@@ -6,7 +6,7 @@ Dynamic single-pixel imaging reconstruction using:
 - 2D Gaussian Splatting for scene representation
 - SE(2) rigid-body motion model
 - ADMM with TV regularization (Phase 1)
-- Future: spatiotemporal diffusion prior (Phase 2)
+- Future: 3DTV prior next:spatiotemporal diffusion prior (Phase 2)
 
 ## Architecture
 ```
