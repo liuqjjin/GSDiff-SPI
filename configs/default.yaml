@@ -1,0 +1,34 @@
+seed: 42
+
+scene:
+  num_gaussians: 256
+  init_scale: 1.5
+
+motion:
+  enable_rotation: false
+
+data:
+  image_size: [28, 28]
+  num_frames: 10
+  num_patterns: 784
+  pattern_type: bernoulli   # bernoulli | gaussian | random | s_matrix
+  snr_db: 30.0
+  shape: "7"                # "7" | "L" | "T" | "circle" | path to image
+  motion_type: custom_se2   # custom_se2 | translation | rotation | shear | swirl | translation_and_rotation
+  motion_mode: 2            # 1: one frame per pattern, 2: fixed T frames
+  speed_factor: 1.0
+  gt_velocity: [5, 5]  # [v_y, v_x] pixels total (for custom_se2)
+  gt_omega: 0.0             # radians total (for custom_se2)
+
+solver:
+  type: admm          # admm | sgd
+  num_outer: 20
+  num_inner: 100
+  rho: 0.1
+  rho_growth: 1.05
+  tv_weight: 0.005
+  lr_scene: 5.0e-3
+  lr_motion: 1.0e-2
+  sgd_steps: 1500
+
+output_dir: ./results/v4
