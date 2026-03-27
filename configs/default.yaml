@@ -1,19 +1,19 @@
 seed: 42
 
 scene:
-  num_gaussians: 256
+  num_gaussians: 3000
   init_scale: 1.5
 
 motion:
   enable_rotation: false
 
 data:
-  image_size: [28, 28]
-  num_frames: 10
-  num_patterns: 784
-  pattern_type: bernoulli   # bernoulli | gaussian | random | s_matrix
-  snr_db: 30.0
-  shape: "7"                # "7" | "L" | "T" | "circle" | path to image
+  image_size: [64, 64]
+  num_frames: 20
+  num_patterns: 4096
+  pattern_type: random    # bernoulli | gaussian | random | s_matrix
+  snr_db: 0
+  shape: "assets/tank.png"                # "7" | "L" | "T" | "circle" | path to image
   motion_type: custom_se2   # custom_se2 | translation | rotation | shear | swirl | translation_and_rotation
   motion_mode: 2            # 1: one frame per pattern, 2: fixed T frames
   speed_factor: 1.0

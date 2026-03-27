@@ -4,22 +4,22 @@ data:
   - 5
   - 5
   image_size:
-  - 28
-  - 28
+  - 64
+  - 64
   motion_mode: 2
   motion_type: custom_se2
-  num_frames: 10
-  num_patterns: 784
-  pattern_type: bernoulli
-  shape: '7'
-  snr_db: 30.0
+  num_frames: 20
+  num_patterns: 4096
+  pattern_type: random
+  shape: assets/tank.png
+  snr_db: 0
   speed_factor: 1.0
 motion:
   enable_rotation: false
 output_dir: ./results/v4
 scene:
   init_scale: 1.5
-  num_gaussians: 256
+  num_gaussians: 3000
 seed: 42
 solver:
   lr_motion: 0.01
