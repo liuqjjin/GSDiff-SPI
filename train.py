@@ -92,7 +92,7 @@ def save_loss_curve(history, out_path, solver_type):
 # ─── Main ─────────────────────────────────────────────────────
 def main():
     args = parse_args()
-    with open(args.config) as f:
+    with open(args.config, encoding='utf-8') as f:
         raw = yaml.safe_load(f)
     cfg = _to_ns(raw)
     if args.solver:
@@ -103,7 +103,7 @@ def main():
     out_dir = cfg.output_dir
     ensure_dir(out_dir)
 
-    with open(os.path.join(out_dir, "config.yaml"), "w") as f:
+    with open(os.path.join(out_dir, "config.yaml"), "w", encoding='utf-8') as f:
         yaml.dump(raw, f)
 
     print(f"Device: {dev}, Solver: {cfg.solver.type}")
@@ -157,6 +157,10 @@ def main():
     fwd = SPIForwardModel(scene, motion, H, W).to(dev)
     print(f"Params: scene={scene.num_params()}, motion={motion.num_params()}")
 
+    # ── 4.5. Optional: DGI warm-start for scene amplitudes (方案B) ────
+    if getattr(cfg.scene, 'init_mode', 'random') == 'dgi':
+        scene.init_from_image(dgi_img)
+
     # ── 5. Solve ──────────────────────────────────────────────
     t0 = time.time()
     history = []
@@ -168,6 +172,7 @@ def main():
             rho=cfg.solver.rho, tv_weight=cfg.solver.tv_weight,
             lr_scene=cfg.solver.lr_scene, lr_motion=cfg.solver.lr_motion,
             n_inner=cfg.solver.num_inner, rho_growth=cfg.solver.rho_growth,
+            loss_norm=getattr(cfg.solver, 'loss_norm', 'zscore'),
             device=dev)
 
         L = cfg.solver.num_outer
@@ -188,7 +193,9 @@ def main():
             fwd, pat, y, fidx, tg,
             tv_weight=cfg.solver.tv_weight,
             lr_scene=cfg.solver.lr_scene, lr_motion=cfg.solver.lr_motion,
-            n_steps=cfg.solver.sgd_steps, device=dev)
+            n_steps=cfg.solver.sgd_steps,
+            loss_norm=getattr(cfg.solver, 'loss_norm', 'zscore'),
+            device=dev)
 
         N = cfg.solver.sgd_steps
         for i in range(1, N + 1):
@@ -264,7 +271,7 @@ def main():
         "gt_omega": data.gt_omega,
         "motion_type": data.motion_type,
     })
-    with open(os.path.join(out_dir, "results.json"), "w") as f:
+    with open(os.path.join(out_dir, "results.json"), "w", encoding='utf-8') as f:
         json.dump(results, f, indent=2)
 
     # Checkpoint

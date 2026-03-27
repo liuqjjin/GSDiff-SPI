@@ -1,33 +1,35 @@
 data:
   gt_omega: 0.0
   gt_velocity:
-  - 5
-  - 5
+  - 8
+  - 8
   image_size:
   - 64
   - 64
   motion_mode: 2
   motion_type: custom_se2
   num_frames: 20
-  num_patterns: 4096
+  num_patterns: 2500
   pattern_type: random
   shape: assets/tank.png
-  snr_db: 0
+  snr_db: 40
   speed_factor: 1.0
 motion:
   enable_rotation: false
 output_dir: ./results/v4
 scene:
+  init_mode: random
   init_scale: 1.5
-  num_gaussians: 3000
+  num_gaussians: 4000
 seed: 42
 solver:
-  lr_motion: 0.01
-  lr_scene: 0.005
-  num_inner: 100
-  num_outer: 20
-  rho: 0.1
-  rho_growth: 1.05
+  loss_norm: target_std
+  lr_motion: 0.03
+  lr_scene: 0.01
+  num_inner: 30
+  num_outer: 15
+  rho: 1
+  rho_growth: 1
   sgd_steps: 1500
   tv_weight: 0.005
   type: admm
