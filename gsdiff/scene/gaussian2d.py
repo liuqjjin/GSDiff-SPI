@@ -77,3 +77,34 @@ class GaussianScene2D(nn.Module):
 
     def num_params(self):
         return sum(p.numel() for p in self.parameters())
+
+    def init_from_image(self, dgi_img):
+        """Scale Gaussian amplitudes so mean rendering ≈ dgi_img mean (方案B).
+
+        Uses the exact softplus inverse so get_amplitudes() output scales by
+        (target_mean / current_mean) without changing centers or scales.
+
+        dgi_img : [H, W] numpy array or torch Tensor with values in [0, 1].
+        """
+        import numpy as np
+        dev = self.centers.device
+        if not isinstance(dgi_img, torch.Tensor):
+            dgi_t = torch.tensor(np.asarray(dgi_img), device=dev, dtype=torch.float32)
+        else:
+            dgi_t = dgi_img.to(dev).float()
+
+        with torch.no_grad():
+            rendered      = self.render()[0, 0]                    # [H, W]
+            current_mean  = rendered.mean().clamp(min=1e-8).item()
+            target_mean   = dgi_t.mean().clamp(min=1e-8).item()
+            scale         = target_mean / current_mean
+
+            # Exact inversion: new_raw = softplus_inv(scale * softplus(raw_amps))
+            # softplus_inv(y) = log(expm1(y))   for y > 0
+            old_amps = self.get_amplitudes()                        # [M], all > 0
+            new_amps = (old_amps * scale).clamp(min=1e-6)
+            new_raw  = torch.log(torch.expm1(new_amps))
+            self.raw_amps.data.copy_(new_raw)
+
+        print(f"  Scene init (dgi): mean {current_mean:.4f} → {target_mean:.4f} "
+              f"(×{scale:.3f})")

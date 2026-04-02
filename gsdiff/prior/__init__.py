@@ -1,1 +1,1 @@
-from .tv import TVPrior
+from .tv import TVPrior, TVPrior3D

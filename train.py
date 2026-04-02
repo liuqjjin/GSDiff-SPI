@@ -16,7 +16,7 @@ from gsdiff.utils import (set_seed, get_device, ensure_dir, normalize_01,
 from gsdiff.scene import GaussianScene2D
 from gsdiff.motion import SE2Motion
 from gsdiff.forward import SPIForwardModel
-from gsdiff.prior import TVPrior
+from gsdiff.prior import TVPrior, TVPrior3D
 from gsdiff.solver import ADMMSolver, SGDSolver
 from gsdiff.data import generate_spi_data, dgi_reconstruct
 
@@ -92,7 +92,7 @@ def save_loss_curve(history, out_path, solver_type):
 # ─── Main ─────────────────────────────────────────────────────
 def main():
     args = parse_args()
-    with open(args.config) as f:
+    with open(args.config, encoding='utf-8') as f:
         raw = yaml.safe_load(f)
     cfg = _to_ns(raw)
     if args.solver:
@@ -103,7 +103,7 @@ def main():
     out_dir = cfg.output_dir
     ensure_dir(out_dir)
 
-    with open(os.path.join(out_dir, "config.yaml"), "w") as f:
+    with open(os.path.join(out_dir, "config.yaml"), "w", encoding='utf-8') as f:
         yaml.dump(raw, f)
 
     print(f"Device: {dev}, Solver: {cfg.solver.type}")
@@ -157,17 +157,35 @@ def main():
     fwd = SPIForwardModel(scene, motion, H, W).to(dev)
     print(f"Params: scene={scene.num_params()}, motion={motion.num_params()}")
 
+    # ── 4.5. Optional: DGI warm-start for scene amplitudes ───────────
+    if getattr(cfg.scene, 'init_mode', 'random') == 'dgi':
+        scene.init_from_image(dgi_img)
+
     # ── 5. Solve ──────────────────────────────────────────────
     t0 = time.time()
     history = []
 
+    # Select TV prior (2D or 3D) for ADMM z-step
+    _use_3dtv = getattr(cfg.solver, 'use_3dtv', False)
+    _temp_w   = getattr(cfg.solver, 'temporal_tv_weight', 1.0)
+
     if cfg.solver.type == "admm":
-        prior = TVPrior(max_iter=50)
+        prior = TVPrior3D(max_iter=50, temporal_weight=_temp_w) if _use_3dtv \
+                else TVPrior(max_iter=50)
+        _s = cfg.solver
         solver = ADMMSolver(
             fwd, prior, pat, y, fidx, tg,
-            rho=cfg.solver.rho, tv_weight=cfg.solver.tv_weight,
-            lr_scene=cfg.solver.lr_scene, lr_motion=cfg.solver.lr_motion,
-            n_inner=cfg.solver.num_inner, rho_growth=cfg.solver.rho_growth,
+            rho=_s.rho,
+            tv_weight=getattr(_s, 'admm_tv_weight', _s.tv_weight),
+            lr_scene=getattr(_s, 'admm_lr_scene', _s.lr_scene),
+            lr_motion=getattr(_s, 'admm_lr_motion', _s.lr_motion),
+            n_inner=_s.num_inner,
+            rho_growth=_s.rho_growth,
+            loss_norm=getattr(_s, 'loss_norm', 'zscore'),
+            n_warmup=getattr(_s, 'admm_n_warmup', 0),
+            n_outer=_s.num_outer,
+            soft_tv_weight=getattr(_s, 'admm_soft_tv_weight', 0.0),
+            temporal_tv_weight=_temp_w if _use_3dtv else 0.0,
             device=dev)
 
         L = cfg.solver.num_outer
@@ -188,7 +206,10 @@ def main():
             fwd, pat, y, fidx, tg,
             tv_weight=cfg.solver.tv_weight,
             lr_scene=cfg.solver.lr_scene, lr_motion=cfg.solver.lr_motion,
-            n_steps=cfg.solver.sgd_steps, device=dev)
+            n_steps=cfg.solver.sgd_steps,
+            loss_norm=getattr(cfg.solver, 'loss_norm', 'zscore'),
+            temporal_tv_weight=_temp_w if _use_3dtv else 0.0,
+            device=dev)
 
         N = cfg.solver.sgd_steps
         for i in range(1, N + 1):
@@ -197,7 +218,7 @@ def main():
             if i % 100 == 0 or i == N:
                 mp = motion.get_params_dict()
                 print(f"[{i:5d}/{N}]  data={info['loss_data']:.4f}  "
-                      f"tv={info['tv']:.4f}  v={[f'{v:.2f}' for v in mp['velocity']]}  "
+                      f"tv={info['tv']:.6f}  v={[f'{v:.2f}' for v in mp['velocity']]}  "
                       f"ω={mp.get('omega', 0):.4f}")
     else:
         raise ValueError(f"Unknown solver: {cfg.solver.type}")
@@ -264,7 +285,7 @@ def main():
         "gt_omega": data.gt_omega,
         "motion_type": data.motion_type,
     })
-    with open(os.path.join(out_dir, "results.json"), "w") as f:
+    with open(os.path.join(out_dir, "results.json"), "w", encoding='utf-8') as f:
         json.dump(results, f, indent=2)
 
     # Checkpoint
