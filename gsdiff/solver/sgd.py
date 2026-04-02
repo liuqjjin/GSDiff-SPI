@@ -15,11 +15,17 @@ def zscore(y):
     return (y - y.mean()) / (y.std() + 1e-8)
 
 
-def tv_loss(video):
-    """Differentiable L1 TV for video [T,1,H,W]."""
+def tv_loss(video, temporal_weight=0.0):
+    """Differentiable L1 TV for video [T,1,H,W].
+    temporal_weight > 0 adds the frame-to-frame temporal term (3D TV).
+    """
     dy = (video[:, :, 1:, :] - video[:, :, :-1, :]).abs().mean()
     dx = (video[:, :, :, 1:] - video[:, :, :, :-1]).abs().mean()
-    return dy + dx
+    spatial = dy + dx
+    if temporal_weight > 0:
+        dt = temporal_weight * (video[1:] - video[:-1]).abs().mean()
+        return spatial + dt
+    return spatial
 
 
 class SGDSolver:
@@ -27,7 +33,8 @@ class SGDSolver:
 
     def __init__(self, fwd, patterns, y_target, frame_idx, t_grid,
                  tv_weight=0.005, lr_scene=3e-3, lr_motion=1e-2,
-                 n_steps=800, loss_norm='zscore', device='cpu'):
+                 n_steps=800, loss_norm='zscore', temporal_tv_weight=0.0,
+                 device='cpu'):
         """
         loss_norm : 'zscore'     → original independent z-score loss (default)
                     'target_std' → normalize by fixed target std only (方案A)
@@ -38,6 +45,7 @@ class SGDSolver:
         self.t_grid = t_grid.to(device)
         self.loss_norm = loss_norm
         self.tv_weight = tv_weight
+        self.temporal_tv_weight = temporal_tv_weight
         self.lr_scene = lr_scene
         self.lr_motion = lr_motion
         self.n_steps = n_steps
@@ -74,7 +82,7 @@ class SGDSolver:
         self.optimizer.zero_grad()
         y_pred, video = self.fwd(self.patterns, self.frame_idx, self.t_grid)
         loss_d = self._data_loss(y_pred)
-        loss_tv = self.tv_weight * tv_loss(video)
+        loss_tv = self.tv_weight * tv_loss(video, self.temporal_tv_weight)
         loss = loss_d + loss_tv
         loss.backward()
         torch.nn.utils.clip_grad_norm_(

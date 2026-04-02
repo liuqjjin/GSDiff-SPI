@@ -1,0 +1,39 @@
+data:
+  gt_omega: 0.0
+  gt_velocity:
+  - 8
+  - 8
+  image_size:
+  - 64
+  - 64
+  motion_mode: 2
+  motion_type: custom_se2
+  num_frames: 20
+  num_patterns: 2500
+  pattern_type: random
+  shape: assets/tank.png
+  snr_db: 0
+  speed_factor: 1.0
+motion:
+  enable_rotation: false
+output_dir: ./results/admm_2
+scene:
+  init_mode: random
+  init_scale: 1.5
+  num_gaussians: 500
+seed: 42
+solver:
+  admm_lr_motion: 0.15
+  admm_lr_scene: 0.009
+  admm_n_warmup: 30
+  admm_tv_weight: 0.008
+  loss_norm: zscore
+  lr_motion: 0.15
+  lr_scene: 0.009
+  num_inner: 50
+  num_outer: 50
+  rho: 0.1
+  rho_growth: 1.1
+  sgd_steps: 2500
+  tv_weight: 0.005
+  type: admm

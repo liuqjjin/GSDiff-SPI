@@ -194,7 +194,7 @@ def simulate_motion(img, motion_type, num_frames, speed_factor=1.0, dim=None):
 # ─── Noise ───────────────────────────────────────────────────
 def _add_noise(signal, snr_db, rng):
     if snr_db <= 0: return signal
-    sig_pow = np.mean(signal ** 2)
+    sig_pow = np.var(signal)
     noise_pow = sig_pow / (10 ** (snr_db / 10))
     return signal + rng.normal(0, np.sqrt(noise_pow), signal.shape)
 
