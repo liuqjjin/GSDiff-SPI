@@ -6,20 +6,20 @@ scene:
   init_mode: random    # random | dgi   (scheme B: DGI amplitude warm-start)
 
 motion:
-  enable_rotation: false
+  enable_rotation: true
 
 data:
   image_size: [64, 64]
   num_frames: 20
   num_patterns: 2500
   pattern_type: random    # bernoulli | gaussian | random | s_matrix
-  snr_db: 30
+  snr_db: 0
   shape: "assets/tank.png"                # "7" | "L" | "T" | "circle" | path to image
   motion_type: custom_se2   # custom_se2 | translation | rotation | shear | swirl | translation_and_rotation
   motion_mode: 2            # 1: one frame per pattern, 2: fixed T frames
   speed_factor: 1.0
   gt_velocity: [8, 8]  # [v_y, v_x] pixels total (for custom_se2)
-  gt_omega: 0.0             # radians total (for custom_se2)
+  gt_omega: 0.3           # radians total (for custom_se2)
 
 solver:
   type: admm          # admm | sgd
@@ -47,5 +47,5 @@ solver:
   temporal_tv_weight: 0.1 # α: weight of temporal TV relative to spatial TV
                           #    α<1 → weaker temporal constraint
 
-output_dir: ./results/9
+output_dir: ./results/11
  

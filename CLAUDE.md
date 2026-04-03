@@ -279,3 +279,14 @@ python train.py --config configs/default.yaml --solver admm
   - DGI baseline: ~6.7 dB
 - SNR correctly calibrated via `np.var(signal)` (AC-based)
 - Next: Phase 2 = replace TV with spatiotemporal diffusion prior (STEP/DAPS)
+
+### Implementation Notes (verified by experiment)
+
+- **ADMM transition bug fixed**: `step()` now has an `is_transition` flag for iteration `n_warmup+1`.
+  On that iteration the θ-step runs without the consistency term (z not yet valid), then z_step and
+  u_step run to initialize z/u. From `n_warmup+2` onward, full ADMM with proper target = z−u.
+- **True ADMM outperforms SGD** once the transition fix is applied and `admm_n_warmup < num_outer`.
+- **`temporal_tv_weight` has an optimal range**: empirically `0.05` works best; `0.02` is too weak
+  (insufficient temporal smoothing), `0.08` is too strong (over-smooths across frames).
+- **`admm_soft_tv_weight` must not be set to 0**: removing the soft TV in the θ-step causes a
+  noticeable drop in reconstruction quality. Keep it at `0.005` (matching SGD `tv_weight`).
