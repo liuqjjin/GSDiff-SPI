@@ -200,6 +200,26 @@ def _add_noise(signal, snr_db, rng):
 
 
 # ─── Main data generation ────────────────────────────────────
+def _measure_interpolated_np(patterns, gt_frames, K, T):
+    """Numpy counterpart of SPIForwardModel.measure_interpolated (must stay identical).
+
+    t_k = k/(K-1),  u_k = t_k*(T-1),  m_k = floor(u_k),  alpha_k = u_k - m_k.
+    Boundary (m_k == T-1): m_k = T-2, alpha_k = 1.0.
+    y[k] = (1-alpha_k)*<patterns[k], gt_frames[m_k]> + alpha_k*<patterns[k], gt_frames[m_k+1]>
+    """
+    meas = np.zeros(K, dtype=np.float64)
+    for k in range(K):
+        t_k   = k / max(K - 1, 1)
+        u_k   = t_k * (T - 1)
+        m_k   = int(np.floor(u_k))
+        a_k   = u_k - m_k
+        if m_k >= T - 1:          # boundary: only k == K-1 when K>1
+            m_k, a_k = T - 2, 1.0
+        f_interp = (1.0 - a_k) * gt_frames[m_k] + a_k * gt_frames[m_k + 1]
+        meas[k]  = np.sum(patterns[k] * f_interp)
+    return meas
+
+
 def generate_spi_data(
     H=28, W=28, T=10, K=784,
     pattern_type="bernoulli",
@@ -212,6 +232,7 @@ def generate_spi_data(
     # For custom_se2: explicit velocity/omega (overrides speed_factor)
     gt_velocity=None,          # [vy, vx] pixels total
     gt_omega=None,             # radians total
+    time_assignment_mode="uniform",   # uniform | interpolation
 ) -> SPIData:
     """Generate complete dynamic SPI dataset.
 
@@ -268,9 +289,15 @@ def generate_spi_data(
     frame_idx = np.clip(np.arange(K) // ppf, 0, T - 1).astype(np.int64)
 
     # 5. Measurements
-    meas = np.zeros(K, dtype=np.float64)
-    for k in range(K):
-        meas[k] = np.sum(patterns[k] * gt_frames[frame_idx[k]])
+    if time_assignment_mode == "uniform":
+        # Original uniform logic (unchanged)
+        meas = np.zeros(K, dtype=np.float64)
+        for k in range(K):
+            meas[k] = np.sum(patterns[k] * gt_frames[frame_idx[k]])
+    elif time_assignment_mode == "interpolation":
+        meas = _measure_interpolated_np(patterns, gt_frames, K, T)
+    else:
+        raise ValueError(f"Unknown time_assignment_mode: {time_assignment_mode}")
 
     # 6. Noise
     meas = _add_noise(meas, snr_db, rng).astype(np.float32)

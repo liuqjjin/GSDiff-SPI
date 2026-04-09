@@ -1,0 +1,425 @@
+=== PAGE 17 ===
+B Experimental details
+B.1 Black hole video reconstruction
+We introduce the black hole video reconstruction problem in more detail. The goal is to reconstruct a
+video x0 P Rnf ˆnhˆnw of a rapidly moving black hole. Each measurement, or visibility, is given by
+correlating the measurements from a pair of telescopes to sample a particular spatial Fourier frequency
+of the source with very long baseline interferometry (VLBI) [57, 74]. In VLBI, the cross-correlation
+of the recorded scalar electric fields at two telescopes, known as the ideal visibility, is related to the
+ideal source video x0 through a 2D Fourier transform, as given by the van Cittert-Zernike theorem
+[57, 74]. Specifically, the ideal visibility of the j-th frame of the target video is
+Irjs
+ta,bupx0q :“
+ż
+ρ
+ż
+δ
+exp
+´
+´i2π
+´
+urjs
+ta,buρ ` vrjs
+ta,buδ
+¯¯
+xrjs
+0 pρ, δqdρdδ P C, (7)
+where pρ, δq denotes the angular coordinates of the source video frame, and
+´
+urjs
+ta,bu, vrjs
+ta,bu
+¯
+is the
+dimensionless baseline vector between two telescopes ta, bu, orthogonal to the source direction.
+Due to atmospheric turbulence and instrumental calibration errors, the observed visibility is corrupted
+by gain error, phase error, and additive Gaussian thermal noise [19, 53]:
+Vrjs
+ta,bu :“ grjs
+a grjs
+b exp
+´
+´i
+´
+ϕrjs
+a ´ ϕrjs
+b
+¯¯
+Irjs
+ta,bu px0q ` nrjs
+ta,bu P C. (8)
+where gain errors are denoted by grjs
+a , grjs
+b , phase errors are denoted by ϕrjs
+a , ϕrjs
+b , and thermal noise
+is denoted by nrjs
+ta,bu. While the phase of the observed visibility cannot be directly used due to phase
+errors, the product of three visibilities among any combination of three telescopes, known as the
+bispectrum, can be computed to retain useful information. Specifically, the phase of the bispectrum,
+termed the closure phase, effectively cancels out the phase errors in the observed visibilities. Similarly,
+a strategy can be employed to cancel out amplitude gain errors and extract information from the
+visibility amplitude [3]. Formally, these quantities are defined as
+yrjs
+cp,ta,b,cu :“ =pVrjs
+ta,buVrjs
+tb,cuVrjs
+ta,cuq P R,
+yrjs
+logca,ta,b,c,du :“ log
+¨
+˝
+ˇˇˇVrjs
+ta,bu
+ˇˇˇ
+ˇˇˇVrjs
+tc,du
+ˇˇˇ
+ˇˇˇVrjs
+ta,cu
+ˇˇˇ
+ˇˇˇVrjs
+tb,du
+ˇˇˇ
+˛
+‚P R.
+(9)
+Here, =p¨q denotes the complex angle, and | ¨ | computes the complex amplitude. For a total of P
+telescopes, the number of closure phase measurements yrjs
+cp,ta,b,cu at is pP ´1qpP ´2q
+2 , and the number
+of log closure amplitude measurements yrjs
+logca,ta,b,c,du is P pP ´3q
+2 , after accounting for redundancy.
+Let Drjs
+cp and Drjs
+camp to indicate the dimension of yrjs
+cp and yrjs
+logca. Since closure quantities are nonlinear
+transformations of the visibilities, the black hole video reconstruction problem is non-convex.
+To aggregate data over different measurement times and telescope combinations, the forward model
+of black hole video reconstruction for the j-th frame can be expressed as
+yrjs :“
+”
+Arjs
+cp px0q, Arjs
+logcapx0q, Arjs
+fluxpx0q
+ı
+:“
+”
+yrjs
+cp , yrjs
+logca, yrjs
+flux
+ı
+, (10)
+where yrjs
+cp “
+”
+yrjs
+cp,ta,b,cu
+ı
+is the set of all closure phase measurements and yrjs
+cp “
+”
+yrjs
+logca,ta,b,c,du
+ı
+is the set of all log closure amplitude measurements for j-th frame. The total flux of the at j-th frame,
+representing the DC component of the Fourier transform, is given by
+yrjs
+flux :“
+ż
+ρ
+ż
+δ
+xrjs
+0 pρ, δqdρdδ. (11)
+The overall data consistency is an aggregation over all frames and typically expressed using the χ2
+statistics
+17
+
+=== PAGE 18 ===
+Ground truthDirty image
+Selected frames over time
+Figure 8: The dirty images from the ideal visibilities. We use the standard implementation in EHT
+library to get dirty images for each selected frame.
+´ log ppy | x0q9
+nfÿ
+j“1
+1
+nf Drjs
+cp σ2cp
+›››Arjs
+cp px0q ´ yrjs
+cp
+›››
+2
+loooooooooooooooooooomoooooooooooooooooooon
+χ2cp
+`
+nfÿ
+j“1
+1
+nf Drjs
+logcaσ2
+logca
+›››Arjs
+logcapx0q ´ yrjs
+logca
+›››
+2
+lo ooooooooooooooooooooooo omo ooooooooooooooooooooooo on
+χ2
+logca
+` β
+nfÿ
+j“1
+1
+nf σ2
+flux
+›››Arjs
+fluxpx0q ´ yrjs
+flux
+›››
+2
+loooooooooooooooooomoooooooooooooooooon
+χ2
+flux
+(12)
+where σcp, σlogca, and σflux are the estimated standard deviations of the measured closure phase, log
+closure amplitude, and flux, respectively, andβ is a hyperparameter that controls the strength of the
+flux regularization, which is empirically determined. To evaluate the data fitting, we introduce a
+unified ˜χ2 statistics
+˜χ2 “ χ2 ¨ 1tχ2 ě 1u ` 1
+χ2 ¨ 1tχ2 ă 1u. (13)
+The ˜χ2 is no less than 1 and closer to 1, indicating better measurement data fit. In our experiments
+we use an average p ˜χ2
+cp ` ˜χ2
+campq{2 for the data misfit metrics for evaluation.
+Our experiments are based on the simulation of observing the Sagittarius A˚ black hole with the EHT
+2017 array of eight radio telescopes over an observation period of around 100 minutes. We refer
+the readers to Fig. 5 of [ 37] for a visualization of the measurement patterns in Fourier space over
+time. To show the difficulty of this black hole video reconstruction problem, we visualize the dirty
+video frames obtained by applying the inverse Fourier transform to the ideal visibilities, assuming
+no measurement errors, in Figure 8. One can see that substantial spatiotemporal information is lost
+during the measurement process, so obtaining high-quality reconstructions relies on the effectiveness
+of incorporating prior information in the reconstruction process.
+B.2 Dynamic MRI
+MRI is an important imaging technique for clinical diagnosis and biomedical research, where the
+objective is to recover a video x0 P Cnf ˆnhˆnw of the heart from the subsampled Fourier space
+(a.k.a k-space) measurements y. Despite its many advantages, MRI is known to be slow because of
+the physical limitations of the data acquisition in k-space. This leads to low patient throughput and
+sensitivity to patient’s motion [61]. To accelerate the scan speed, instead of fully sampling k-space,
+the compressed subsampling MRI (CS-MRI) technique subsamples k-space with masks tmrjsunf
+j“1.
+Mathematically, this can be formulated as
+yrjs “ mrjs d F
+´
+xrjs
+0
+¯
+` nrjs P Cn for j “ 1, ..., nf , (14)
+where mrjs P t 0, 1unhˆnw is the subsampling mask for the j-th frame, d denotes element-wise
+multiplication, F is the Fourier transform, and nrjs is the measurement noise. In our experiments, we
+18
+
+=== PAGE 19 ===
+<latexit sha1_base64="1WxsgSQFxKVWkPS9JiPgVsEVYOU=">AAAIo3icjdRZb9pAEABgJ6QtpVfSPvbFShSJqBECVKVPkXKH3EA4cixYa7MGB1+x1wFi+Zf1R/S5/6Y28QwBglJLoNlvZse7xqxs65rLs9m/c/OJhTdv3yXfpz58/PT5y+LS15preY7CqoqlW86VTF2mayarco3r7Mp2GDVkndXl7m6Urz8wx9Uss8IHNmsYtG1qqqZQHpK0NP97VVQlwlmf+5oZEM0UiUF5R5b9ctD0TUkVCdcM5oqmpDSxboSdUdgLUqNmlsf/r1tUOLtdPCLrhOp2hzZ9si4S6vIoN9bulaWF5bdh/frzymjQib56jal0tKqJfDrqGA6et1iL0mo8fbSEuPLFJFFaFo8qIJhRhrsYbQIL07O3sjaVHt9KnH9tOXEZbmPsTjOycKNhGt4Dzgx7+EMO3wPVHwTiJg62gzSEpC8bUjZYE39g1hzOkw2fKB0taOYlX6Fhs81cJp/Np7pSX1pcyWayw0ucDnJxsCLEV1FaWvhDWpbiGczkik5d9zaXtXnDpw7XFJ0FKeK5zKZKl7bZbRiaNHzyDX/4NwvE1VBaomo54cfk4lCfz/Cp4boDQw4rox24k7kIX8yxe5M6Dh28mJSNYHw8CYanc82xeuPKqezp1OkHqRRpMZXQ8Dn60cOkQRA8kQwkIylAClILqIXEgBiSCqQitYHaSB2gDpIGpCHdAd0hdYG6SDqQjmQAGUgmkIlkAVlINpCNdA90j+QAOUgukIvEgTiSB+QhPQA9IPWAekh9oD7SAGiA9Aj0GNGTbYNtY9kO0A7SLtAu0h7QHtI+0D7SAdAB0iHQIVIBqIB0BHSEdAx0jHQCdIJ0CnSKdAZ0hnQOdI50AXSBVAQqIpWASkhloDLSJdAlUgWoglQFqiLVgGpIdaA60hXQFdI10DXSDdBNSOERmJs88KaDWj6T28hslH6ubO3Eh2FS+C4sC2khJ/wStoSCUBSqgpJYThQSpUQ5uZo8SZaTlafS+bl4zjdh7Eo2/gFoEBff</latexit>
+kx
+<latexit sha1_base64="RulI99z0Wp9qHoeJGeM0d9WRwBY=">AAAIo3icjdRZb9pAEABgJ6QtpVfSPvbFShSJqBECVKVPkXKH3EA4cixYa7MGB1+x1wFi+Zf1R/S5/6Y28QwBglJLoNlvZse7xqxs65rLs9m/c/OJhTdv3yXfpz58/PT5y+LS15preY7CqoqlW86VTF2mayarco3r7Mp2GDVkndXl7m6Urz8wx9Uss8IHNmsYtG1qqqZQHpK0NP97VVQlwlmf+5oZEM0UiUF5R5b9ctD0TUkVCdcM5oqmpDSxboSdUdgLUqNmlsf/r1tUOLtdPCLrhOp2hzZ9si4S6vIoN9bulaWF5bdh/frzymjQib56jal0tKqJfDrqGA6et1iL0mo8fbSEuPLFJFFaFo8qIJhRhrsYbQIL07O3sjaVHt9KnH9tOXEZbmPsTjOycKNhGt4Dzgx7+EMO3wPVHwTiJg62gzSEpC8bUjZYE39g1hzOkw2fKB0taOYlX6Fhs81cJp/Np7rSQFpcyWayw0ucDnJxsCLEV1FaWvhDWpbiGczkik5d9zaXtXnDpw7XFJ0FKeK5zKZKl7bZbRiaNHzyDX/4NwvE1VBaomo54cfk4lCfz/Cp4boDQw4rox24k7kIX8yxe5M6Dh28mJSNYHw8CYanc82xeuPKqezp1OkHqRRpMZXQ8Dn60cOkQRA8kQwkIylAClILqIXEgBiSCqQitYHaSB2gDpIGpCHdAd0hdYG6SDqQjmQAGUgmkIlkAVlINpCNdA90j+QAOUgukIvEgTiSB+QhPQA9IPWAekh9oD7SAGiA9Aj0GNGTbYNtY9kO0A7SLtAu0h7QHtI+0D7SAdAB0iHQIVIBqIB0BHSEdAx0jHQCdIJ0CnSKdAZ0hnQOdI50AXSBVAQqIpWASkhloDLSJdAlUgWoglQFqiLVgGpIdaA60hXQFdI10DXSDdBNSOERmJs88KaDWj6T28hslH6ubO3Eh2FS+C4sC2khJ/wStoSCUBSqgpJYThQSpUQ5uZo8SZaTlafS+bl4zjdh7Eo2/gFtkhfg</latexit>
+ky
+<latexit sha1_base64="1WxsgSQFxKVWkPS9JiPgVsEVYOU=">AAAIo3icjdRZb9pAEABgJ6QtpVfSPvbFShSJqBECVKVPkXKH3EA4cixYa7MGB1+x1wFi+Zf1R/S5/6Y28QwBglJLoNlvZse7xqxs65rLs9m/c/OJhTdv3yXfpz58/PT5y+LS15preY7CqoqlW86VTF2mayarco3r7Mp2GDVkndXl7m6Urz8wx9Uss8IHNmsYtG1qqqZQHpK0NP97VVQlwlmf+5oZEM0UiUF5R5b9ctD0TUkVCdcM5oqmpDSxboSdUdgLUqNmlsf/r1tUOLtdPCLrhOp2hzZ9si4S6vIoN9bulaWF5bdh/frzymjQib56jal0tKqJfDrqGA6et1iL0mo8fbSEuPLFJFFaFo8qIJhRhrsYbQIL07O3sjaVHt9KnH9tOXEZbmPsTjOycKNhGt4Dzgx7+EMO3wPVHwTiJg62gzSEpC8bUjZYE39g1hzOkw2fKB0taOYlX6Fhs81cJp/Np7pSX1pcyWayw0ucDnJxsCLEV1FaWvhDWpbiGczkik5d9zaXtXnDpw7XFJ0FKeK5zKZKl7bZbRiaNHzyDX/4NwvE1VBaomo54cfk4lCfz/Cp4boDQw4rox24k7kIX8yxe5M6Dh28mJSNYHw8CYanc82xeuPKqezp1OkHqRRpMZXQ8Dn60cOkQRA8kQwkIylAClILqIXEgBiSCqQitYHaSB2gDpIGpCHdAd0hdYG6SDqQjmQAGUgmkIlkAVlINpCNdA90j+QAOUgukIvEgTiSB+QhPQA9IPWAekh9oD7SAGiA9Aj0GNGTbYNtY9kO0A7SLtAu0h7QHtI+0D7SAdAB0iHQIVIBqIB0BHSEdAx0jHQCdIJ0CnSKdAZ0hnQOdI50AXSBVAQqIpWASkhloDLSJdAlUgWoglQFqiLVgGpIdaA60hXQFdI10DXSDdBNSOERmJs88KaDWj6T28hslH6ubO3Eh2FS+C4sC2khJ/wStoSCUBSqgpJYThQSpUQ5uZo8SZaTlafS+bl4zjdh7Eo2/gFoEBff</latexit>
+kx
+<latexit sha1_base64="RulI99z0Wp9qHoeJGeM0d9WRwBY=">AAAIo3icjdRZb9pAEABgJ6QtpVfSPvbFShSJqBECVKVPkXKH3EA4cixYa7MGB1+x1wFi+Zf1R/S5/6Y28QwBglJLoNlvZse7xqxs65rLs9m/c/OJhTdv3yXfpz58/PT5y+LS15preY7CqoqlW86VTF2mayarco3r7Mp2GDVkndXl7m6Urz8wx9Uss8IHNmsYtG1qqqZQHpK0NP97VVQlwlmf+5oZEM0UiUF5R5b9ctD0TUkVCdcM5oqmpDSxboSdUdgLUqNmlsf/r1tUOLtdPCLrhOp2hzZ9si4S6vIoN9bulaWF5bdh/frzymjQib56jal0tKqJfDrqGA6et1iL0mo8fbSEuPLFJFFaFo8qIJhRhrsYbQIL07O3sjaVHt9KnH9tOXEZbmPsTjOycKNhGt4Dzgx7+EMO3wPVHwTiJg62gzSEpC8bUjZYE39g1hzOkw2fKB0taOYlX6Fhs81cJp/Np7rSQFpcyWayw0ucDnJxsCLEV1FaWvhDWpbiGczkik5d9zaXtXnDpw7XFJ0FKeK5zKZKl7bZbRiaNHzyDX/4NwvE1VBaomo54cfk4lCfz/Cp4boDQw4rox24k7kIX8yxe5M6Dh28mJSNYHw8CYanc82xeuPKqezp1OkHqRRpMZXQ8Dn60cOkQRA8kQwkIylAClILqIXEgBiSCqQitYHaSB2gDpIGpCHdAd0hdYG6SDqQjmQAGUgmkIlkAVlINpCNdA90j+QAOUgukIvEgTiSB+QhPQA9IPWAekh9oD7SAGiA9Aj0GNGTbYNtY9kO0A7SLtAu0h7QHtI+0D7SAdAB0iHQIVIBqIB0BHSEdAx0jHQCdIJ0CnSKdAZ0hnQOdI50AXSBVAQqIpWASkhloDLSJdAlUgWoglQFqiLVgGpIdaA60hXQFdI10DXSDdBNSOERmJs88KaDWj6T28hslH6ubO3Eh2FS+C4sC2khJ/wStoSCUBSqgpJYThQSpUQ5uZo8SZaTlafS+bl4zjdh7Eo2/gFtkhfg</latexit>
+ky
+6× acceleration 8× acceleration
+Figure 9: Subsampling masks of 6ˆ (left) and 8ˆ (right) accelerations used in dynamic MRI
+experiments. The white areas in the center indicate the auto-calibration (ACS) signals. The horizontal
+and vertical directions are the frequency (kx) and phase (kx) encoding directions, respectively. The
+same mask is applied to the sampling of each individual frame of all videos.
+used subsampling masks with an equi-spaced pattern (similar to those visualized in [61]) of both 6ˆ
+acceleration with 24 auto-calibration signal (ACS) lines (Tab. 4) and8ˆ acceleration with 12 ACS
+lines (Tab. 1). For dynamic MRI, we use the Gaussian likelihood function
+´ log ppy|x0q9}Apx0q ´ y}2
+2. (15)
+Fig.9 visualizes the subsampling masks used in our experiments, where kx, ky indicate the frequency
+encoding and phase encoding directions, respectively. The same mask is applied to the sampling of
+each frame of all videos.
+B.3 Baseline implementations
+In this section, we explain the detailed implementation of our baseline methods. We follow the same
+grouping in Sec. 4.1.
+Group 1: simple heuristics We implement batch independent sampling (BIS) and batch consistent
+sampling (BCS) following [36, 35]. BIS is implemented to reconstruct each frame independently,
+whereas BCS promotes temporal consistency by using identical ("batch-consistent") noise across the
+temporal dimension. To ensure a fair comparison, we adapt Algorithm 1 by initializing the noise
+variables ztN (line 1) and zti´1 (line 9) with batch-consistent noise.
+Group 2: noise warping We follow [16, 9] in performing noise warping based on optical flow
+estimated from measurements. As described in Sec. 4.1, we derive optical flow using ground-truth
+black hole videos and inverse Fourier-transformed dynamic MRI videos with a pretrained model [54].
+Since we utilize a latent diffusion model, we further downsample the optical flow via interpolation
+to match the latent noise dimension. We adapt Algorithm 1 accordingly by replacing the original
+i.i.d. noise with the warped noise while keeping other components unchanged. We implement
+Bilinear, Bicubic, and Nearest warping strategies using their corresponding interpolation methods,
+and follow the implementation from https://github.com/yitongdeng-projects/infinite_
+resolution_integral_noise_warping_code for
+ş
+-noise. Lastly, since [ 15] does not provide
+publicly available code, we implement GP-Warp following Equation (2) from their paper.
+19
+
+=== PAGE 20 ===
+C Training details for spatiotemporal diffusion prior
+In this section, we show the detail of getting a video diffusion prior on black hole video reconstruction
+and dynamic MRI, and we summarize the training hyper-parameters in Table 3. We define Dimage
+and Dvideo as the image and video datasets, containing Nimage and Nvideo data points, respectively.
+The image dataset Dimage includes all individual frames from the video dataset Dvideo, along with
+additional large-scale image data to enhance generalization. For data augmentation, we apply random
+horizontal/vertical flipping and random zoom-in-and-out to improve robustness and diversity in
+training.
+We first train the compression functions, the encoder E and decoder D, on an image dataset. The
+training objective consists of an L1 reconstruction loss combined with a KL divergence term scaled
+by a factor βKL. The loss function for training is as defined in Equation (16). The Adam optimizer
+is used as the default optimizer throughout the paper. The loss function for training the variational
+autoencoder (V AE) is given by:
+LV AE“ Eqϕpz0|x0q,x0„Dimage r}Dpz0q ´ x0}1s ` βKLDKL
+`
+qϕpz0|x0q}ppz0q
+˘
+(16)
+where ppz0q is the standard Gaussian N p0, Iq and qϕpz0|x0q is the isotropic Gaussian distribution
+over z0 where the mean and standard deviation is given by Epx0q. Next, we train the image diffusion
+UNet sθ using the standard score-matching loss, as defined in Equation (17), following [26, 50].
+LIDM “ Ez0„qϕpz0|x0q,x0„Dimage,ϵ„N p0,Iq,t„U p0,1q
+”
+σ2
+t }sθpxt, tq ´ ∇xt log ptpxt|x0q}2
+ı
+(17)
+After pertaining, the image diffusion UNet sθ is then converted to a spatiotemporal UNet by adding
+zero-initialized temporal modules to 2D spatial modules and fine-tune jointly with video and image
+Table 3: Summary of the training of spatiotemporal diffusion prior. We provide and group the
+hyperparameters according to each component in the model. The model is trained with 1 NVIDIA
+A100-SCM4-80GB GPU.
+Hyper-parameters Black hole video reconstruction Dynamic MRI
+Dataset Related
+frames nf 64 12
+resolutionnh ˆ nw 256ˆ256 192 ˆ192
+Nimage 50000 39888
+Nvideo 648 3324
+V AE Training Related
+latent channels 1 2
+block channels [64, 128, 256, 256] [256, 512, 512]
+down sampling factor 8 4
+batch size 16 16
+epochs 25 10
+βKL 0.06 0.03
+IDM Training Related
+block channels [128, 256, 512, 512] [128, 256, 512, 512]
+batch size 16 16
+epochs 200 50
+Joint Fine-tuning Related
+pjoint 0.8 0.8
+epochs 500 300
+Other Info
+V AE parameters 14.8M 57.5M
+diffusion model parameters 131.7M 131.7M
+V AE training time 4.5h 8.9h
+image diffusion model training time 5.5h 3.8h
+joint fine-tuning time 13.7h 22.8h
+20
+
+=== PAGE 21 ===
+datasets. We use the same Equation (17) without change x0 to video or pseudo video input and use
+the encoder to process each frame independently.
+After pretraining, the image diffusion U-Net sθ is transformed into a spatiotemporal UNet by
+integrating zero-initialized temporal modules into the existing 2D spatial modules. The model is then
+fine-tuned jointly using both video and image datasets. We use the same loss as in Equation (17), by
+changing x0 to a video or a pseudo-video input. Each frame is independently processed using the
+encoder E, ensuring that spatial representations remain aligned while temporal consistency is learned
+through the added temporal modules.
+D Limitations
+Though ST EP is a general framework for solving scientific VIPs with spatiotemporal diffusion prior,
+the sampling cost of STEP is relatively high due to the requirement of backpropagation through
+decoder D in MCMC updates in Algorithm 1. So we have to strike a balance between the capability
+of the decoder and its computational cost. We leave the exploration of performing MCMC updates in
+pixel space or other better approaches to bypass backpropagation through the decoder as future work.
+E Broader impacts
+Our work introduces a new method for solving scientific video inverse problems, with potential
+applications in astronomy, medical imaging, and physics, where accurate reconstruction from sparse
+data is crucial. However, the learned spatiotemporal prior may introduce biases; thus, practitioners
+should responsibly evaluate the reconstructions and mitigate any potential negative impacts.
+F Licenses
+We list the licenses of all the assets we used in this paper:
+• Data
+– GRMHD black hole data: Unknown
+– CMRxRecon Challenge 2023 [61]: MIT License
+• Code
+–
+ş
+-noise [16]2: MIT License
+– Diffusers [60]3: Apache-2.0 license
+– Common metrics on video quality4: None
+2ş
+-noise: https://github.com/yitongdeng-projects/infinite_resolution_integral_noise_
+warping_code
+3Diffusers: https://github.com/huggingface/diffusers
+4Common metrics on video quality: https://github.com/JunyaoHu/common_metrics_on_video_
+quality
+21
+
+=== PAGE 22 ===
+Table 4: Additional results on dynamic MRI with 6ˆ acceleration. Following the same setup as
+in Tab. 1, we report the quantitative results on 10 test videos.
+Tasks Methods PSNR ( Ò) SSIM ( Ò) LPIPS ( Ó) d-PSNR (Ò) d-SSIM ( Ò) FVD ( Ó) Data Misfit (Ó)
+MRI (6ˆ)
+BIS [36] 39.47 (0.59) 0.958 (0.007) 0.086 (0.011) 43.26 (1.23) 0.962 (0.005) 113.17 11.071 (0.740)
+BCS [36] 40.69 (0.57) 0.959 (0.006) 0.081 (0.012) 44.73 (1.31) 0.974 (0.004) 110.01 11.085 (0.720)
+Bilinear [9] 40.85 (0.57) 0.960 (0.006) 0.080 (0.012) 44.84 (1.28) 0.975 (0.004) 114.37 11.038 (0.735)
+Bicubic [9] 40.71 (0.67) 0.959 (0.007) 0.079 (0.012) 44.74 (1.38) 0.974 (0.005) 106.82 11.068 (0.755)
+Nearest [9] 40.37 (0.56) 0.960 (0.007) 0.080 (0.012) 44.81 (1.41) 0.974 (0.005) 110.91 11.050 (0.739)ş-noise [9, 16] 40.09 (0.50) 0.960 (0.006) 0.082 (0.012) 44.77 (1.34) 0.974 (0.005) 111.92 11.059 (0.731)
+GP-Warp [15] 39.50 (0.48) 0.959 (0.007) 0.080 (0.012) 44.53 (1.33) 0.973 (0.005) 105.70 11.070 (0.727)
+STEP (video only) 40.76 (0.43) 0.967 (0.005) 0.077 (0.012) 46.38(1.82) 0.981 (0.005) 101.83 10.788(0.713)
+STEP (image-video joint) 41.39(0.52) 0.969(0.005) 0.076(0.012) 46.61(1.72) 0.982(0.004) 98.15 10.808(0.723)
+Ground truth
+VAE ReconGround truthVAE Recon
+(a) black hole imaging
+(b) dynamic MRI
+Figure 10: Visualization of V AE reconstructions. The V AE reconstructions are computed by first
+encoding the ground truth videos and then decoding them.
+G More results & visualization
+Data misfit values for samples in Fig. 1. We report the data misfit values in Tab. 5.
+Table 5: The data misfit values for samples shown in Fig. 1.We report the data misfit metrics for
+the three obtained modes, which demonstrate that all modes fit the measurement data equally well.
+Metrics Mode 1 Mode 2 Mode 3
+χ2
+cp 1.045 0.987 1.084
+χ2
+logca 1.007 1.001 1.202
+Data Misfit 1.026 1.007 1.143
+Dynamic MRI with higher acceleration. To access the capability of using spatiotemporal prior
+for solving more challenging inverse problems, we increase the acceleration times in Dynamic MRI,
+which makes the observation more sparse. The results are summarized in Table 4.
+More visualizations Here, we show the V AE reconstruction results in Figure 10, unconditional
+samples in Figure 11 and additional posterior samples in Figure 12.
+22
+
+=== PAGE 23 ===
+(a) black hole imaging
+Sample 1Sample 2Sample 3Sample 4Sample 5
+(b) dynamic MRI
+Sample 1Sample 2Sample 3Sample 4Sample 5
+Figure 11: Visualization of video diffusion model unconditional samples. The videos are sampled
+by solving PF-ODE with 100 Euler’s steps.
+23
+
+=== PAGE 24 ===
+Ground truthSTePGround truthSTePGround truthSTeP
+(a) black hole imaging
+Ground truthSTeP
+Ground truthSTePGround truthSTeP
+(b) dynamic MRI
+Figure 12: Visualization of ST EP posterior samples. The videos are sampled using the Algorithm 1.
+24
+

@@ -8,11 +8,14 @@ import torch, torch.nn as nn, torch.nn.functional as F
 
 class SPIForwardModel(nn.Module):
 
-    def __init__(self, scene, motion, H, W):
+    def __init__(self, scene, motion, H, W, time_assignment_mode="uniform"):
         super().__init__()
         self.scene = scene
         self.motion = motion
         self.H, self.W = H, W
+        assert time_assignment_mode in ("uniform", "interpolation"), \
+            f"Unknown time_assignment_mode: {time_assignment_mode}"
+        self.time_assignment_mode = time_assignment_mode
 
     def _render_frame(self, centers_t, Sinv_t, amps):
         """Render one frame from transformed params.
@@ -60,8 +63,47 @@ class SPIForwardModel(nn.Module):
             y[mask] = P @ fr
         return y
 
+    @staticmethod
+    def measure_interpolated(video, patterns):
+        """Interpolated measurement: y[k] = <patterns[k], interp_frame(t_k)>.
+
+        t_k = k / (K-1),  u_k = t_k * (T-1),  m_k = floor(u_k),  alpha_k = u_k - m_k.
+        Boundary (m_k == T-1): clamp to m_k = T-2, alpha_k = 1.0 → recovers video[T-1].
+        y[k] = (1-alpha_k)*<patterns[k], video[m_k]> + alpha_k*<patterns[k], video[m_k+1]>
+
+        video: [T,1,H,W], patterns: [K,H,W] → y: [K]
+        """
+        T = video.shape[0]
+        K = patterns.shape[0]
+        dev = video.device
+
+        k_idx = torch.arange(K, device=dev, dtype=torch.float32)
+        u = k_idx / max(K - 1, 1) * (T - 1)       # [K], continuous frame position in [0, T-1]
+        m_raw = torch.floor(u).long()               # [K]
+        alpha_raw = u - m_raw.float()               # [K], in [0, 1)
+
+        # Boundary: when m_raw == T-1 (only k=K-1), set m=T-2, alpha=1.0
+        boundary = (m_raw >= T - 1)
+        m     = torch.where(boundary, torch.full_like(m_raw, T - 2), m_raw)        # [K]
+        alpha = torch.where(boundary, torch.ones_like(alpha_raw), alpha_raw)       # [K]
+
+        # Gather neighboring frames: [K, H, W]
+        frame0 = video[m,     0]                    # [K,H,W]
+        frame1 = video[m + 1, 0]                    # [K,H,W]
+
+        # Linear interpolation then inner product (numerically equivalent to interp then dot)
+        HW = patterns.shape[1] * patterns.shape[2]
+        P  = patterns.reshape(K, HW)                # [K, HW]
+        a  = alpha.unsqueeze(1)                     # [K, 1]
+        y  = (1.0 - a) * (P * frame0.reshape(K, HW)).sum(-1) \
+           +        a  * (P * frame1.reshape(K, HW)).sum(-1)  # [K]
+        return y
+
     def forward(self, patterns, frame_idx, t_grid):
         """Full forward. Returns (y_pred [K], video [T,1,H,W])."""
         video = self.render_video(t_grid)
-        y = self.measure(video, patterns, frame_idx)
+        if self.time_assignment_mode == "uniform":
+            y = self.measure(video, patterns, frame_idx)
+        else:  # interpolation
+            y = self.measure_interpolated(video, patterns)
         return y, video
