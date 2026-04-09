@@ -1,0 +1,43 @@
+data:
+  gt_omega: 0.3
+  gt_velocity:
+  - 8
+  - 8
+  image_size:
+  - 64
+  - 64
+  motion_mode: 2
+  motion_type: custom_se2
+  num_frames: 20
+  num_patterns: 2500
+  pattern_type: random
+  shape: assets/tank.png
+  snr_db: 0
+  speed_factor: 1.0
+  time_assignment_mode: interpolation
+motion:
+  enable_rotation: true
+output_dir: ./results/11
+scene:
+  init_mode: random
+  init_scale: 1.5
+  num_gaussians: 500
+seed: 42
+solver:
+  admm_lr_motion: 0.15
+  admm_lr_scene: 0.009
+  admm_n_warmup: 80
+  admm_soft_tv_weight: 0.005
+  admm_tv_weight: 0.005
+  loss_norm: zscore
+  lr_motion: 0.15
+  lr_scene: 0.009
+  num_inner: 50
+  num_outer: 80
+  rho: 0.1
+  rho_growth: 1.05
+  sgd_steps: 2500
+  temporal_tv_weight: 0.1
+  tv_weight: 0.005
+  type: admm
+  use_3dtv: true

@@ -133,16 +133,27 @@ class ADMMSolver:
     def step(self):
         self._outer_iter += 1
         in_warmup = self._outer_iter <= self.n_warmup
-        info = self.theta_step(in_warmup=in_warmup)
+        is_transition = (self._outer_iter == self.n_warmup + 1)
+
+        # 关键修补：
+        # 第一个“刚结束 warmup”的 outer iter，不要立刻让 θ-step 去追未初始化的 z-u。
+        # 这一轮仍按 warmup 的方式跑 θ-step，但要执行 z_step / u_step 来初始化 z 和 u。
+        info = self.theta_step(in_warmup=(in_warmup or is_transition))
+
         vid = info["video"]
+
+        # 只要已经离开 warmup，就执行 z/u 更新
+        # 注意：transition 轮也会进这里，从而完成 z/u 初始化
         if not in_warmup:
             self.z_step(vid)
             self.u_step(vid)
             self.rho *= self.rho_growth
+
         info["prim_res"] = F.mse_loss(vid, self.z).item()
         info["tv"] = self.prior.energy(self.z)
         info["rho"] = self.rho
         info["in_warmup"] = in_warmup
+        info["is_transition"] = is_transition
         return info
 
     def get_z(self):

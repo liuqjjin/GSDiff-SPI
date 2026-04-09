@@ -1,0 +1,518 @@
+=== PAGE 1 ===
+arXiv:2504.07549v2  [cs.CV]  10 Jun 2025
+STEP: A Framework for Solving Scientific Video
+Inverse Problems with Spatiotemporal Diffusion Priors
+Bingliang Zhang1,˚ Zihui Wu1,˚ Berthy T. Feng1 Yang Song2
+Yisong Yue1 Katherine L. Bouman1
+1California Institute of Technology 2OpenAI
+Abstract
+Reconstructing spatially and temporally coherent videos from time-varying mea-
+surements is a fundamental challenge in many scientific domains. A major diffi-
+culty arises from the sparsity of measurements, which hinders accurate recovery
+of temporal dynamics. Existing image diffusion-based methods rely on extracting
+temporal consistency directly from measurements, limiting their effectiveness on
+scientific tasks with high spatiotemporal uncertainty. We address this difficulty by
+proposing a plug-and-play framework that incorporates a learned spatiotemporal
+diffusion prior. Due to its plug-and-play nature, our framework can be flexibly
+applied to different video inverse problems without the need for task-specific design
+and temporal heuristics. We further demonstrate that a spatiotemporal diffusion
+model can be trained efficiently with limited video data. We validate our approach
+on two challenging scientific video reconstruction tasks—black hole video recon-
+struction and dynamic MRI. While baseline methods struggle to provide temporally
+coherent reconstructions, our approach achieves significantly improved recovery of
+the spatiotemporal structure of the underlying ground truth videos.
+1 Introduction
+Reconstructing high-quality videos from time-varying measurements is a core challenge in many
+scientific domains, such as black hole video reconstruction [21] and dynamic magnetic resonance
+imaging (MRI) [24], where recovered spatiotemporal features influence downstream scientific analysis
+or medical interpretation. These problems are inherently difficult due to the high dimensionality of
+the underlying video and the severe loss of both spatial and temporal information during acquisition.
+Diffusion models (DMs) have become the state-of-the-art for modeling image and video distributions,
+offering powerful priors for solving inverse problems [78]. However, most existing diffusion-based
+approaches for video inverse problems are motivated by either video editing tasks or restoration
+problems in photography [ 15, 36, 35, 73], where the spatiotemporal structure is either given or
+mostly preserved in the measurements. These methods leverage image diffusion models (IDMs) to
+process each video frame independently while enforcing temporal consistency via correlated noise or
+optical flow. We find that these methods struggle on scientific problems where there is limited spatial
+structure in the measurements to capture complex dynamics.
+Plug-and-play diffusion prior (PnPDP) methods offer a general strategy for solving inverse problems
+by leveraging pre-trained diffusion models as priors. They have shown strong performance across
+a range of applications, including natural image restoration [ 63, 50, 32, 11, 44, 39, 81], medical
+imaging [29, 49, 13, 28, 17, 12, 75], and physics-based inverse problems [ 78, 1, 23, 51, 52, 70].
+Despite being compatible with videos in principle, existing PnPDP methods are predominantly
+investigated for static images. It remains largely unexplored how to effectively obtain a well-trained
+video diffusion prior and extend the PnPDP framework to ill-posed video inverse problems.
+Preprint. Under review.
+
+=== PAGE 2 ===
+Video diffusion
+inverse solver
+Spatiotemporal diffusion prior
+Large amount of image data
+Limited amount of video data
+Diverse (multi-modal) and high-ﬁdelity video reconstructionsPhysics of the inverse problem
+ 
+Ground truth
+Mode ① (≈30%) 
+(d-PSNR = 40.43)
+Mode ② (≈60%) 
+(d-PSNR = 37.48)
+Mode ③ (≈10%) 
+(d-PSNR = 34.65)
+Avg. optical ﬂow
+Forward model 
+(e.g. black hole imaging 
+OR MR imaging)
+Noise 
+(e.g. Gaussian 
+OR non-Gaussian)
+Higher d-PSNR
+Selected frames over time
+Equal data ﬁdelity
+<latexit sha1_base64="DFW59n2x7qRmtpl4oZJtvE/hyNE=">AAAIhHicjdTZbtpAFAZgJ6StS7ekveyN1SgSqCiCpE2vWmXfF7KwJDGxxmYMDh7bsccBYvlN+k697tvUBp9DgKB0JKyZ7z8ez6CxVcc0PJ7P/52aTs28ePlKfJ1+8/bd+w+zcx/Lnu27Gi1ptmm7VZV41DQsWuIGN2nVcSlhqkkramsjziv31PUM27rgXYfWGGlYhm5ohEekzE3/XpB0Rea0wwPDCmXDkmRGeFNVg7PwJrAUXZK5wagnWYp2g3UDbA667TA9mMz2+f/NFhdOni4ZyTmZmE6T3ARyTpKJx+NsaLpnlhaVX0f1uceV8aAZX9q1sThe1UieiWeMBo+nyMaxntw+WEJS+WQoa3WbxxXQmVCGuxhsAgszk7eSHYuHt5Lkzy0nKcNtDD1pQgoP6sVwDjhlTpjunwI96IbSz/6R0IgZrIUZCOSOypR8mJW+SkBWmFZm5/OL+V6TxjuFpDMvJK2ozM38keu25jNqcc0knnddyDu8FhCXG5pJo4X4HnWI1iINeh11LRL9tbWg9x6F0kIkdUm33ehncamnj+8ICPO8LlOjyniN3mgW45MZvbOI65Luk6HKwuHxKDDf5IZrt4eVE9U3idsJ02m5TnWZqCwI5OhCwjDskwqkImlAGlIdqI5EgSiSDqQjNYAaSE2gJpIBZCDdAt0itYBaSCaQicSAGJIFZCHZQDaSA+Qg3QHdIblALpIH5CFxII7kA/lI90D3SG2gNlIHqIPUBeoiPQA9xNS3NbA1LFsHWkfaANpA2gTaRNoC2kLaBtpG2gHaQdoF2kXaA9pD2gfaRzoAOkA6BDpEOgI6QjoGOkY6ATpBKgIVkU6BTpHOgM6QzoHOkS6ALpBKQCWkMlAZqQJUQaoCVZEugS6RroCuIoo+gYXRD954p7y0WFhZXDn9Nr+6nnwMReGz8EXICAXhh7Aq7ApFoSRoqVQqm1pKLYsvxZy4LH7vl05PJfd8Eoaa+Osft1UM0A==</latexit>
+y = A (x0 )+ n
+Figure 1: An overview of our proposed framework with Spatiotemporal Diffusion Priors, ST EP,
+for scientific video inverse problems. Left: STEP combines the physic model of the target problem
+with a spatiotemporal diffusion prior that directly characterizes the video distribution. We show
+that such a prior can be efficiently obtained by fine-tuning a pre-trained image diffusion model with
+limited video data. Right: STEP can generate diverse solutions to a black hole video reconstruction
+problem that exhibit equally good fidelity with the measurements.
+In this paper, we introduce STEP, a framework for solving scientific video inverse problems by
+integrating a SpatioTemporal video diffusion Prior into a PnPDP method. STEP enforces learned
+priors over both spatial and temporal dimensions and does not rely on heuristics to ensure temporal
+consistency, making it well-suited for tasks with high spatiotemporal uncertainty. To obtain a
+spatiotemporal prior efficiently, we are inspired by [62] to first train an image latent diffusion model
+with a 2D UNet and then turn it into a spatiotemporal video diffusion model by adding a zero-
+initialized temporal module to each 2D convolution module in the UNet. This enables us to fine-tune
+a spatiotemporal diffusion prior from a pre-trained IDM in a data- and time-efficient manner, using
+only hundreds to thousands of videos and a few hours of training on a single A100 GPU. We then
+integrate the resulting prior with the Decoupled Annealing Posterior Sampling (DAPS) [75], a state-
+of-the-art PnPDP method. STEP inherits the ability of DAPS to handle general inverse problems
+with nonlinear forward models and does not require heuristics to enforce temporal consistency.
+We demonstrate the effectiveness of STEP on two challenging scientific video inverse problems:
+black hole video reconstruction (previewed in Figure 1) and dynamic MRI, where the underlying
+targets exhibit significantly different spatiotemporal characteristics. As Figure 1 illustrates, STEP
+not only achieves state-of-the-art results with improved spatial and temporal consistency but also
+effectively captures the multi-modal nature of highly ill-posed problems, recovering diverse plausible
+solutions from the posterior distribution. Notably, our approach achieves substantial improvements in
+both spatial and temporal consistency, significantly outperforming baselines across most evaluation
+metrics. For example, our method demonstrates a 1.57dB and 2.38dB improvement on PSNR on black
+hole video reconstruction and dynamic MRI, respectively. More importantly, for the challenging black
+hole video reconstruction, while baseline methods have difficulty accurately recovering temporal
+dynamics, our method demonstrates spatiotemporal structure that closely aligns with ground truth
+video (Fig. 4), under extremely sparse measurement conditions.
+2 Background
+Video inverse problems Existing approaches to video inverse problems have primarily focused
+on restoration and editing problems, such as super-resolution and JPEG artifact removal, for natural
+videos [9, 15, 35, 16, 82, 36]. Since it is computationally expensive to obtain a well-trained video
+diffusion model (VDM) for natural videos, existing methods instead rely on an image diffusion model
+(IDM) to process each video frame and propose various techniques to enforce temporal consistency.
+For example, the batch-consistent sampling (BCS) technique fixes the injected noise across all video
+frames [35, 36]. Another common approach, which we refer to as noise warping, first extracts optical
+flow from measurements and uses it to warp the injected noise across all video frames [9, 15, 73, 16].
+As observed empirically, the dynamics of the injected noise translates into that of the generated
+video. These methods work well in restoration problems where the dynamics is mostly preserved
+2
+
+=== PAGE 3 ===
+Spatial (image) UNet Temporal consistency
+Spatiotemporal UNet
+Spatiotemporal modules
+Prior works
+Ours
+Implicitly enforced by correlated
+noise OR optical ﬂow information
+Per-frame
+processing
+Whole-video
+processing
+Decoder High-res. video
+Decode if in
+latent space  
+High-res. videoInput  noise
+Input
+latent noise
+Output  latent
+Output
+video / latent
+OPTIONAL
+✕ N steps
+✕ N steps
+Measurement
+consistency
+Measurement
+consistency
+Identical OR correlated
+i.i.d Gaussian
+<latexit sha1_base64="jcvHCVPFVk4MNpW/cCw6JKT6SgA=">AAAF8HicbdTJThtBEAbghuCEOBskx1ysoEg5ITuK4Mq+L2bxAhihnnHbDJ6N7h7AWPMYkXIKyjUvk3PeJmPw/yssJXWr+qsqqU/lxL5nbLH4d2j42Uju+YvRl/lXr9+8fTc2/r5qokS7quJGfqTrjjTK90JVsZ71VT3WSgaOr2pOZ75fr10obbwo3LfdWB0Hsh16Lc+VNqOjRiDtqSv93kJ6MjZRnCzeRuFxUhokE2IQ5ZPxkT+NZuQmgQqt60tjjkrF2B73pLae66s030iMiqXbkW11lKWhDJQ57t3+OS18zqRZaEU6O6Et3Or/Ez0ZGNMNnKyz/0fzsNbHJ2vqPJRay+6TRSdI778fQpD41tPR5X210kl8qa/SfL7RVK2GdIJer5FdMk3TO3JADskFuaQmqElSIEVqgVqkNqhNOgWdkjyQRzoDnZE6oA7JB/mkABSQQlBIikARKQbFpHPQOUmDNMmADMmCLCkBJaQL0AXpEnRJugJdkbqgLukadN2nO5uFzbJtDjRHmgfNkxZAC6RF0CJpCbREWgYtk1ZAK6RV0CppDbRGWgetkzZAG6RN0CZpC7RF2gZtk8qgMmkHtEPaBe2S9kB7pH3QPqkCqpCqoCqpBqqR6qA66QB0QDoEHWaUrcDSw4X3OKl+nSxNTU7tfJuYmRssw1HxUXwSX0RJTIsZsSLKoiJcEYnv4qe4yencj9xN7tdd6/DQYOaDuBe53/8ASOAoCQ==</latexit>
+D
+<latexit sha1_base64="jcvHCVPFVk4MNpW/cCw6JKT6SgA=">AAAF8HicbdTJThtBEAbghuCEOBskx1ysoEg5ITuK4Mq+L2bxAhihnnHbDJ6N7h7AWPMYkXIKyjUvk3PeJmPw/yssJXWr+qsqqU/lxL5nbLH4d2j42Uju+YvRl/lXr9+8fTc2/r5qokS7quJGfqTrjjTK90JVsZ71VT3WSgaOr2pOZ75fr10obbwo3LfdWB0Hsh16Lc+VNqOjRiDtqSv93kJ6MjZRnCzeRuFxUhokE2IQ5ZPxkT+NZuQmgQqt60tjjkrF2B73pLae66s030iMiqXbkW11lKWhDJQ57t3+OS18zqRZaEU6O6Et3Or/Ez0ZGNMNnKyz/0fzsNbHJ2vqPJRay+6TRSdI778fQpD41tPR5X210kl8qa/SfL7RVK2GdIJer5FdMk3TO3JADskFuaQmqElSIEVqgVqkNqhNOgWdkjyQRzoDnZE6oA7JB/mkABSQQlBIikARKQbFpHPQOUmDNMmADMmCLCkBJaQL0AXpEnRJugJdkbqgLukadN2nO5uFzbJtDjRHmgfNkxZAC6RF0CJpCbREWgYtk1ZAK6RV0CppDbRGWgetkzZAG6RN0CZpC7RF2gZtk8qgMmkHtEPaBe2S9kB7pH3QPqkCqpCqoCqpBqqR6qA66QB0QDoEHWaUrcDSw4X3OKl+nSxNTU7tfJuYmRssw1HxUXwSX0RJTIsZsSLKoiJcEYnv4qe4yencj9xN7tdd6/DQYOaDuBe53/8ASOAoCQ==</latexit>
+D
+Figure 2: A schematic comparison between prior works (top) and ourST EP framework (bottom)
+for video inverse problems. The bold texts highlight the key differences between them. While prior
+works use an image diffusion model and enforce temporal consistency using simple heuristics or
+warping noise with optical flow, we directly learn a spatiotemporal diffusion prior.
+in the measurements or video editing tasks where the dynamics is given. However, these methods
+face challenges when dealing with scientific problems because the measurements may belong to a
+different domain that is nontrivial to invert, or substantial spatiotemporal information may be lost in
+the measurement process.
+Plug-and-play diffusion priors for inverse problems Plug-and-play diffusion priors (PnPDP)
+constitute a family of methods that leverage diffusion models as priors for solving inverse problems.
+The goal is to draw samples from the posterior distribution ppx0|yq 9 ppy|x0qppx0q where the
+likelihood ppy|x0q can be derived from knowledge of the physical system, and the prior ppx0q
+is characterized by a diffusion model. Various formulations have been considered in the existing
+literature, including measurement guidance [11, 43, 32, 46], variable splitting [14, 38, 45, 71, 70, 75],
+variational Bayes [40, 23, 22], and Sequential Monte Carlo (SMC) [68, 55, 8, 18]. A major advantage
+of PnPDP is its ability to handle inverse problems in a general way without task-specific design.
+Video inverse problems fit into the PnPDP framework in principle, but existing PnPDP methods
+have mainly focused on the static image setting. The main reason is that characterizing the prior
+distribution ppx0q for videos is challenging due to their high dimensionality and a potentially limited
+number of samples for training. Prior work [34] has explored the applicability of PnPDP to an optical
+scattering problem with a pixel-space video diffusion prior. In this work, we develop a general
+framework that can efficiently handle VIPs with larger spatiotemporal dimensions.
+Diffusion models as image and video priors Latent diffusion models (LDMs) [42] offer a way
+to reduce the computational cost otherwise necessary to model the original high-dimensional data
+distribution. LDMs generate an efficient, low-dimensional latent representation z0 of data x0 with
+a pretrained perceptual compression encoder E and decoder D, which satisfy z0 “ Epx0q and
+Dpz0q « x0. The compression models E and D can be trained as V AE variants [33, 41, 6] with KL
+divergence regularization or VQGAN variants [25, 20, 58] with quantization regularization. Video
+latent diffusion models are commonly believed to be hard to train due to the computational overhead
+of 3D modules and the requirement of a large video dataset [5, 80, 77, 27, 4]. Many recent methods
+tend to solve video modeling by fine-tuning from a pretrained IDM with a video dataset [67, 5, 4].
+Our work leverages these techniques to solve scientific VIPs.
+3 Method
+In this section, we introduce our framework, STEP, for solving video inverse problems with
+SpatioTemporal diffusion Priors. Figure 2 illustrates the conceptual difference between our ap-
+proach and the prior works on video inverse problems. Designed mainly for restoration problems
+on natural videos, prior works rely on IDMs to incorporate spatial prior and enforce temporal con-
+sistency by injecting correlated noise in the diffusion process. As we will show in the experiments,
+these techniques do not work well when dealing with ill-posed scientific problems. Our method
+3
+
+=== PAGE 4 ===
+instead adopts a whole-video formulation (Sec. 3.1) and simultaneously handles spatial and temporal
+dimensions within a PnPDP framework (Sec. 3.2). The core of our method is to efficiently obtain
+spatiotemporal diffusion priors (Sec. 3.3), which directly learn temporal information from data and
+eliminate the need for designing task-specific temporal heuristics.
+3.1 General approach
+We consider the general formulation of video inverse problems where the goal is to recover a moving
+target x0 from the time-varying measurements
+y “ Apx0q ` n. (1)
+Here Ap¨q is the forward model, which could be nonlinear, and n is the measurement noise. In many
+scientific problems, such as black hole video reconstruction, substantial spatiotemporal information
+of x0 is lost in the measurement process due to the ill-posed and potentially nonlinear nature of Ap¨q,
+necessitating a prior on both the spatial and temporal dimensions of x0 for meaningful recovery.
+Instead of taking a per-frame processing approach using IDMs, we propose to directly learn
+the video distribution ppx0q from data and draw samples from the posterior distribution
+ppx0|yq 9 ppy|x0qppx0q via the PnPDP framework. This enables us to deal with more general
+problems in which the extraction of temporal information directly from measurements is hard.
+Solve video inverse problems in latent space. While the likelihood ppy|x0q can be derived from
+Equation (1), it is often challenging to characterize the prior distribution ppx0q for videos due to
+its high dimensionality and potentially limited number of samples for training. To overcome these
+challenges, we propose to impose a spatiotemporal prior in the latent space. Assuming that the set of
+likely x0’s is in the range of a decoder D, we have that D z0 s.t. x0 “ Dpz0q and can thus rewrite
+Equation (1) as:
+y “ ApDpz0qq ` n. (2)
+It follows that the posterior ppx0|yq is the pushforward of the latent posterior ppz0|yq through D, so
+it suffices to first generate latent samples from ppz0|yq and then decode them by D.
+3.2 Decoupled Annealing Posterior Sampling
+STEP leverages the PnPDP framework to sample the posterior distribution given by Equation (2).
+In this work, we employ the Decoupled Annealing Posterior Sampling (DAPS) method [75], which
+has demonstrated strong performance on various scientific inverse problems [79]. It is also easily
+compatible with latent diffusion models, making it a suitable choice for our purpose.
+DAPS samples the target latent posterior ppz0|yq by sequentially sampling ppzt|yq from t “ T to
+t “ 0. To do so, DAPS first generates a sample from ppzT |yq « N p0, σ2
+maxIq and sequentially
+draws a sample from ppzti´1 |yq given a sample from ppzti |yq for i “ N, ..., 1 based on a time
+schedule ttiuN
+i“1. As shown by Proposition 1 of [75], this is possible if one can sample from
+ppz0|zt, yq “ ppy|z0, ztqppz0|ztq
+ppy|ztq 9 ppy|z0qppz0|ztq.
+Since we have access to the gradient of this unnormalized distribution, we can sample it using MCMC
+methods, such as Langevin Monte Carlo (LMC) [65] and Hamiltonian Monte Carlo (HMC) [2]. After
+obtaining ˆz0 „ ppz0|zti , yq, we then sample from ppzti´1 |yq by sampling zti´1 „ N pˆz0, σ2
+ti´1 Iq
+due to Proposition 1 of [75]. The pseudocode and more technical details of the STEP with DAPS are
+provided in Sec. A.
+3.3 Efficient training of spatiotemporal diffusion priors
+We propose to obtain spatiotemporal diffusion priors for scientific video inverse problems in an
+efficient way via the following three steps.
+4
+
+=== PAGE 5 ===
+conv2d
+ON/OFF
+conv1d
+Spatiotemporal moduleInput feature  
+†
+Output feature
+Spatial module
+Temporal module
+<latexit sha1_base64="yUcO3/UtXCkH0xFp4N5Vd/QiQBk=">AAAH8XicjdTLTttAFAZg49IG0hu0y26sIqQgIZSgim4h4X4Nl1wAh2jsjBMTe2w8Y5Jg+TUqdVXUbR+m675NbeJzQgKUjmTrzHf+Gc1IljXXMrnIZv+MyS/GX75KTUymX795++791PSHMnd8T6cl3bEcr6oRTi2T0ZIwhUWrrkeJrVm0orULcb9yTT1uOuxE9Fxas0mTmYapExFRfVqenFWMuipoVwQmC1WTKapNREvTgqPwImB1Q1GFaVOusLp+gbkBtgZlJ0wPNnN88X+7xcGnt0tm6rxKLLdFIhna5JkDRfHzKD9/PxlPWvGrU3vQjs8y0s/EO0aT+1vMxW0jWT44QpJ8tKnqDUfECSieiOEtBpdIgpmnLzKXns384x799nNHmatPzWQXsndDeVjkkmJGSkaxPj3+W204um9TJnSLcH6ey7qiFhBPmLpFw7Tqc+oSvU2a9DwqGYluVAvuPtpQmY2koRiOFz1MKHd6f0VAbM57thYl40+Ij/ZifLRHrxjxPNJ7tKnZ4fB8FGzfEqbndIZVEM23iNcN02m1QQ2VaHYQqNGLhGHYJw1IQ9KBdKQGUAOJAlEkA8hAagI1kVpALSQTyES6BLpEagO1kSwgC8kGspEYEENygBwkF8hFugK6QvKAPCQOxJEEkEDygXyka6BrpA5QB6kL1EXqAfWQboBuYurbCtgKxvJAeaQCUAFpFWgVaQ1oDWkdaB1pA2gDaRNoE2kLaAtpG2gbaQdoB2kXaBdpD2gPaR9oH+kA6ACpCFREOgQ6RDoCOkI6BjpGOgE6QSoBlZDKQGWkClAFqQpURToFOkU6AzqLKPoF5kZ/eA+L8uJCbmlh6fDLzHI++RlOSJ+kz1JGyklfpWVpUypKJUmXXfmb/EO+TfHU99Rt6mc/Ko8laz5KQyP16y/MEt3G</latexit>
+(nf ,n in ,n h ,n w )
+<latexit sha1_base64="gxP166q8e2hPfO1joxd56qeQwHc=">AAAH8XicjdRJT9tAFAdw49IG0g3aYy9WEVIiIZSgil7Z9yUsWQCHaOyMkyHe8IxJguWvUamnol77YXrut6kd/F5IAqUj2Xrze/8ZzUiWNddkXORyf8bkF+MvX6UmJtOv37x9935q+kOJO76n06LumI5X0QinJrNpUTBh0orrUWJpJi1rrdW4X76hHmeOfSq6Lq1apGEzg+lERFSblidnFaOmCtoRAbNDldmKahHR1LTgOLwM7JqhqIJZlCt2Tb/EXB+b/bIdpvubOb74v93i4NPbJTN1TiWm2ySRDGzyzIGi+EWUn3uYjCfN+NWujrTjswz1M/GO0eThFtm4bSTL+0dIko82Vb3uiDgBxRMxvEX/EhDMPH2TbDrzj3tke2ufO0q2NjWTm8/1hjJa5JNiRkpGoTY9/lutO7pvUVvoJuH8Ip9zRTUgnmC6ScO06nPqEr1FGvQiKm0S3aga9D7aUJmNpK4Yjhc9tlB6+nBFQCzOu5YWJeNPiA/3Yny0R69t4nmk+2hTs8LB+TBYvimY57QHVRDNN4nXCdNptU4NlWhWEKjRi4RheE8akIakA+lIdaA6EgWiSAaQgdQAaiA1gZpIDIghXQFdIbWAWkgmkIlkAVlINpCN5AA5SC6Qi3QNdI3kAXlIHIgjCSCB5AP5SDdAN0htoDZSB6iD1AXqIt0C3cZ0b8tgyxhbAVpBWgVaRVoDWkNaB1pH2gDaQNoE2kTaAtpC2gbaRtoB2kHaBdpF2gPaQ9oH2kc6ADpAOgQ6RCoAFZCOgI6QjoGOkU6ATpBOgU6RikBFpBJQCakMVEaqAFWQzoDOkM6BziOKfoH54R/eaFFamM8vzi8efZlZWkl+hhPSJ+mzlJHy0ldpSdqSClJR0mVX/ib/kO9SPPU9dZf6eR+Vx5I1H6WBkfr1F8ab3cY=</latexit>
+(nf ,n out ,n h ,n w )
+Input shape Output shape
+<latexit sha1_base64="YZ39ywcMtrr9aIVGMGYOYDRqTBQ=">AAAH+3icjdRJT9tAFABg49KGphuUYy9WEVKQEEqqil7Z9yUsWQCHaOyMExN7bDxjkmD5v1TqqajX/o6e+286Br8XEkB0pFhvvvfmeUaxxvAdm4t8/u+I+mL05avM2Ovsm7fv3n8Yn/hY5l4YmLRkeo4XVA3CqWMzWhK2cGjVDyhxDYdWjPZykq9c0YDbHjsWPZ/WXNJktmWbREiqT6iT05pV1wXtishmsW4zTXeJaBlGdBifR6xuabqwXco1VjfPsa6PrX7YibP9Zl4o/q9bUvhUuzTWZ3Xi+C1yHumzmk64SF400OyZjcnyM1k/e78ymbSSR6f2IJ3saSifSzrKyf0WM0naSpf3t5BWPprUzYYnkgoInijDU/QPAYW5p08yM5wdPIhMa7nnNzNTH5/Kz+Vvh/YwKKTBlJKOYn1i9I/e8MzQpUyYDuH8rJD3RS0igbBNh8o/MuTUJ2abNOmZDBmRZ6pFt59vrE1LaWiWF8gfE9qt3l8REZfznmvIyuRj4sO5BB/N0UtGgoD0Hk0abjw4HwY3dIQdeJ1BFcQIHRJ042xWb1BLJ4YbRbp8kDiO78gAMpBMIBOpAdRAokAUyQKykJpATaQWUAvJBrKRLoAukNpAbSQHyEFygVwkBsSQPCAPyQfykS6BLpECoACJA3EkASSQQqAQ6QroCqkD1EHqAnWRekA9pGug64TubBFsEcuWgJaQloGWkVaAVpBWgVaR1oDWkNaB1pE2gDaQNoE2kbaAtpC2gbaRdoB2kHaBdpH2gPaQ9oH2kYpARaQDoAOkQ6BDpCOgI6RjoGOkElAJqQxURqoAVZCqQFWkE6ATpFOgU0nyCiwMX3gPg/KXucL83PzB16mFpfQyHFM+KZ+VnFJQvikLyoZSVEqKqV6r39Wf6k0mzvzI3GR+3ZWqI+maSWVgZH7/A4zy4cw=</latexit>
+⇥ ↵
+⇤
+* Trainable and initialized at 0† Broadcasted to       frames for image input
+<latexit sha1_base64="uRYu2ikS+Q4Z8I6Kr/G97819e84=">AAAIAXicjdRJT9tAFABgk9KGphu0p6oXqwgpSAglVUWv7PsSliyQCdHYGScm3vCMSYJlqVL/S6Weinrtj+i5/6Zj8HshAURH8ujN9948zUjWaJ5lcpHL/R1JPRl9+iw99jzz4uWr12/GJ96WuBv4OivqruX6FY1yZpkOKwpTWKzi+YzamsXKWnspzpcvmM9N1zkSPY/VbNp0TMPUqZBUn0i9n1KNOhGsK0LTiYjpqMSmoqVp4UF0Gjp1QyXCtBlXnbp+inV9bPXDTpTpN3MD8X/d4sKH2yUrMkOo5bXoaUhmVEK5iHMD7R45miyvyvqZ25XxohVPndqddHyqoXw27igXt1tMx2kj2d4/QlJ5b5LoDVfEFRA8UIa36F8CCrMP32R6ODt4EZlWs48fZjojp/r4ZG42dz3Uu0E+CSaVZBTqE6N/SMPVA5s5Qrco59V8zhO1kPrC1C0WZUjAmUf1Nm2yqgwdKu9VC69/4kidktJQDdeXnyPUa729I6Q25z1bk5XxL8WHczHem2PnDvV92rs3qdnR4HoY7MASpu92BlVQLbCo340yGdJgBqGaHYZETjSKohvSgDQkHUhHagA1kBgQQzKADKQmUBOpBdRCMoFMpDOgM6Q2UBvJArKQbCAbyQFykFwgF8kD8pDOgc6RfCAfiQNxJAEkkAKgAOkC6AKpA9RB6gJ1kXpAPaRLoMuYbmwBbAHLFoEWkZaAlpCWgZaRVoBWkFaBVpHWgNaQ1oHWkTaANpA2gTaRtoC2kLaBtpF2gHaQdoF2kfaA9pAKQAWkfaB9pAOgA6RDoEOkI6AjpCJQEakEVEIqA5WRKkAVpGOgY6QToBNJ8gnMDz94d4PSp9n83Ozc/ufJ+cXkMRxTPigflaySV74o88q6UlCKip76mvqe+pm6Sn9L/0hfpX/dlKZGkj3vlIGR/v0Ps1zjig==</latexit>
+nf
+<latexit sha1_base64="bRYljDlBtzZ7c6X05t9aRO09WnU=">AAAIGnicjdRJT9tAFABgk9KGphu0x16sIqQgIZSgil7Z9yUsWYAJ0dgZJybe8IxJguUfUqn/pVJPRT300kv/Tcfg97IAoiPFevO9Ny/zJMuaZ5lc5HJ/R1LPRp+/SI+9zLx6/ebtu/GJ9yXuBr7OirpruX5Fo5xZpsOKwhQWq3g+o7ZmsbLWWo7z5Svmc9N1jkXXY1WbNhzTMHUqJNUmUnNTqlEjgnVEaDoRMR2V2FQ0NS08jM5Dp2aoRJg246pT08+xrofNXtiOMr1mbiD+r1tc+Hi7ZEdmCLW8Jj0PyYxKKBdxbqDdE1eT5Weyfqa/Mt4040e7ei8d32oon407yk1/i+k4bSTHe1dIKh9MEr3uirgCgkfKcIreEFCYfXyS6eHs4CAyrWafvsx0Jts3wsDfyFxtfDI3m7td6v0gnwSTSrIKtYnR36Tu6oHNHKFblPOzfM4T1ZD6wtQtFmVIwJlH9RZtsDMZOlQOXA1v3+5InZJSVw3Xlz9HqLfafyKkNuddW5OV8bvGh3MxPphjlw71fdp9MKnZ0eB+GOzAEqbvtgdVUC2wqN+JMhlSZwahmh2GRD5oFEV3pAFpSDqQjlQHqiMxIIZkABlIDaAGUhOoiWQCmUgXQBdILaAWkgVkIdlANpID5CC5QC6SB+QhXQJdIvlAPhIH4kgCSCAFQAHSFdAVUhuojdQB6iB1gbpI10DXMd3ZItgili0BLSEtAy0jrQCtIK0CrSKtAa0hrQOtI20AbSBtAm0ibQFtIW0DbSPtAO0g7QLtIu0B7SHtA+0jFYAKSAdAB0iHQIdIR0BHSMdAx0hFoCJSCaiEVAYqI1WAKkgnQCdIp0CnkuQnMD/8wbsflOZm8/Oz8wefJxeWko/hmPJR+aRklbzyRVlQNpSCUlT01NfU99TP1E36W/pH+ib96640NZKc+aAMrPSff6Dk7M0=</latexit>
+(nh nw ,n in ,n f )
+<latexit sha1_base64="imrhv0p14cgkD0FzJzZoeP+gsxM=">AAAIOXicjdRbT9swFAfw0LGVdTfYHvcSDSEVCaF2mtgr9/ulBXphuFRO6rShuRE7tCXK95q0D7HnvUza09Be9wXmQM4pbUHMUiP79z927Cqy5lkmF7ncj7HUk/Gnz9ITzzMvXr56/WZy6m2Zu4Gvs5LuWq5f1ShnlumwkjCFxaqez6itWayitVfivHLJfG66zrHoeaxm06ZjGqZOhaT6VKo4oxp1IlhXhKYTEdNRiU1FS9PCw+gsdOqGSoRpM646df0M6/rY6nc7Uaa/mBuI/1stLnx4uWRE5gi1vBY9C8mcSigXcTaw3CNbk+Wnsn7ubmU8aMWPTm0kjnc1lGfjFeXg7hKzcWwk0/tbSCrvDYnecEVcAZ0HyvAU/UNAYfbhk8wOp4MHkbGafXwzSRkeYuBFMh3N4DUyrE9O5+ZzN00d7eSTzrSStEJ9avw7abh6YDNH6Bbl/DSf80QtpL4wdYtFGRJw5lG9TZvsVHYdKv+PWnjz8UfqjJSGari+/DlCvdG7M0Jqc96zNVkZf4p8OIvx3oxdONT3ae/eULOjwfEw2IElTN/tDKqgWmBRvxtlMqTBDEI1OwyJfNAoim5JA9KQdCAdqQHUQGJADMkAMpCaQE2kFlALyQQykc6BzpHaQG0kC8hCsoFsJAfIQXKBXCQPyEO6ALpA8oF8JA7EkQSQQAqAAqRLoEukDlAHqQvUReoB9ZCugK5iurUlsCUsWwZaRloBWkFaBVpFWgNaQ1oHWkfaANpA2gTaRNoC2kLaBtpG2gHaQdoF2kXaA9pD2gfaRzoAOkAqABWQikBFpEOgQ6QjoCOkY6BjpBJQCakMVEaqAFWQqkBVpBOgE6QvQF8kySswP3zhjXbKH+fzC/MLxU/Ti8vJZTihvFc+KFklr3xWFpVNpaCUFD31NfUz9Tt1nf6W/pW+Tv+5LU2NJXPeKQMt/fcfGgv4RQ==</latexit>
+(nh nw ,n out ,n f )
+Reshape to Reshape to output shape
+from
+<latexit sha1_base64="wm0nY7CDa872X8dE/XgqRlMK8hk=">AAAIR3icjdRJT9tAFAdw49KGphu0x16sIqQgIZRUFb2y70tYsgAO1tgZJybe8IxJguWvV6mnnvsdKvVU1GPH4PeyQEQtxZr5vf+MZyJ7dN+2GM/nf47Jz8afv8hMvMy+ev3m7bvJqfdl5oWBQUuGZ3tBVSeM2pZLS9ziNq36ASWObtOK3lpJ6pVrGjDLc09416c1hzRcy7QMwgVpU7I2o5iaymmHR5Ybq5arqA7hTV2PjuKLyNVMReWWQ5niasYF5nrY7DXbcbY3mRfy/5stCY6eLu2pcyqx/Sa5iNQ5RSWMJ7WB6Z5Ymoifi/xcfzLpNJNbu/agnKxqqJ5LZhSd/ilmk7KZDu8tIU0+WlSNuseTBDRGxHAXvU1AMDd6J7PD1cGNiLKSe3oxaQw3MfCgEVV4kCj3vVBZbXI6P5+/u5SHjULamJbSq6hNjf9Q654ROtTlhk0YOy/kfV6LSMAtw6ZxVg0Z9YnRIg16LpouEf9OLbr7FGJlRkhdMb1A/Fyu3Gn/iIg4jHUdXSSTF5MN1xJ8tEavXBIEpPtoUXfiwf4wOKHNrcBrDyonemiToBNns2qdmirRnShSxY3EcXxPOpCOZAAZSHWgOhIFokgmkInUAGogNYGaSBaQhXQJdInUAmoh2UA2kgPkILlALpIH5CH5QD7SFdAVUgAUIDEghsSBOFIIFCJdA10jtYHaSB2gDlIXqIt0A3ST0L0tgS1hbBloGWkFaAVpFWgVaQ1oDWkdaB1pA2gDaRNoE2kLaAtpG2gbaQdoB2kXaBdpD2gPaR9oH+kA6ACpCFREOgQ6RDoCOkI6BjpGOgE6QSoBlZDKQGWkClAFqQpURToFOkU6AzoTJI7AwvCB97BR/jxfWJhfOPwyvbicHoYT0kfpk5STCtJXaVHalIpSSTLkb/Iv+Y98m/me+Z25zfy9j8pj6ZgP0sA1MfYPqJf81g==</latexit>
+f in
+<latexit sha1_base64="3kZ8lVDgFZA+LRSeq/7EHbH1TqQ=">AAAISHicjdRJT9tAFAdw49KGphu0x16sIqQgIZSgil7Z9yUsWQAn6dgZJybe8IxJguXPV6mXnvshKvVU1FvH4PeyQEQtxZr5vf+MZyJ7NM8yGc9mf47Jz8afv0hNvEy/ev3m7bvJqfdF5ga+Tgu6a7l+WSOMWqZDC9zkFi17PiW2ZtGS1lqN66Vr6jPTdU5516MVmzQc0zB1wgXVpuSvM4pRUznt8NB0ItV0FNUmvKlp4XFUDZ2aoajctClTnJpexVwPm71mO0r3JnMD/n+zxcHR0yU9dU4lltck1VCdU1TCeFwbmO6JpYn4hcjP9SfjTjO+tSsPyvGqhuqZeEbR6Z9iNi4byfDeEpLko0VVr7s8TkBjRAx30dsEBDOjdzI7XB3ciCgrmacXk8RwEwMPGlGFB4ly/zuQrk1OZ+ezd5fysJFLGtNScuVrU+M/1LqrBzZ1uG4Rxi5yWY9XQuJzU7dolFYDRj2it0iDXoimQ8TfUwnvvoVImRFSVwzXFz+HK3faPyIkNmNdWxPJ+M1kw7UYH63RK4f4Puk+WtTsaLA/DHZgcdN324PKiRZYxO9E6bRap4ZKNDsMVXEjURTdkwakIelAOlIdqI5EgSiSAWQgNYAaSE2gJpIJZCJdAl0itYBaSBaQhWQD2UgOkIPkArlIHpCHdAV0heQD+UgMiCFxII4UAAVI10DXSG2gNlIHqIPUBeoi3QDdxHRvy2DLGFsBWkFaBVpFWgNaQ1oHWkfaANpA2gTaRNoC2kLaBtpG2gHaQdoF2kXaA9pD2gfaRzoAOkA6BDpEygPlkY6AjpCOgY6RToBOkE6BTpEKQAWkIlARqQRUQioDlZHOgM6QzoHOBYkjMDd84D1sFBfmc4vzi0efp5dWksNwQvoofZIyUk76Ii1JW1JeKki6/E3+Jf+Rb1PfU79Tt6m/91F5LBnzQRq4JuR/ckr9YQ==</latexit>
+f out
+<latexit sha1_base64="WJPwdTRHSfIRnZbDMzhOpuxaNec=">AAAISXicjdRJT9tAFAdwE2hD0w3aYy9WEVKQEEpQRa/s+xKWLMCEaOyMExNveMYkwfL3q9RDz/0SlXoq6qlj8HshgYhaijXze/8Zz0T2aJ5lcpHL/RxJjY69eJkef5V5/ebtu/cTkx9K3A18nRV113L9ikY5s0yHFYUpLFbxfEZtzWJlrbUS18vXzOem65yIrseqNm04pmHqVEiqTabotGrUiGAdEZpORExHJTYVTU0Lj6KL0KkZKhGmzbjq1PQLzPWw2Wu2o0xvMjcQ/zdbHBw+XdIjs4RaXpNehGRWJZSLuNY33TNLk/FzmZ99mIw7zfjWrj4qx6saqGfjGWXn4RQzcdlIhveWkCSfLBK97oo4AY0hMdxFbxMQzA7fycxgtX8jsqxmn19MEsNN9D1oSBUeJMvwDghme1GmNjGVm8vdXerjRj5pTCnJVahNjv0gdVcPbOYI3aKcn+dznqiG1BembrEoQwLOPKq3aIOdy6ZD5f9TDe8+hkidllJXDdeXP0eod/pwREhtzru2JpPxq8kHazE+WWNXDvV92n2yqNlRf38Q7MASpu+2+1VQLbCo34kyGVJnBqGaHYZE3mgURfekAWlIOpCOVAeqIzEghmQAGUgNoAZSE6iJZAKZSJdAl0gtoBaSBWQh2UA2kgPkILlALpIH5CFdAV0h+UA+EgfiSAJIIAVAAdI10DVSG6iN1AHqIHWBukg3QDcx3dsS2BLGloGWkVaAVpBWgVaR1oDWkNaB1pE2gDaQNoE2kbaAtpC2gbaRdoB2kHaBdpH2gPaQ9oH2kQ6ADpAKQAWkQ6BDpCOgI6RjoGOkE6ATpCJQEakEVEIqA5WRKkAVpFOgU6QzoDNJ8gjMDx54jxul+bn8wtzC4ZepxeXkMBxXPimflaySV74qi8qmUlCKip76lvqV+pO6TX9P/07fpv/eR1MjyZiPSt81PvoPezr9yQ==</latexit>
+ftemp
+<latexit sha1_base64="z7wwB8APZjET+D6w5JnDDS5zs28=">AAAGBnicbdTJbhNBEAbgToghmM2BIwcsIqRwwLIjFK6JncXZ7cRbkrGsnnHbnng2T/d4iTVHJN4FiRMRV96AM2/D2PFfIktJ3ar+qlqtvpTuWaZU6fTfuflHC7HHTxafxp89f/HyVWLpdUW6gW+IsuFarl/TuRSW6YiyMpUlap4vuK1boqp3c5N6tS98abpOSY08Ubd52zFbpsFVRI3Eu1ZDU2KoxtLjKkxqyrSFTK5kPmnc8jr8YyOxnE6lp5G8n2RmyTKbRaGxtPBHa7pGYAtHGRaX8iKT9lR9zH1lGpYI41oghceNLm+Liyh1ePRgfTz9SZj8EEkz2XL9aDkqOdX/b4y5LeXI1qNOm6uOvFub4IM10XO47/PRg0XdDm+f74IdWMr03cFtVVwPLO4Pw3hca4qWxnV7PNaijYdheEM6SCcyQAZRE9QkEiBB1AK1iNqgNlEH1CEyQSbRJeiSqAvqElkgi8gG2UQOyCFyQS6RB/KIeqAekQ/yiSRIEimQIgpAAVEf1CcagAZEQ9CQaAQaEV2BriZ0YxuwDWrLgrJEOVCOaBO0SbQF2iLaBm0T7YB2iPKgPNEuaJdoD7RHtA/aJzoAHRAdgg6JjkBHRMegY6ICqEBUBBWJTkAnRKegU6ISqERUBpWJKqAKURVUJaqBakRnoDOic9B5RNEIzNwdePeTymoqs5ZaK35eXs/OhuEie8vesxWWYV/YOsuzAiszg31l39lPdh37FvsRu479ummdn5vdecNuRez3P1wjL/U=</latexit>
+fspat ⇥ (1   ↵)
+Figure 3: Architecture of the spatiotemporal
+module. Given a pretrained image diffusion
+UNet, we add a zero-initialized temporal mod-
+ule with an ON/OFF switch to each 2D spatial
+module and initialize the additive weight α to
+zero. Thus, it will add no effect at the start
+of fine-tuning and gradually learn by the video
+training data. The number of frames, height,
+and width are denoted by nf , nh, and nw, re-
+spectively. The numbers of channels for input
+features (fin) and output features (fout) are de-
+noted by nin and nout, respectively.
+Step 1: Training a latent diffusion model (LDM)
+as an image prior We start by training a V AE
+[33] using the standard L1 reconstruction loss
+with a scaled KL divergence loss on an image
+dataset. The KL divergence scaling factor is set
+to much less than 1 to prevent excessive regular-
+ization of the latent space. This allows us to ob-
+tain an image encoder E and decoder D. Once
+they are trained, we fix their parameters and train
+a 2D UNet model sθpzt; σtq using the standard de-
+noising score matching loss [ 59]. Despite recent
+progress in 3D spatiotemporal encoders and de-
+coders [72, 69, 10], we opt for a 2D spatial encoder
+and decoder to process each frame independently.
+This choice is due to efficiency considerations, as
+the decoder D will be called repeatedly in DAPS
+during inference.
+Step 2: Turning an image prior into a spatiotem-
+poral prior Upon obtaining an LDM as an im-
+age prior, we use a spatiotemporal UNet archi-
+tecture to parameterize the time-dependent video
+score function, i.e. sθpzt; σtq « ∇zt log ppzt; σtq,
+leveraging recent advancements in video generation
+[62, 27]. The key component in the architecture
+is the spatiotemporal module for 3D modeling, as
+illustrated in Figure 3. Given a pretrained IDM with a 2D UNet, we introduce a zero-initialized
+temporal module for each 2D spatial module within the UNet. Specifically, for an input feature fin,
+let fout be the output of the spatiotemporal module, with fspat and ftemp representing the outputs of
+the spatial and temporal branches, respectively. These features are combined using an α-blending
+mechanism:
+fout “ p1 ´ αq ¨ fspat ` α ¨ ftemp, (3)
+where α P R is a learnable parameter initialized as 0 in each spatiotemporal module. This design
+allows us to inherit the weights of the 2D spatial modules from the pretrained IDM, significantly
+reducing training time. Additionally, by factorizing the 3D module into a 2D spatial module and a
+1D temporal module, the spatiotemporal UNet has marginal computational overhead compared to the
+original 2D UNet, striking a good balance between model capacity and efficiency.
+Step 3: Image-video joint fine-tuning To further improve performance and be compatibile
+with both image and video inputs, we introduce an ON/OFF switch signal in the spatiotemporal
+module. When the switch is set to OFF (indicating image inputs), the temporal module is disabled
+(or equivalently α “ 0). This ensures that fout “ fspat and reduces the spatiotemporal module to the
+original 2D spatial module, which processes each frame independently. During training, we initialize
+the weights of the spatial modules based on a pretrained image diffusion model and fine-tune all
+parameters of the spatiotemporal UNet using both image and video data. During fine-tuning, the
+model receives video data with probability pjoint P r0, 1s and receives images (with switch set to OFF
+accordingly) with probability 1 ´ pjoint. The probability pjoint is a tunable hyperparameter controlling
+the proportion of real video data in training. Pseudo video regularization helps the spatiotemporal
+UNet retain the spatial capabilities of the initialized spatial UNet. This strategy, proven effective in
+previous work [62], stabilizes training and prevents overfitting to the video dataset.
+4 Experiments
+4.1 Tasks and setup
+We consider two scientific video inverse problems: black hole video reconstruction [21] and dynamic
+MRI [24]. Although both are scientific imaging tasks, they have significantly different characteristics.
+Black hole video reconstruction involves simple spatial structures (usually a ring structure) but
+5
+
+=== PAGE 6 ===
+complex temporal dynamics that obey physical constraints. In contrast, dynamic MRI requires higher
+spatial fidelity with relatively simpler temporal dynamics, such as periodic heartbeat motion.
+Black hole video reconstruction We consider the problem of observing the Sagittarius A* black
+hole using the Event Horizon Telescope (EHT) array in 2017 [ 21]. The measurements consist of
+sparse vectors with a dimensionality of 1,856 derived from an underlying black hole video comprising
+64 frames, each with a spatial resolution of 256 ˆ256 pixels, capturing the black hole’s dynamics
+during the 100-minute observation period. These measurements are given by calculating the closure
+quantities based on the complex visibilities (a detailed description of the problem is available in
+Appendix B.1). For the training dataset, we employ the general relativistic magnetohydrodynamic
+(GRMHD) simulations [66] of Sagittarius A*, covering various black hole models and observational
+conditions. The dataset comprises 648 simulated black hole videos and 50,000 black hole images.
+Dynamic MRI We consider a standard compressed sensing MRI setup with two acceleration
+scenarios: 8ˆ acceleration with 12 auto-calibration signal (ACS) lines and 6ˆ acceleration with 24
+ACS lines. Further details are provided in Appendix B.2. We utilize the publicly available cardiac
+cine MRI dataset from the CMRxRecon Challenge 2023 [ 61] for training. This dataset includes
+3,324 cardiac MRI sequences, each containing fully sampled, ECG-triggered k-space data from 300
+patients, featuring various canonical cardiac imaging views. Each sequence is processed into a video
+consisting of 12 frames with a spatial resolution of 192ˆ192 pixels. We construct the image dataset
+by extracting the individual frames from the videos, resulting in 39,888 images in total.
+4.2 Baselines and our method
+Recall from Sec. 3 that our method leverages a learned spatiotemporal prior to avoid explicitly
+estimating temporal dynamics from measurements at inference time. To evaluate the effectiveness of
+this strategy, we compare our method to existing IDM-based approaches. Based on how temporal
+information is incorporated, we categorize these baseline methods into two groups as follows.
+Group 1: simple heuristics We consider two baselines: BIS [36] and BCS [36]. Batch independent
+sampling (BIS) reconstructs each frame independently, while batch consistent sampling (BCS)
+implicitly incorporates a static temporal prior to enforce consistency across frames.
+Group 2: noise warping We include another line of baselines:
+ş
+-noise [9, 16], and GP-Warp [15].
+These baselines enforce temporal consistency by warping the noise using optical flow estimated
+directly from the measurements. Besides, we include more conventional warping strategies such
+as Bilinear, Bicubic, Nearest from work [9]. For the black hole video reconstruction task, a direct
+inversion from the sparse measurement vector is infeasible. Thus, to demonstrate the upper-bound
+performance of these methods, we leverage the ground truth video as an oracle to derive the optical
+flow. For the dynamic MRI task, we utilize a naive inversion obtained via inverse Fourier trans-
+formation to estimate the optical flow. We follow the methodology of [9], leveraging a pretrained
+model [54] to extract optical flow.
+Ours: two variants of STEP We evaluate two variants differentiated by their spatiotemporal
+priors: STEP (video-only), which uses a spatiotemporal prior trained exclusively on video data,
+and ST EP (image-video joint), which initializes with a pre-trained IDM and undergoes joint image-
+video fine-tuning. We follow the Sec. C to train our priors until convergence. The detailed training
+hyperparameters are summarized in Table 3. To make a fair comparison, we run all the baselines
+with DAPS [75]. The detailed implementation of each baseline can be found at Appendix A and B.3.
+4.3 Metrics
+We evaluate our results on three aspects: (1) spatial similarity, (2) temporal consistency, and (3)
+measurement data fit.
+Spatial Spatial similarity is assessed by calculating Peak Signal-to-Noise Ratio (PSNR), Structural
+Similarity Index Measure (SSIM) [64], and Learned Perceptual Image Patch Similarity (LPIPS) [76].
+Metrics are computed per frame and averaged across all frames. We utilize implementations from
+6
+
+=== PAGE 7 ===
+Table 1: Quantitative results on black hole video reconstruction and dynamic MRI. We compare
+our method against baselines by reporting the mean and standard deviation (shown in parentheses)
+of selected evaluation metrics computed over 10 test videos (FVD is reported without standard
+deviation since it evaluates the set of 10 videos collectively). The results clearly demonstrate that by
+leveraging the spatiotemporal prior, STEP consistently achieves improvements in both spatial quality
+and temporal consistency relative to baseline methods.
+Tasks Methods PSNR ( Ò) SSIM ( Ò) LPIPS ( Ó) d-PSNR (Ò) d-SSIM ( Ò) FVD ( Ó) Data Misfit (Ó)
+Black hole
+BIS [36] 23.79 (1.41) 0.718 (0.047) 0.179 (0.031) 29.26 (1.51) 0.938 (0.015) 1429.42 1.719 (1.277)
+BCS [36] 27.66 (2.04) 0.816 (0.053) 0.124 (0.040) 41.71(1.99) 0.979(0.008) 564.43 1.426 (0.784)
+Bilinear [9] 26.11 (2.05) 0.718 (0.067) 0.151 (0.044) 33.14 (2.33) 0.958 (0.013) 1335.95 1.384 (0.742)
+Bicubic [9] 25.68 (1.88) 0.730 (0.058) 0.163 (0.041) 31.70 (1.88) 0.952 (0.015) 1521.14 1.736 (1.259)
+Nearest [9] 25.29 (1.80) 0.754 (0.059) 0.164 (0.042) 30.76 (1.75) 0.943 (0.017) 1171.07 1.691 (1.020)ş-noise [9, 16] 24.90 (1.52) 0.745 (0.058) 0.163 (0.034) 31.87 (1.93) 0.945 (0.017) 1253.81 1.655 (1.020)
+GP-Warp [15] 23.98 (1.28) 0.721 (0.043) 0.176 (0.029) 29.21 (1.24) 0.938 (0.014) 1395.15 1.721 (1.225)
+STEP (video only) 28.71 (1.81) 0.802 (0.079) 0.120 (0.041) 41.41 (2.39) 0.975 (0.011) 238.36 1.124(0.136)
+STEP (image-video joint) 30.28(2.71) 0.865(0.063) 0.095(0.039) 42.09(2.63) 0.976 (0.011) 170.67 1.114(0.154)
+MRI (8ˆ)
+BIS [36] 35.04 (0.76) 0.889 (0.016) 0.100 (0.012) 38.91 (1.13) 0.918 (0.012) 82.30 9.203 (0.698)
+BCS [36] 35.43 (0.97) 0.893 (0.016) 0.099 (0.012) 39.91 (1.09) 0.931 (0.011) 95.68 9.225 (0.693)
+Bilinear [9] 35.30 (0.96) 0.896 (0.016) 0.098 (0.012) 39.87 (1.14) 0.931 (0.011) 87.90 9.157 (0.670)
+Bicubic [9] 35.31 (0.91) 0.896 (0.016) 0.098 (0.011) 40.11 (1.10) 0.934 (0.010) 108.90 9.189 (0.653)
+Nearest [9] 34.87 (0.90) 0.895 (0.018) 0.099 (0.013) 40.09 (1.14) 0.933 (0.011) 108.57 9.188 (0.656)ş-noise [9, 16] 35.55 (1.03) 0.892 (0.020) 0.099 (0.014) 39.77 (1.36) 0.929 (0.015) 89.59 9.208 (0.693)
+GP-Warp [15] 34.49 (0.65) 0.886 (0.016) 0.102 (0.012) 38.71 (1.14) 0.916 (0.013) 92.19 9.209 (0.659)
+STEP (video only) 37.00 (1.46) 0.927 (0.019) 0.086 (0.013) 43.50(2.70) 0.963 (0.015) 75.27 8.817(0.650)
+STEP (image-video joint) 39.38(1.16) 0.951(0.009) 0.078(0.011) 44.86(1.92) 0.974(0.006) 78.60 8.753(0.603)
+piq [31], normalizing images to the range r0, 1s. For grayscale images, frames are replicated across
+three channels before computing LPIPS scores.
+Temporal Temporal consistency is quantified using delta-based PSNR (d-PSNR) and delta-based
+SSIM (d-SSIM), measuring the similarity of normalized differences between consecutive frames, with
+results averaged over all frames. Additionally, we compute the Fréchet Video Distance (FVD) [56]
+between the reconstructed videos and our test dataset to evaluate distributional similarity.
+Data fit Lastly, we report measurement data fit using task-specific metrics. For the black hole
+video reconstruction task, we employ the unified average ˜χ2 statistic (defined in Equation (13) in
+Appendix), where values closer to 1 indicate better data fidelity. For dynamic MRI, we measure data
+misfit by computing the mean squared error in measurement space.
+4.4 Main results 1
+ST EP reconstructs videos with better spatial and temporal coherence. We provide quantitative
+results in Tab. 1 and visual comparisons in Fig. 4 and Fig. 5. STEP outperforms baselines in
+overall video quality across most metrics and generates video reconstructions with significantly
+better spatiotemporal coherence. Fig. 4 visualizes an x-t slice, representing the temporal evolution
+(horizontal axis) of a spatial slice (marked by the cyan vertical line). We find that the noise warping
+baselines fail to constrain temporal consistency, as indicated by the fluctuating ring diameters in
+the x-t slices, while BCS provides almost static reconstructions. In contrast, ST EP exhibits closer
+alignment with the ground truth and improved temporal consistency. This is further illustrated by
+the averaged optical flow visualization, highlighting that STEP faithfully captures the underlying
+temporal dynamic. Similar trends can be observed in Fig. 5.
+Noise warping is less effective in scientific problems. We observe that the performance of noise-
+warping strategies in challenging scientific VIPs does not correlate with noise-warping accuracy.
+For example, although the
+ş
+-noise approach has demonstrated superior noise-warping capability
+given optical flow (as shown in [9]), it underperforms simpler strategies such as Bilinear and Bicubic
+interpolation in challenging VIPs. This discrepancy arises primarily due to: (1) inaccuracies in the
+optical flow, and (2) the inherent difficulty of effectively manipulating noise in latent space through
+pixel space optical-flow-guided warping. Consequently, methods relying on precise optical flow and
+carefully designed warping strategies struggle with tasks requiring high temporal consistency, such as
+1For better assessment of video reconstruction quality, we strongly encourage the readers to watch our
+supplementary video.
+7
+
+=== PAGE 8 ===
+First frame
+Ground truth
+STeP (joint)
+Avg. optical ﬂow- slice xt Avg. optical ﬂow
+BCS
+∫-noise
+First frame - slice xt Avg. optical ﬂow
+GP-Warp
+BIS
+First frame - slice xt
+x
+t
+Figure 4: Visual examples of ST EP (bottom left) and baselines for black hole video reconstruc-
+tion. To facilitate analysis of the reconstructed spatiotemporal structures, we present results in three
+ways: (1) a single frame to illustrate spatial fidelity, (2) an x-t slice depicting temporal evolution of a
+vertical line to evaluate temporal consistency, and (3) the averaged optical flow visualized using the
+standard color scheme from [54] to assess spatiotemporal coherence jointly. Compared to baselines,
+ST EP exhibits clearer alignment with ground truth videos across all aspects.
+First frame
+Ground truth
+Avg. optical ﬂow
+ First frame
+BCS
+Avg. optical ﬂow
+ First frame
+GP-Warp
+Avg. optical ﬂow
+STeP (joint)
+∫-noise
+BIS
+Figure 5: Visual examples of ST EP (bottom left) and baselines for dynamic MRI. We visualize a
+representative frame along with two zoomed-in regions for each method to better illustrate spatial
+fidelity. Benefiting from its robust spatiotemporal prior,ST EP provide reconstructions with fewer
+structural artifacts and temporal fluctuations, as indicated by its averaged optical flow aligning more
+closely with the ground truth. This demonstrates the effectiveness of our learned spatiotemporal prior
+in enhancing both spatial and temporal consistency.
+black hole video reconstruction. In contrast, our approach employs a data-driven spatiotemporal prior
+learned from training data, effectively overcoming these limitations and enabling broader applicability
+to scientific tasks with significant temporal uncertainty.
+Joint fine-tuning benefits both spatial and temporal consistency. As shown in Tab. 1,STEP with
+an image-video jointly fine-tuned spatiotemporal prior outperforms both IDM-based baselines and
+ST EP trained video data only. To further illustrate these improvements, we provide a detailed visual
+comparison in Fig. 6. In Fig. 6 (a), we analyze the temporal dynamics using averaged delta frames,
+which visualize the averaged differences between consecutive frames over a window. We observe
+that delta frames from BCS remain largely unchanged as the temporal window expands, indicating
+limited temporal variation. In contrast, ST EP (joint) effectively captures more complex and coherent
+temporal dynamics. In Fig. 6 (b), we compare ST EP (joint) and STEP (video only) with a focus on
+spatial fidelity. Although their reconstructions have similar average optical flow,ST EP (joint) have
+fewer artifacts and hallucinations as pointed out by the arrows. Such an improvement highlights the
+value of using image data in both the pre-training and fine-tuning stages.
+ST EP provides diverse and equally plausible solutions. Due to the highly ill-posed and extremely
+sparse measurements in black hole video reconstruction, ST EP can produce multiple semantically
+diverse reconstructions, each visually plausible and consistent with measurement data. Since the
+true posterior distribution is unknown, directly quantifying mode coverage is infeasible. Instead, we
+draw 100 i.i.d. samples and cluster them based on spatial appearance and temporal dynamics. As
+illustrated in Fig. 1, we identify three distinct modes with nearly identical data fidelity (see Tab. 5
+exact data misfit values). One recovered mode aligns closely with the ground truth, while the others
+differ in rotation direction or spatial structure. This demonstrates that our method not only accurately
+reconstructs the underlying ground truth but also discovers additional plausible solutions.
+8
+

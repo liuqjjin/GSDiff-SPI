@@ -1,0 +1,50 @@
+seed: 42
+
+scene:
+  num_gaussians: 500
+  init_scale: 1.5
+  init_mode: random
+
+motion:
+  enable_rotation: true
+
+data:
+  image_size: [64, 64]
+  num_frames: 20
+  num_patterns: 2500
+  pattern_type: random
+  snr_db: 30
+  
+  shape: "assets/tank.png"
+  motion_type: custom_se2
+  motion_mode: 2
+  speed_factor: 1.0
+  gt_velocity: [8, 8]
+  gt_omega: 0.3
+
+solver:
+  type: admm
+  loss_norm: zscore
+
+  # SGD (unused here, kept for compatibility)
+  lr_scene: 0.9e-2
+  lr_motion: 15.0e-2
+  sgd_steps: 2500
+  tv_weight: 0.005
+
+  # ADMM: true ADMM activated
+  num_outer: 80
+  num_inner: 50
+  admm_n_warmup: 20
+  rho: 0.1
+  rho_growth: 1.05
+  admm_tv_weight: 0.005
+  admm_soft_tv_weight: 0.006
+  admm_lr_scene: 0.9e-2
+  admm_lr_motion: 15.0e-2
+
+  # 3D TV enabled
+  use_3dtv: true
+  temporal_tv_weight: 0.05
+
+output_dir: ./results/exp4_admm_true_3dtv_0.05_0.006

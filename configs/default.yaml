@@ -13,13 +13,14 @@ data:
   num_frames: 20
   num_patterns: 2500
   pattern_type: random    # bernoulli | gaussian | random | s_matrix
-  snr_db: 30
+  snr_db: 18
+  time_assignment_mode: uniform  # uniform | interpolation
   shape: "assets/tank.png"                # "7" | "L" | "T" | "circle" | path to image
   motion_type: custom_se2   # custom_se2 | translation | rotation | shear | swirl | translation_and_rotation
   motion_mode: 2            # 1: one frame per pattern, 2: fixed T frames
   speed_factor: 1.0
   gt_velocity: [8, 8]  # [v_y, v_x] pixels total (for custom_se2)
-  gt_omega: 0.0             # radians total (for custom_se2)
+  gt_omega: 0.3         # radians total (for custom_se2)
 
 solver:
   type: admm          # admm | sgd
@@ -31,21 +32,29 @@ solver:
   sgd_steps: 2500
   tv_weight: 0.005
 
-  # ── ADMM (tunable independently) ──────────────────────────
-  num_outer: 80       # all warmup, no Chambolle TV z-step
-  num_inner: 50       # 80×50 = 4000 steps (1.6× SGD)
-  admm_n_warmup: 80   # entire run is data-loss + soft-TV warmup
+  # ADMM: true ADMM activated
+  num_outer: 80
+  num_inner: 50
+  admm_n_warmup: 40
   rho: 0.1
   rho_growth: 1.05
-  admm_tv_weight: 0.005      # Chambolle TV (unused since n_warmup=num_outer)
-  admm_soft_tv_weight: 0.005 # soft differentiable TV in θ-step (same as SGD)
+  admm_tv_weight: 0.005
+  admm_soft_tv_weight: 0.006
   admm_lr_scene: 0.9e-2
   admm_lr_motion: 15.0e-2
 
-  # ── 3D TV: spatial + temporal (optional) ───────────────────
-  use_3dtv: true        # true: add temporal TV term to both solvers
-  temporal_tv_weight: 0.1 # α: weight of temporal TV relative to spatial TV
-                          #    α<1 → weaker temporal constraint
+  # 3D TV enabled
+  use_3dtv: true
+  temporal_tv_weight: 0.05
 
-output_dir: ./results/9
+  # ── Prior selection ────────────────────────────────────────
+  prior_type: diffusion           # tv | diffusion  (default=tv, backward compatible)
+  diffusion_prior:            # only used when prior_type=diffusion
+    checkpoint: checkpoints/diffusion_prior.pt
+    denoise_steps: 5          # 1=Tweedie single-step, 3-5=multi-step DDIM
+    clamp_range: [0.0, 1.0]
+    sigma_start: 0.3         # σ at first z-step (strong denoising)
+    sigma_end: 0.3          # σ at last z-step (weak denoising)
+
+output_dir: ./results/admm_n_warmup_40
  

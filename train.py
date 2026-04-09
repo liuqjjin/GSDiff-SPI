@@ -112,6 +112,8 @@ def main():
     H, W = cfg.data.image_size
     T, K = cfg.data.num_frames, cfg.data.num_patterns
 
+    _time_mode = getattr(cfg.data, 'time_assignment_mode', 'uniform')
+
     data = generate_spi_data(
         H=H, W=W, T=T, K=K,
         pattern_type=cfg.data.pattern_type,
@@ -123,6 +125,7 @@ def main():
         motion_mode=cfg.data.motion_mode,
         gt_velocity=list(cfg.data.gt_velocity) if hasattr(cfg.data, 'gt_velocity') else None,
         gt_omega=cfg.data.gt_omega if hasattr(cfg.data, 'gt_omega') else None,
+        time_assignment_mode=_time_mode,
     )
 
     # Update T in case motion_mode=1 changed it
@@ -154,7 +157,7 @@ def main():
     # ── 4. Build model ────────────────────────────────────────
     scene = GaussianScene2D(cfg.scene.num_gaussians, H, W, cfg.scene.init_scale).to(dev)
     motion = SE2Motion(((H-1)/2.0, (W-1)/2.0), cfg.motion.enable_rotation).to(dev)
-    fwd = SPIForwardModel(scene, motion, H, W).to(dev)
+    fwd = SPIForwardModel(scene, motion, H, W, time_assignment_mode=_time_mode).to(dev)
     print(f"Params: scene={scene.num_params()}, motion={motion.num_params()}")
 
     # ── 4.5. Optional: DGI warm-start for scene amplitudes ───────────
@@ -170,9 +173,27 @@ def main():
     _temp_w   = getattr(cfg.solver, 'temporal_tv_weight', 1.0)
 
     if cfg.solver.type == "admm":
-        prior = TVPrior3D(max_iter=50, temporal_weight=_temp_w) if _use_3dtv \
-                else TVPrior(max_iter=50)
         _s = cfg.solver
+        _prior_type = getattr(_s, 'prior_type', 'tv')
+        if _prior_type == 'tv':
+            prior = TVPrior3D(max_iter=50, temporal_weight=_temp_w) if _use_3dtv \
+                    else TVPrior(max_iter=50)
+        elif _prior_type == 'diffusion':
+            from gsdiff.prior.diffusion import DiffusionPrior
+            _dp = _s.diffusion_prior
+            prior = DiffusionPrior(
+                checkpoint_path=_dp.checkpoint,
+                device=dev,
+                denoise_steps=getattr(_dp, 'denoise_steps', 1),
+                clamp_range=tuple(getattr(_dp, 'clamp_range', [0.0, 1.0])),
+                sigma_start=getattr(_dp, 'sigma_start', 0.3),
+                sigma_end=getattr(_dp, 'sigma_end', 0.05),
+            )
+            # Tell the prior how many z-step calls to expect
+            _n_zsteps = _s.num_outer - getattr(_s, 'admm_n_warmup', 0)
+            prior.set_n_steps(_n_zsteps)
+        else:
+            raise ValueError(f"Unknown prior_type: {_prior_type}")
         solver = ADMMSolver(
             fwd, prior, pat, y, fidx, tg,
             rho=_s.rho,
@@ -196,9 +217,13 @@ def main():
             # Per-pixel TV for readable numbers
             npix = T * H * W
             tv_pp = info['tv'] / npix
+            _sigma_str = ""
+            if _prior_type == 'diffusion' and hasattr(prior, '_current_sigma'):
+                _sigma_str = f"  σ={prior._current_sigma():.4f}"
             print(f"[{l:3d}/{L}]  data={info['loss_data']:.4f}  "
                   f"prim={info['prim_res']:.6f}  TV/px={tv_pp:.4f}  "
-                  f"rho={info['rho']:.3f}  v={[f'{v:.2f}' for v in mp['velocity']]}  "
+                  f"rho={info['rho']:.3f}{_sigma_str}  "
+                  f"v={[f'{v:.2f}' for v in mp['velocity']]}  "
                   f"ω={mp.get('omega', 0):.4f}")
 
     elif cfg.solver.type == "sgd":

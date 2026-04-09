@@ -1,0 +1,29 @@
+# Training config for the video diffusion prior (pixel-space DDPM).
+# Usage: python scripts/train_diffusion_prior.py --config configs/diffusion_prior.yaml
+
+dataset:
+  path: data/video_dataset.pt      # output of generate_video_dataset.py
+  # Expected shape: {"videos": [N, T, H, W] float32 in [0,1]}
+
+model:
+  in_channels: 1
+  base_channels: 32
+  channel_mults: [1, 2, 4]         # -> [32, 64, 128]
+  emb_dim: 128
+
+noise:
+  sigma_min: 0.002
+  sigma_max: 0.5                   # covers ADMM sigma range [0.035, 0.224]
+
+training:
+  batch_size: 8
+  epochs: 200
+  lr: 1.0e-4
+  weight_decay: 1.0e-5
+  ema_decay: 0.999                 # exponential moving average (0=disabled)
+  seed: 42
+  log_every: 100                   # print loss every N steps
+
+output:
+  checkpoint_dir: checkpoints
+  save_every_epoch: 50             # save intermediate checkpoints

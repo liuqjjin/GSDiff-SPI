@@ -5,7 +5,12 @@
 Dynamic single-pixel imaging (SPI) reconstruction using:
 - **2D Gaussian Splatting (2DGS)** for differentiable, compact scene representation
 - **SE(2) rigid-body motion model** — shared translation + rotation across all Gaussians
-- **ADMM with TV regularization** as the main solver (exact proximal operator via Chambolle)
+- **ADMM** as the main solver, with two interchangeable z-step priors:
+  - **TV prior** (`prior/tv.py`): exact Chambolle proximal operator (2D or 3D isotropic)
+  - **Diffusion prior** (`prior/diffusion.py`): pixel-space video DDPM denoiser plugged into the
+    z-step in **PnP-ADMM** style — i.e. `z = D_σ(R(θ) + u)` with an *independent* σ annealing
+    schedule. This is **not** the closed-form proximal of an explicit `g(z)`; it's the standard
+    Plug-and-Play substitution where a learned Gaussian denoiser replaces `prox_{g/ρ}`.
 - **Direct Adam (SGD)** as the baseline solver
 - Optional **3D TV** (spatial + temporal) for both solvers via `use_3dtv: true`
 
@@ -144,14 +149,19 @@ For i = 1..N:
 
 ### 6. ADMM Solver (`solver/admm.py`)
 
-Decouples data fidelity from TV regularization via variable splitting.
+Decouples data fidelity from the prior via variable splitting.
 Auxiliary variable z (video domain), constraint R(θ) = z via augmented Lagrangian.
 
 **Augmented Lagrangian (Boyd 2011 scaled form)**:
 ```
 L_ρ(θ, z, u) = f(θ) + g(z) + (ρ/2)‖R(θ) - z + u‖²
 ```
-where `f(θ)` = data fidelity + soft TV, `g(z) = λ·TV(z)` (Chambolle exact).
+where `f(θ)` = data fidelity + soft TV. The prior `g(z)` is:
+- **TV mode**: `g(z) = λ·TV(z)`, solved exactly by Chambolle dual projection.
+- **Diffusion (PnP) mode**: no explicit `g(z)` — the proximal step is *replaced* by a Gaussian
+  video denoiser `D_σ(·)`, following the standard Plug-and-Play ADMM template (Venkatakrishnan
+  et al. 2013). The denoiser's σ is chosen by an **independent annealing schedule**, not
+  derived from `1/√ρ` or `√(λ/ρ)` (see §7.2 below for the rationale).
 
 **Three-step iteration**:
 ```
@@ -159,35 +169,108 @@ where `f(θ)` = data fidelity + soft TV, `g(z) = λ·TV(z)` (Chambolle exact).
     min_θ  f(θ) + λ_soft·TV(R(θ)) + (ρ/2)‖R(θ) - (z - u)‖²
     target = z − u   ← Boyd sign convention (CRITICAL)
 
-z-step (Chambolle proximal — exact TV denoising):
-    z = prox_{g/ρ}(R(θ) + u)
+z-step:
+    TV mode:        z = prox_{(λ/ρ)·TV}(R(θ) + u)        # exact Chambolle
+    PnP (diffusion): z = D_σ_k(R(θ) + u)                  # learned denoiser, σ from schedule
     input = R(θ) + u   ← Boyd sign convention (CRITICAL)
 
 u-step:
     u ← u + R(θ) − z
 ```
 
-**Warmup mechanism** (current config: `admm_n_warmup = num_outer = 80`):
-- During warmup: skip `(ρ/2)‖·‖²` and z/u updates
-- Allows velocity to converge without z=0 anchoring the scene to zero
-- With `n_warmup = n_outer = 80`: Chambolle z-step NEVER executes → ADMM ≈ SGD with 4000 steps
+**Warmup mechanism**:
+- During warmup (`outer_iter ≤ admm_n_warmup`): skip `(ρ/2)‖·‖²` and z/u updates entirely.
+  The θ-step is pure data fidelity + soft TV, identical to the SGD loss.
+- Allows velocity to converge without z=0 anchoring the scene to zero.
+- **Transition iter** `n_warmup + 1`: θ-step still runs without the consistency term (z is not yet
+  valid), then `z_step` and `u_step` execute to initialize z and u. From `n_warmup + 2` onward,
+  full ADMM with `target = z − u`.
+- The diffusion prior counts its z-step calls and anneals σ over `n_outer − n_warmup` steps. The
+  schedule is initialized via `prior.set_n_steps(n_zsteps)` from `train.py`.
 
-**Why ADMM ≈ SGD currently**: All 80 outer iterations are warmup. The θ-step uses identical soft TV loss as SGD. Only difference: 4000 total gradient steps vs SGD's 2500.
+**`admm_n_warmup` regimes**:
+- `admm_n_warmup = num_outer` → z-step never runs → ADMM ≡ SGD with `num_outer × num_inner` steps.
+- `admm_n_warmup < num_outer` → true ADMM after warmup → prior actually contributes.
 
 **Persistent optimizer**: Adam state preserved across all outer iterations.
 **CosineAnnealingLR**: `T_max = num_outer × num_inner` — matches SGD total budget.
 
 ---
 
-### 7. TV Priors (`prior/tv.py`)
+### 7. Priors
+
+#### 7.1 TV Priors (`prior/tv.py`)
 
 **TVPrior (2D)**: Chambolle dual projection, frame-by-frame.
 - Dual variable: `p ∈ ℝ^{H×W×2}`, step size `τ = 1/8`
+- `proximal(x, weight)` solves `prox_{weight·TV}(x)` exactly. ADMM passes `weight = λ_TV/ρ`.
 
 **TVPrior3D**: Isotropic 3D TV, processes full video jointly.
 - `TV3D(V) = Σ_{t,i,j} √((α·ΔtV)² + (ΔyV)² + (ΔxV)²)`
 - Dual variable: `p ∈ ℝ^{T×H×W×3}`, step size `τ = 1/(8 + 4α²)` (from spectral norm bound)
 - Enabled by `use_3dtv: true`, tuned via `temporal_tv_weight`
+
+#### 7.2 Diffusion Prior (`prior/diffusion.py`) — PnP-ADMM with σ annealing
+
+A pixel-space video diffusion model (`UNet3D` in `prior/unet3d.py`) acts as a **learned Gaussian
+denoiser** in the ADMM z-step:
+
+```
+z = D_σ(R(θ) + u)        single-step Tweedie:  D_σ(v) = v − σ·ε_θ(v, σ)
+                          multi-step DDIM:      iterative denoising from σ down to σ_min
+```
+
+**Why this is PnP, not a strict proximal**: in PnP-ADMM the denoiser is *substituted* into the
+algorithmic slot occupied by `prox_{g/ρ}` without committing to an explicit `g(z)`. There is
+*no* `g(z)` such that the denoiser exactly equals its proximal operator. Convergence relies on
+empirical observations / contraction-style results (Ryu et al. 2019), not strong-convex analysis.
+
+**σ schedule (CRITICAL design choice)**: σ is chosen by an **independent log-linear schedule**
+
+```
+σ_k = exp((1 − k/N)·log(σ_start) + (k/N)·log(σ_end))     k = 0, 1, …, N−1
+N = num_outer − admm_n_warmup
+```
+
+**not** by the seemingly-natural mapping `σ = √(weight) = √(tv_weight/ρ)`. The latter ties
+`σ` to the TV regularization coefficient (which has nothing to do with diffusion prior strength)
+and pushes σ into a regime (`~0.03–0.14`) where the denoiser is essentially the identity,
+making the diffusion prior indistinguishable from mild TV. The independent schedule
+(default `σ_start=0.3 → σ_end=0.05`) keeps σ inside the network's training distribution
+`[σ_min=0.002, σ_max=0.5]` and gives meaningful denoising in the early outer iterations.
+
+**The `weight` argument is still in the signature** (`proximal(x, weight)`) for interface
+compatibility with `TVPrior`, but it is **ignored** by `DiffusionPrior`.
+
+**Counting and bookkeeping**:
+- `train.py` computes `n_zsteps = num_outer − admm_n_warmup` and calls
+  `prior.set_n_steps(n_zsteps)` once after construction.
+- Each `proximal()` call increments `_call_count`, advancing the σ schedule.
+- The current σ is logged each outer iteration (next to ρ).
+
+**Energy monitor**: `DiffusionPrior.energy(x)` returns spatial TV of `x` purely as a *monitoring*
+quantity (so the existing ADMM logging path keeps working). It has no role in optimization.
+
+#### 7.3 UNet3D score network (`prior/unet3d.py`)
+
+Lightweight 3D UNet, ~2.8 M parameters:
+- Input/output: `[B, 1, T, H, W]` (single-channel grayscale video, batch-first)
+- Encoder: Conv3d(1→32) → Down(32→64) → Down(64→128)
+- Middle: ResBlock3D(128)
+- Decoder: Up(128+128→64) → Up(64+64→32) → Conv3d(32→1)
+- Each ResBlock3D has FiLM-style σ conditioning: `log(σ)` → sinusoidal embed → MLP → (scale, shift)
+- ε-prediction objective; conversion to Tweedie inside `DiffusionPrior._tweedie`
+
+#### 7.4 Noise schedule (`prior/noise_schedule.py`)
+
+EDM-style log-linear schedule used **only for training and for clamping σ during inference**:
+
+```
+σ(t) = exp((1−t)·log(σ_min) + t·log(σ_max)),  t ∈ [0,1]
+```
+
+Defaults: `σ_min=0.002`, `σ_max=0.5`. The inference-time σ schedule of `DiffusionPrior` is
+clamped into `[σ_min, σ_max]` so the network is never queried outside its training distribution.
 
 ---
 
@@ -222,19 +305,33 @@ u-step:
 
 ```
 gsdiff/
-├── scene/gaussian2d.py    Canonical 2D Gaussian rendering (differentiable)
-├── motion/se2.py          SE(2) transform of Gaussian params
-├── forward/spi.py         Physics: scene+motion → video → measurements
-├── prior/tv.py            TVPrior (2D Chambolle) + TVPrior3D (3D isotropic)
-├── solver/admm.py         ADMM outer loop (Boyd 2011 scaled form)
-├── solver/sgd.py          Direct Adam baseline
-├── data/simulation.py     Synthetic data generation (multiple motion types)
-├── data/patterns.py       Bernoulli / Gaussian / random / S-matrix patterns
-├── data/dgi.py            DGI baseline reconstruction
-└── utils.py               Seed, config, metrics, I/O
+├── scene/gaussian2d.py     Canonical 2D Gaussian rendering (differentiable)
+├── motion/se2.py           SE(2) transform of Gaussian params
+├── forward/spi.py          Physics: scene+motion → video → measurements
+├── prior/
+│   ├── tv.py               TVPrior (2D Chambolle) + TVPrior3D (3D isotropic)
+│   ├── diffusion.py        DiffusionPrior — PnP denoiser w/ independent σ annealing
+│   ├── unet3d.py           Lightweight 3D UNet ε-prediction network (~2.8M params)
+│   └── noise_schedule.py   EDM-style log-linear σ schedule (training + inference clamp)
+├── solver/admm.py          ADMM outer loop (Boyd 2011 scaled form)
+├── solver/sgd.py           Direct Adam baseline
+├── data/simulation.py      Synthetic data generation (multiple motion types)
+├── data/patterns.py        Bernoulli / Gaussian / random / S-matrix patterns
+├── data/dgi.py             DGI baseline reconstruction
+└── utils.py                Seed, config, metrics, I/O
+
+scripts/
+├── generate_video_dataset.py  Build [N,T,H,W] training set for the diffusion prior
+└── train_diffusion_prior.py   Train UNet3D with ε-prediction loss (EMA optional)
+
+configs/
+├── default.yaml               Main config (solver + prior + diffusion_prior block)
+└── diffusion_prior.yaml       Diffusion-prior training config (UNet, noise, optimizer)
 ```
 
-**Phase 2 extension point**: swap `prior/tv.py` for `prior/diffusion.py` — implement `proximal(x, weight)` interface, no other files change.
+The prior is a plug-in: `train.py` instantiates either `TVPrior(3D)` or `DiffusionPrior` based
+on `solver.prior_type`, and `ADMMSolver` calls `prior.proximal(...)` without knowing which one
+it received. Only `train.py` needs to know about the diffusion-specific `set_n_steps()` call.
 
 ---
 
@@ -253,11 +350,59 @@ gsdiff/
 
 ## How to Run
 
+### Reconstruction (`train.py`)
+
 ```bash
-python train.py                              # ADMM (default)
+python train.py                              # ADMM (default config)
 python train.py --solver sgd                 # SGD baseline
 python train.py --config configs/default.yaml --solver admm
 ```
+
+The prior is selected by `solver.prior_type` in the YAML — `tv` or `diffusion`. The diffusion
+mode requires a trained UNet checkpoint at `solver.diffusion_prior.checkpoint` (see below).
+
+### Training the diffusion prior (one-time)
+
+```bash
+# 1. Generate the training dataset (~5000 SE(2) videos by default)
+python scripts/generate_video_dataset.py
+#   → data/video_dataset.pt   ({"videos": [N, T, H, W] float32 in [0,1]})
+
+# 2. Train the UNet3D ε-prediction network
+python scripts/train_diffusion_prior.py --config configs/diffusion_prior.yaml
+#   → checkpoints/diffusion_prior.pt
+```
+
+After the checkpoint exists, set `solver.prior_type: diffusion` in `configs/default.yaml`
+and run `python train.py` as usual.
+
+### Key configuration knobs
+
+```yaml
+solver:
+  type: admm
+  prior_type: diffusion         # tv | diffusion
+  num_outer: 80
+  num_inner: 50
+  admm_n_warmup: 40             # MUST be < num_outer for diffusion to ever fire
+  rho: 0.1
+  rho_growth: 1.05
+  admm_tv_weight: 0.005         # only used by TV prior
+  admm_soft_tv_weight: 0.006    # soft TV inside θ-step (do NOT set to 0)
+  use_3dtv: true
+  temporal_tv_weight: 0.05
+
+  diffusion_prior:              # only used when prior_type=diffusion
+    checkpoint: checkpoints/diffusion_prior.pt
+    denoise_steps: 1            # 1 = single-step Tweedie, 3-5 = multi-step DDIM
+    clamp_range: [0.0, 1.0]
+    sigma_start: 0.3            # σ at the FIRST z-step (after warmup)
+    sigma_end:   0.05           # σ at the LAST z-step
+```
+
+`sigma_start` and `sigma_end` define the log-linear σ annealing schedule over
+`num_outer − admm_n_warmup` z-step calls. Both values are clamped to `[σ_min, σ_max]` of the
+training schedule (`0.002` and `0.5`).
 
 ---
 
@@ -272,10 +417,36 @@ python train.py --config configs/default.yaml --solver admm
 
 ## Current Status
 
-- Phase 1 complete: ADMM + 2D/3D TV working, SGD baseline working
-- Benchmark (`snr_db=30`, `vel=[8,8]`, `64×64`, `seed=42`):
-  - SGD: PSNR ~23.5 dB, est vel ~[8.0, 7.7]
-  - ADMM (full-warmup, 4000 steps): PSNR ~23.75 dB
-  - DGI baseline: ~6.7 dB
+- ADMM + TV (2D/3D) working; SGD baseline working
+- Diffusion prior integrated as PnP z-step replacement (interface-compatible plug-in)
 - SNR correctly calibrated via `np.var(signal)` (AC-based)
-- Next: Phase 2 = replace TV with spatiotemporal diffusion prior (STEP/DAPS)
+
+### Implementation Notes (verified by experiment)
+
+- **ADMM transition bug fixed**: `step()` has an `is_transition` flag for iteration `n_warmup+1`.
+  On that iteration the θ-step runs without the consistency term (z not yet valid), then z_step and
+  u_step run to initialize z/u. From `n_warmup+2` onward, full ADMM with proper `target = z − u`.
+- **True ADMM outperforms SGD** once the transition fix is applied and `admm_n_warmup < num_outer`.
+- **`temporal_tv_weight` has an optimal range**: empirically `0.05` works best; `0.02` is too weak
+  (insufficient temporal smoothing), `0.08` is too strong (over-smooths across frames).
+- **`admm_soft_tv_weight` must not be set to 0**: removing the soft TV in the θ-step causes a
+  noticeable drop in reconstruction quality. Keep it at `~0.005–0.006`.
+
+### Diffusion-prior Implementation Notes
+
+- **Do NOT derive σ from `tv_weight/ρ`**. An earlier version computed
+  `σ = √(tv_weight/ρ)` inside `DiffusionPrior.proximal`, which collapsed σ to ~0.03–0.14 and made
+  the diffusion prior empirically indistinguishable from a mild TV prior. The fix is the
+  independent log-linear annealing schedule (`sigma_start → sigma_end`) described in §7.2.
+- **`set_n_steps` must be called before the first ADMM step.** `train.py` does this with
+  `n_zsteps = num_outer − admm_n_warmup` immediately after constructing `DiffusionPrior`.
+  Forgetting this leaves `_n_steps = 1`, so σ jumps to `sigma_end` after a single call.
+- **σ is clamped into the training range** `[σ_min, σ_max]` of `NoiseSchedule` so the network is
+  never queried out-of-distribution. If you want larger σ values, retrain the UNet with a larger
+  `sigma_max` in `configs/diffusion_prior.yaml` *before* changing `sigma_start`.
+- **`weight` argument to `DiffusionPrior.proximal` is ignored** (kept only for interface
+  compatibility with `TVPrior`). Changing `admm_tv_weight` has no effect when
+  `prior_type: diffusion`.
+- **PnP, not strict proximal**: there is no explicit `g(z)` such that `D_σ` is its proximal.
+  Convergence guarantees are weaker than the TV/Chambolle case; expect to tune `sigma_start`,
+  `sigma_end`, and `denoise_steps` empirically per scene.
