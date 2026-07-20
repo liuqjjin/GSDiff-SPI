@@ -173,19 +173,34 @@ def main():
         pat_tr, y_tr, fidx_tr = pat, y, fidx
 
     # ── 4. Build model ────────────────────────────────────────
-    scene = GaussianScene2D(cfg.scene.num_gaussians, H, W, cfg.scene.init_scale,
-                            min_scale=getattr(cfg.scene, 'min_scale', 0.0)).to(dev)
+    # scene.type selects the representation: gaussian (default) or an INR/grid/
+    # low-rank canonical (the representation control — same motion, loss, solver).
+    _scene_type = getattr(cfg.scene, 'type', 'gaussian')
     motion = SE2Motion(((H-1)/2.0, (W-1)/2.0), cfg.motion.enable_rotation,
                        poly_degree=getattr(cfg.motion, 'poly_degree', 1),
                        enable_affine=getattr(cfg.motion, 'enable_affine', False)).to(dev)
-    fwd = SPIForwardModel(scene, motion, H, W, time_assignment_mode=_time_mode).to(dev)
-    print(f"Params: scene={scene.num_params()}, motion={motion.num_params()}")
+    if _scene_type == 'gaussian':
+        scene = GaussianScene2D(cfg.scene.num_gaussians, H, W, cfg.scene.init_scale,
+                                min_scale=getattr(cfg.scene, 'min_scale', 0.0)).to(dev)
+        fwd = SPIForwardModel(scene, motion, H, W, time_assignment_mode=_time_mode).to(dev)
+    else:
+        from gsdiff.baselines.inr import build_scene, INRForwardModel
+        scene = build_scene(_scene_type, w0=getattr(cfg.scene, 'siren_w0', 20.0),
+                            r=getattr(cfg.scene, 'lowrank_r', 32)).to(dev)
+        fwd = INRForwardModel(scene, motion, H, W, time_assignment_mode=_time_mode).to(dev)
+    n_scene = sum(p.numel() for p in scene.parameters())
+    print(f"Params: scene[{_scene_type}]={n_scene}, motion={motion.num_params()}")
 
     # ── 4.5. Optional: DGI warm-start for scene amplitudes ───────────
     # NOTE: dgi_reconstruct returns a z-scored image (mean≈0); init_from_image
     # expects [0,1], so normalize first or the amplitude match collapses to 0.
     _init_mode = getattr(cfg.scene, 'init_mode', 'random')
-    if _init_mode == 'dgi':
+    if _scene_type != 'gaussian':
+        # INR/grid/low-rank DGI pre-fit analog (fair only if the Gaussian run also
+        # starts from DGI): fit the canonical field to the motion-blur DGI image.
+        if _init_mode in ('dgi', 'dgi_adaptive'):
+            scene.prefit(normalize_01(dgi_img), fwd.norm_grid(dev))
+    elif _init_mode == 'dgi':
         scene.init_from_image(normalize_01(dgi_img))
     elif _init_mode == 'dgi_adaptive':
         scene.init_adaptive(dgi_img)     # centers ∝ |∇DGI|, amps from intensity

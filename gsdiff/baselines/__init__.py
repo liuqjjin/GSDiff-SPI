@@ -15,7 +15,8 @@ from .common import (build_operator, apply_operator, adjoint, admm_tv,
 from . import cs
 from . import monin
 from . import gidc
+from . import inr
 
 __all__ = ["build_operator", "apply_operator", "adjoint", "admm_tv",
            "dgi_image", "evaluate_video", "select_by_holdout",
-           "holdout_residual", "cs", "monin", "gidc"]
+           "holdout_residual", "cs", "monin", "gidc", "inr"]
