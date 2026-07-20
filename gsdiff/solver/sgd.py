@@ -34,10 +34,18 @@ class SGDSolver:
     def __init__(self, fwd, patterns, y_target, frame_idx, t_grid,
                  tv_weight=0.005, lr_scene=3e-3, lr_motion=1e-2,
                  n_steps=800, loss_norm='zscore', temporal_tv_weight=0.0,
+                 red_prior=None, red_weight=0.0, freeze_motion=False,
                  device='cpu'):
         """
         loss_norm : 'zscore'     → original independent z-score loss (default)
                     'target_std' → normalize by fixed target std only (方案A)
+        red_prior : optional DiffusionPrior — RED-diff style single-loop
+                    diffusion regularizer: loss += red_weight·½‖V − D_σ(V)‖²
+                    with D_σ detached (gradient = detached-residual form) and
+                    σ following the prior's own annealing schedule.
+        freeze_motion : True → motion params excluded from the optimizer
+                    (v=ω=0 forever ⇒ static-scene fit to ALL measurements —
+                    the motion-blurred lower-bound baseline).
         """
         self.fwd = fwd
         self.patterns = patterns.to(device)
@@ -59,11 +67,16 @@ class SGDSolver:
         self.y_norm_scale  = _scale       # scalar tensor, fixed
         self.y_target_norm = y / _scale   # [K] tensor, fixed
 
+        self.red_prior = red_prior
+        self.red_weight = red_weight
+        self.freeze_motion = freeze_motion
+
         sp = list(fwd.scene.parameters())
         mp = list(fwd.motion.parameters())
-        self.optimizer = torch.optim.Adam([
-            {"params": sp, "lr": lr_scene},
-            {"params": mp, "lr": lr_motion}])
+        groups = [{"params": sp, "lr": lr_scene}]
+        if not freeze_motion:
+            groups.append({"params": mp, "lr": lr_motion})
+        self.optimizer = torch.optim.Adam(groups)
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer, T_max=n_steps, eta_min=lr_scene * 0.1)
 
@@ -84,6 +97,10 @@ class SGDSolver:
         loss_d = self._data_loss(y_pred)
         loss_tv = self.tv_weight * tv_loss(video, self.temporal_tv_weight)
         loss = loss_d + loss_tv
+        if self.red_prior is not None and self.red_weight > 0:
+            # RED-diff: pull R(θ) toward its own denoised version (detached)
+            z = self.red_prior.proximal(video.detach(), 0.0)
+            loss = loss + self.red_weight * 0.5 * F.mse_loss(video, z)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(
             list(self.fwd.scene.parameters()) + list(self.fwd.motion.parameters()), 5.0)

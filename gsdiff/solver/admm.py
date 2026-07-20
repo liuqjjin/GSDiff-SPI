@@ -41,10 +41,13 @@ class ADMMSolver:
                  rho=0.1, tv_weight=0.005, lr_scene=5e-3, lr_motion=1e-2,
                  n_inner=100, rho_growth=1.05, loss_norm='zscore', device='cpu',
                  n_warmup=0, n_outer=50, soft_tv_weight=0.0,
-                 temporal_tv_weight=0.0):
+                 temporal_tv_weight=0.0, hqs=False):
         """
         loss_norm : 'zscore'     → original independent z-score loss (default)
                     'target_std' → normalize by fixed target std only (方案A)
+        hqs       : True → u ≡ 0 (half-quadratic splitting ablation: the θ-step
+                    targets z directly and the z-step input is R(θ); isolates
+                    what the ADMM dual/Bregman memory actually contributes)
         """
         self.fwd = fwd
         self.prior = prior
@@ -59,6 +62,7 @@ class ADMMSolver:
         self.n_inner = n_inner
         self.rho_growth = rho_growth
         self.n_warmup = n_warmup
+        self.hqs = hqs
         self._outer_iter = 0
         self.device = device
 
@@ -127,8 +131,9 @@ class ADMMSolver:
             video + self.u, self.tv_weight / (self.rho + 1e-8))
 
     def u_step(self, video):
-        # u ← u + R(θ) - z  (correct in all conventions)
-        self.u = self.u + video - self.z
+        # u ← u + R(θ) - z  (correct in all conventions); HQS keeps u ≡ 0
+        if not self.hqs:
+            self.u = self.u + video - self.z
 
     def step(self):
         self._outer_iter += 1
@@ -144,12 +149,17 @@ class ADMMSolver:
 
         # 只要已经离开 warmup，就执行 z/u 更新
         # 注意：transition 轮也会进这里，从而完成 z/u 初始化
+        z_prev = self.z
         if not in_warmup:
             self.z_step(vid)
             self.u_step(vid)
             self.rho *= self.rho_growth
 
         info["prim_res"] = F.mse_loss(vid, self.z).item()
+        # Diagnostics: dual residual surrogate + dual-variable magnitude
+        # (monotonically growing ‖u‖ signals manifold infeasibility)
+        info["dual_res"] = (self.rho * (self.z - z_prev).pow(2).mean()).item()
+        info["u_norm"] = self.u.abs().mean().item()
         info["tv"] = self.prior.energy(self.z)
         info["rho"] = self.rho
         info["in_warmup"] = in_warmup

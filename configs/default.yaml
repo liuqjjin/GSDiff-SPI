@@ -1,60 +1,64 @@
 seed: 42
 
 scene:
-  num_gaussians: 500
+  num_gaussians: 1000   # 500→1000: the single accepted autoresearch-v3 move
+                        # (31.48→35.10 dB mean; capacity was the binding
+                        # constraint once init+anchor were fixed, 2026-07-18)
   init_scale: 1.5
-  init_mode: random    # random | dgi   (scheme B: DGI amplitude warm-start)
+  init_mode: dgi_adaptive   # random | dgi | dgi_adaptive
+  # dgi_adaptive (centers ∝ |∇DGI|, amps from local intensity) rescues the
+  # translation-only SNR25 collapse (11.4 → 25.1 dB, seeds 7/42) and is
+  # neutral-or-better on rotation (27.6 → 27.8). Verified 2026-07-18.
 
 motion:
-  enable_rotation: false
+  enable_rotation: true
 
 data:
   image_size: [64, 64]
   num_frames: 20
   num_patterns: 2500
-  pattern_type: random    # bernoulli | gaussian | random | s_matrix
-  snr_db: 18
-  time_assignment_mode: uniform  # uniform | interpolation
-  shape: "assets/tank.png"                # "7" | "L" | "T" | "circle" | path to image
-  motion_type: custom_se2   # custom_se2 | translation | rotation | shear | swirl | translation_and_rotation
-  motion_mode: 2            # 1: one frame per pattern, 2: fixed T frames
+  pattern_type: random    # bernoulli | gaussian | random | hadamard_cc | ... (see CLAUDE.md)
+  snr_db: 25
+  time_assignment_mode: uniform
+  shape: "assets/tank.png"
+  motion_type: custom_se2
+  motion_mode: 2
   speed_factor: 1.0
-  gt_velocity: [8, 8]  # [v_y, v_x] pixels total (for custom_se2)
-  gt_omega: 0.3         # radians total (for custom_se2)
+  gt_velocity: [8, 8]
+  gt_omega: 0.3
+  holdout_extra: 250      # non-invasive GT-free eval set (training unaffected)
 
 solver:
-  type: admm          # admm | sgd
-  loss_norm: zscore    # zscore | target_std
+  type: admm
+  loss_norm: zscore
 
-  # ── SGD (do not change) ────────────────────────────────────
+  # ── SGD baseline ───────────────────────────────────────────
   lr_scene: 0.9e-2
   lr_motion: 15.0e-2
   sgd_steps: 2500
   tv_weight: 0.005
 
-  # ADMM: true ADMM activated
+  # ── ADMM ───────────────────────────────────────────────────
   num_outer: 80
   num_inner: 50
-  admm_n_warmup: 40
+  admm_n_warmup: 20
   rho: 0.1
-  rho_growth: 1.05
+  rho_growth: 1.1         # 1.05 → 1.1: +5.3 dB on rotation case w/ dgi_adaptive
+                          # (32.93 ± 0.61 vs 27.59 ± 0.24, 3 seeds, 2026-07-18)
   admm_tv_weight: 0.005
   admm_soft_tv_weight: 0.006
   admm_lr_scene: 0.9e-2
   admm_lr_motion: 15.0e-2
-
-  # 3D TV enabled
   use_3dtv: true
   temporal_tv_weight: 0.05
 
-  # ── Prior selection ────────────────────────────────────────
-  prior_type: diffusion           # tv | diffusion  (default=tv, backward compatible)
-  diffusion_prior:            # only used when prior_type=diffusion
+  # ── Prior ──────────────────────────────────────────────────
+  prior_type: diffusion   # tv | diffusion
+  diffusion_prior:
     checkpoint: checkpoints/diffusion_prior.pt
-    denoise_steps: 5          # 1=Tweedie single-step, 3-5=multi-step DDIM
+    denoise_steps: 1      # single-step Tweedie (deterministic; renoise REJECTED −2.9 dB)
     clamp_range: [0.0, 1.0]
-    sigma_start: 0.3         # σ at first z-step (strong denoising)
-    sigma_end: 0.3          # σ at last z-step (weak denoising)
+    sigma_start: 0.3
+    sigma_end: 0.05       # 0.02 REJECTED (−3.0 dB); constant 0.3 was the old failed state
 
-output_dir: ./results/admm_n_warmup_40
- 
+output_dir: ./results/default_run

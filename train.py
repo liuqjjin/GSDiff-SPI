@@ -125,7 +125,12 @@ def main():
         motion_mode=cfg.data.motion_mode,
         gt_velocity=list(cfg.data.gt_velocity) if hasattr(cfg.data, 'gt_velocity') else None,
         gt_omega=cfg.data.gt_omega if hasattr(cfg.data, 'gt_omega') else None,
+        gt_accel=list(cfg.data.gt_accel) if getattr(cfg.data, 'gt_accel', None) else None,
+        gt_beta=getattr(cfg.data, 'gt_beta', None),
+        noise_sigma_abs=getattr(cfg.data, 'noise_sigma_abs', None),
+        holdout_extra=int(getattr(cfg.data, 'holdout_extra', 0) or 0),
         time_assignment_mode=_time_mode,
+        pattern_order=getattr(cfg.data, 'pattern_order', 'sequential'),
     )
 
     # Update T in case motion_mode=1 changed it
@@ -154,15 +159,37 @@ def main():
     fidx = torch.tensor(data.frame_idx, device=dev)
     tg = torch.tensor(data.t_grid, device=dev)
 
+    # ── 3.5. Optional GT-free measurement holdout ─────────────
+    # holdout_mod=10 → every measurement with k % 10 == holdout_offset is
+    # excluded from the training loss and used only for model selection.
+    _hold_mod = int(getattr(cfg.data, 'holdout_mod', 0) or 0)
+    if _hold_mod > 1:
+        _hold_off = int(getattr(cfg.data, 'holdout_offset', 7)) % _hold_mod
+        hold_mask = torch.tensor((np.arange(K) % _hold_mod) == _hold_off, device=dev)
+        pat_tr, y_tr, fidx_tr = pat[~hold_mask], y[~hold_mask], fidx[~hold_mask]
+        print(f"Holdout: {int(hold_mask.sum())}/{K} measurements (k%{_hold_mod}=={_hold_off})")
+    else:
+        hold_mask = None
+        pat_tr, y_tr, fidx_tr = pat, y, fidx
+
     # ── 4. Build model ────────────────────────────────────────
-    scene = GaussianScene2D(cfg.scene.num_gaussians, H, W, cfg.scene.init_scale).to(dev)
-    motion = SE2Motion(((H-1)/2.0, (W-1)/2.0), cfg.motion.enable_rotation).to(dev)
+    scene = GaussianScene2D(cfg.scene.num_gaussians, H, W, cfg.scene.init_scale,
+                            min_scale=getattr(cfg.scene, 'min_scale', 0.0)).to(dev)
+    motion = SE2Motion(((H-1)/2.0, (W-1)/2.0), cfg.motion.enable_rotation,
+                       poly_degree=getattr(cfg.motion, 'poly_degree', 1),
+                       enable_affine=getattr(cfg.motion, 'enable_affine', False)).to(dev)
     fwd = SPIForwardModel(scene, motion, H, W, time_assignment_mode=_time_mode).to(dev)
     print(f"Params: scene={scene.num_params()}, motion={motion.num_params()}")
 
     # ── 4.5. Optional: DGI warm-start for scene amplitudes ───────────
-    if getattr(cfg.scene, 'init_mode', 'random') == 'dgi':
-        scene.init_from_image(dgi_img)
+    # NOTE: dgi_reconstruct returns a z-scored image (mean≈0); init_from_image
+    # expects [0,1], so normalize first or the amplitude match collapses to 0.
+    _init_mode = getattr(cfg.scene, 'init_mode', 'random')
+    if _init_mode == 'dgi':
+        scene.init_from_image(normalize_01(dgi_img))
+    elif _init_mode == 'dgi_adaptive':
+        scene.init_adaptive(dgi_img)     # centers ∝ |∇DGI|, amps from intensity
+        scene.init_from_image(normalize_01(dgi_img))   # global amplitude scale
 
     # ── 5. Solve ──────────────────────────────────────────────
     t0 = time.time()
@@ -188,6 +215,8 @@ def main():
                 clamp_range=tuple(getattr(_dp, 'clamp_range', [0.0, 1.0])),
                 sigma_start=getattr(_dp, 'sigma_start', 0.3),
                 sigma_end=getattr(_dp, 'sigma_end', 0.05),
+                renoise=getattr(_dp, 'renoise', False),
+                ddim_spacing=getattr(_dp, 'ddim_spacing', 'linear'),
             )
             # Tell the prior how many z-step calls to expect
             _n_zsteps = _s.num_outer - getattr(_s, 'admm_n_warmup', 0)
@@ -195,7 +224,7 @@ def main():
         else:
             raise ValueError(f"Unknown prior_type: {_prior_type}")
         solver = ADMMSolver(
-            fwd, prior, pat, y, fidx, tg,
+            fwd, prior, pat_tr, y_tr, fidx_tr, tg,
             rho=_s.rho,
             tv_weight=getattr(_s, 'admm_tv_weight', _s.tv_weight),
             lr_scene=getattr(_s, 'admm_lr_scene', _s.lr_scene),
@@ -207,6 +236,7 @@ def main():
             n_outer=_s.num_outer,
             soft_tv_weight=getattr(_s, 'admm_soft_tv_weight', 0.0),
             temporal_tv_weight=_temp_w if _use_3dtv else 0.0,
+            hqs=getattr(_s, 'hqs', False),
             device=dev)
 
         L = cfg.solver.num_outer
@@ -227,13 +257,27 @@ def main():
                   f"ω={mp.get('omega', 0):.4f}")
 
     elif cfg.solver.type == "sgd":
+        # Optional RED-diff single-loop diffusion regularizer
+        _red_w = float(getattr(cfg.solver, 'red_weight', 0.0) or 0.0)
+        _red_prior = None
+        if _red_w > 0:
+            from gsdiff.prior.diffusion import DiffusionPrior
+            _dp = cfg.solver.diffusion_prior
+            _red_prior = DiffusionPrior(
+                checkpoint_path=_dp.checkpoint, device=dev, denoise_steps=1,
+                clamp_range=tuple(getattr(_dp, 'clamp_range', [0.0, 1.0])),
+                sigma_start=getattr(_dp, 'sigma_start', 0.3),
+                sigma_end=getattr(_dp, 'sigma_end', 0.05))
+            _red_prior.set_n_steps(cfg.solver.sgd_steps)
         solver = SGDSolver(
-            fwd, pat, y, fidx, tg,
+            fwd, pat_tr, y_tr, fidx_tr, tg,
             tv_weight=cfg.solver.tv_weight,
             lr_scene=cfg.solver.lr_scene, lr_motion=cfg.solver.lr_motion,
             n_steps=cfg.solver.sgd_steps,
             loss_norm=getattr(cfg.solver, 'loss_norm', 'zscore'),
             temporal_tv_weight=_temp_w if _use_3dtv else 0.0,
+            red_prior=_red_prior, red_weight=_red_w,
+            freeze_motion=getattr(cfg.solver, 'freeze_motion', False),
             device=dev)
 
         N = cfg.solver.sgd_steps
@@ -257,6 +301,40 @@ def main():
         y_pred, _ = fwd(pat, fidx, tg)      # [K]
     recon_np = recon_video[:, 0].cpu().numpy()  # [T,H,W]
     y_pred_np = y_pred.cpu().numpy()
+
+    # GT-free residuals (z-scored, matches the training loss convention)
+    def _zs_residual(pred, target):
+        zs = lambda v: (v - v.mean()) / (v.std() + 1e-8)
+        return float(0.5 * torch.nn.functional.mse_loss(zs(pred), zs(target)))
+    holdout_residual = None
+    if hold_mask is not None:
+        holdout_residual = _zs_residual(y_pred[hold_mask], y[hold_mask])
+        train_residual = _zs_residual(y_pred[~hold_mask], y[~hold_mask])
+        print(f"  Holdout residual: {holdout_residual:.6f}  (train: {train_residual:.6f})")
+    else:
+        train_residual = _zs_residual(y_pred, y)
+    # Non-invasive eval set (fresh random patterns; training data untouched)
+    eval_residual = None
+    eval_residual_pf = None
+    if data.eval_patterns is not None:
+        ev_fidx_t = torch.tensor(data.eval_frame_idx, device=dev)
+        with torch.no_grad():
+            y_pred_ev, _ = fwd(torch.tensor(data.eval_patterns, device=dev),
+                               ev_fidx_t, tg)
+        y_ev = torch.tensor(data.eval_measurements, device=dev)
+        eval_residual = _zs_residual(y_pred_ev, y_ev)
+        # Per-frame z-scored variant: removes the per-frame affine gauge, the
+        # same gauge the per-frame normalize_01 PSNR evaluation ignores. The
+        # global variant penalizes frame-flux-trajectory error that stronger
+        # priors trade for shape quality — misaligned with the paper metric.
+        pf = []
+        for f in range(T):
+            m = ev_fidx_t == f
+            if int(m.sum()) >= 4:
+                pf.append(_zs_residual(y_pred_ev[m], y_ev[m]))
+        eval_residual_pf = float(np.mean(pf)) if pf else None
+        print(f"  Eval residual (Ke={len(data.eval_measurements)}): "
+              f"global {eval_residual:.6f}  per-frame {eval_residual_pf:.6f}")
 
     # ── 7. Evaluate ───────────────────────────────────────────
     print("\n=== Results ===")
@@ -308,7 +386,14 @@ def main():
         "velocity_error": vel_err,
         "est_omega": me.get('omega', 0),
         "gt_omega": data.gt_omega,
+        "est_accel": me.get('accel'),
+        "est_beta": me.get('beta'),
+        "est_lin": me.get('lin'),
         "motion_type": data.motion_type,
+        "holdout_residual": holdout_residual,
+        "train_residual": train_residual,
+        "eval_residual": eval_residual,
+        "eval_residual_pf": eval_residual_pf,
     })
     with open(os.path.join(out_dir, "results.json"), "w", encoding='utf-8') as f:
         json.dump(results, f, indent=2)

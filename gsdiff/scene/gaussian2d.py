@@ -8,14 +8,19 @@ import math, torch, torch.nn as nn, torch.nn.functional as F
 
 class GaussianScene2D(nn.Module):
 
-    def __init__(self, M: int, H: int, W: int, init_scale: float = 1.5):
+    def __init__(self, M: int, H: int, W: int, init_scale: float = 1.5,
+                 min_scale: float = 0.0):
         """
         M: number of Gaussians
         H, W: image size
         init_scale: initial std-dev of each Gaussian in pixels
+        min_scale: lower clamp on scales in pixels (0 = off). Sub-pixel
+            Gaussians sampled on the pixel grid bias integral-type
+            measurements (SPI inner products) — ~0.3 px is a sane guard.
         """
         super().__init__()
         self.M, self.H, self.W = M, H, W
+        self.min_scale = float(min_scale)
 
         # Centers uniform in [0, H) x [0, W)
         self.centers = nn.Parameter(torch.rand(M, 2) * torch.tensor([float(H), float(W)]))
@@ -32,7 +37,10 @@ class GaussianScene2D(nn.Module):
 
     def get_scales(self):
         """Returns [M, 2] positive scale values."""
-        return torch.exp(self.log_scales)
+        s = torch.exp(self.log_scales)
+        if self.min_scale > 0:
+            s = s.clamp(min=self.min_scale)
+        return s
 
     def get_amplitudes(self):
         """Returns [M] positive amplitudes."""
@@ -108,3 +116,28 @@ class GaussianScene2D(nn.Module):
 
         print(f"  Scene init (dgi): mean {current_mean:.4f} → {target_mean:.4f} "
               f"(×{scale:.3f})")
+
+    def init_adaptive(self, dgi_img, floor=0.2):
+        """Content-adaptive init (Image-GS style): sample centers from
+        |∇DGI| + uniform floor, set amplitudes from local DGI intensity.
+
+        Uses the global numpy RNG (seeded by set_seed) for reproducibility.
+        Call init_from_image afterwards for the global amplitude scale.
+        """
+        import numpy as np
+        img = np.asarray(dgi_img, dtype=np.float64)
+        img = (img - img.min()) / (img.max() - img.min() + 1e-12)
+        gy, gx = np.gradient(img)
+        w = np.hypot(gy, gx)
+        w = w / (w.max() + 1e-12) + floor
+        p = (w / w.sum()).ravel()
+        idx = np.random.choice(img.size, size=self.M, p=p)
+        ys, xs = np.unravel_index(idx, img.shape)
+        centers = np.stack([ys, xs], 1) + (np.random.rand(self.M, 2) - 0.5)
+        amps = np.clip(img[ys, xs], 0.05, None)
+        with torch.no_grad():
+            self.centers.data.copy_(torch.tensor(centers, dtype=torch.float32))
+            self.raw_amps.data.copy_(
+                torch.log(torch.expm1(torch.tensor(amps, dtype=torch.float32))))
+        print(f"  Scene init (adaptive): centers ∝ |∇DGI|+{floor}, "
+              f"amps from local intensity")

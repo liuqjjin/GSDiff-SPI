@@ -34,7 +34,10 @@ class DiffusionPrior:
                  channel_mults: Optional[List[int]] = None, emb_dim: int = 128,
                  sigma_min: float = 0.002, sigma_max: float = 0.5,
                  # Independent σ annealing schedule (decoupled from ρ)
-                 sigma_start: float = 0.3, sigma_end: float = 0.05):
+                 sigma_start: float = 0.3, sigma_end: float = 0.05,
+                 # Ablation flags (defaults preserve historical behaviour)
+                 renoise: bool = False,          # z = D_σ(v + σ·ε) instead of D_σ(v)
+                 ddim_spacing: str = 'linear'):  # 'linear' | 'log' σ ladder in DDIM
         self.schedule = NoiseSchedule(sigma_min=sigma_min, sigma_max=sigma_max)
         self.denoise_steps = denoise_steps
         self.clamp_range = clamp_range
@@ -44,6 +47,9 @@ class DiffusionPrior:
         self.sigma_end = max(sigma_min, min(sigma_end, sigma_max))
         self._call_count = 0
         self._n_steps = 1  # will be set by caller (= num_outer - n_warmup)
+        self.renoise = renoise
+        assert ddim_spacing in ('linear', 'log')
+        self.ddim_spacing = ddim_spacing
 
         self.net = UNet3D(in_channels=in_channels, base_channels=base_channels,
                           channel_mults=channel_mults, emb_dim=emb_dim)
@@ -85,6 +91,11 @@ class DiffusionPrior:
         with torch.no_grad():
             # [T,1,H,W] -> [1,1,T,H,W]  (batch=1, channel=1)
             v = x.permute(1, 0, 2, 3).unsqueeze(0)
+            if self.renoise:
+                # Re-noise so the denoiser sees an on-manifold input at level σ
+                # (v's deviation from the clean manifold is neither Gaussian
+                # nor at level σ — the known failure mode of naive PnP).
+                v = v + sigma * torch.randn_like(v)
             sigma_t = torch.tensor([sigma], device=self.device, dtype=torch.float32)
 
             if self.denoise_steps == 1:
@@ -113,9 +124,14 @@ class DiffusionPrior:
     # ── internal: multi-step DDIM ──────────────────────────────
     def _multistep_ddim(self, z_noisy, sigma_start):
         """DDIM from sigma_start down to sigma_min."""
-        sigmas = torch.linspace(
-            sigma_start, self.schedule.sigma_min,
-            self.denoise_steps + 1, device=self.device)
+        if self.ddim_spacing == 'log':
+            sigmas = torch.logspace(
+                math.log10(sigma_start), math.log10(self.schedule.sigma_min),
+                self.denoise_steps + 1, device=self.device)
+        else:
+            sigmas = torch.linspace(
+                sigma_start, self.schedule.sigma_min,
+                self.denoise_steps + 1, device=self.device)
         z = z_noisy
         z0_pred = z_noisy
         for i in range(self.denoise_steps):

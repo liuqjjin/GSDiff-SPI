@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from PIL import Image
 from skimage import transform
 import os
-from .patterns import generate_patterns
+from .patterns import generate_patterns, apply_pattern_order
 
 
 @dataclass
@@ -27,6 +27,13 @@ class SPIData:
     motion_type: str
     H: int; W: int; T: int; K: int
     snr_db: float
+    # Optional NON-INVASIVE eval set (extra measurements never shown to the
+    # solver; training data is byte-identical whether or not this exists).
+    # Always random U[0,1] patterns from RandomState(seed+9999) — a neutral,
+    # family-independent generalization probe.
+    eval_patterns: np.ndarray = None      # [Ke,H,W]
+    eval_measurements: np.ndarray = None  # [Ke]
+    eval_frame_idx: np.ndarray = None     # [Ke]
 
 
 # ─── Image loading ──────────────────────────────────────────
@@ -192,7 +199,20 @@ def simulate_motion(img, motion_type, num_frames, speed_factor=1.0, dim=None):
 
 
 # ─── Noise ───────────────────────────────────────────────────
-def _add_noise(signal, snr_db, rng):
+def _add_noise(signal, snr_db, rng, sigma_abs=None):
+    """AC-variance SNR convention (default) or detector-referred absolute σ.
+
+    sigma_abs, when set, takes precedence over snr_db. The variance convention
+    is NOT transferable across pattern families: for coefficient-ordered bases
+    (Hadamard/Fourier/S-matrix) var(y) is dominated by a few huge low-frequency
+    coefficients, so the same snr_db implies a far larger absolute noise floor
+    than for random patterns (e.g. 64x64 tank scene @25dB: σ=1.77 vs 0.45) and
+    drowns the coefficient tail. Cross-family benchmarks must use sigma_abs
+    (same detector ⇒ same absolute noise; multiplex advantages then show up
+    naturally instead of being erased by the convention).
+    """
+    if sigma_abs is not None and sigma_abs > 0:
+        return signal + rng.normal(0, sigma_abs, signal.shape)
     if snr_db <= 0: return signal
     sig_pow = np.var(signal)
     noise_pow = sig_pow / (10 ** (snr_db / 10))
@@ -232,7 +252,12 @@ def generate_spi_data(
     # For custom_se2: explicit velocity/omega (overrides speed_factor)
     gt_velocity=None,          # [vy, vx] pixels total
     gt_omega=None,             # radians total
+    gt_accel=None,             # [ay, ax] pixels·t⁻² (accelerated SE(2), optional)
+    gt_beta=None,              # radians·t⁻² (angular acceleration, optional)
+    noise_sigma_abs=None,      # detector-referred absolute noise σ (overrides snr_db)
+    holdout_extra=0,           # Ke extra eval measurements (non-invasive GT-free metric)
     time_assignment_mode="uniform",   # uniform | interpolation
+    pattern_order="sequential",       # sequential | stratified | random
 ) -> SPIData:
     """Generate complete dynamic SPI dataset.
 
@@ -253,12 +278,16 @@ def generate_spi_data(
         from scipy.ndimage import rotate as nd_rotate, shift as nd_shift
         vel = np.array(gt_velocity, dtype=np.float64)
         omega = gt_omega if gt_omega is not None else 0.0
+        acc = np.array(gt_accel, dtype=np.float64) if gt_accel is not None else np.zeros(2)
+        beta = gt_beta if gt_beta is not None else 0.0
         t_grid = np.linspace(0, 1, T)
         gt_frames = np.zeros((T, H, W), dtype=np.float64)
         for i, t in enumerate(t_grid):
-            f = nd_rotate(canonical.astype(np.float64), np.degrees(omega * t),
+            angle_t = omega * t + beta * t * t
+            shift_t = vel * t + acc * t * t
+            f = nd_rotate(canonical.astype(np.float64), np.degrees(angle_t),
                           reshape=False, order=1, mode='constant', cval=0)
-            f = nd_shift(f, [vel[0] * t, vel[1] * t], order=1, mode='constant', cval=0)
+            f = nd_shift(f, shift_t, order=1, mode='constant', cval=0)
             gt_frames[i] = np.clip(f, 0, 1)
     else:
         # Use simulate_motion (your old code's motion types)
@@ -281,8 +310,9 @@ def generate_spi_data(
     if 't_grid' not in locals():
         t_grid = np.linspace(0, 1, T)
 
-    # 3. Patterns
+    # 3. Patterns (family rank order), then temporal display schedule
     patterns = generate_patterns(H, W, K, pattern_type, seed)
+    patterns = apply_pattern_order(patterns, pattern_order, T, seed)
 
     # 4. Frame index: pattern k → frame f(k)
     ppf = max(1, int(np.ceil(K / T)))
@@ -300,9 +330,24 @@ def generate_spi_data(
         raise ValueError(f"Unknown time_assignment_mode: {time_assignment_mode}")
 
     # 6. Noise
-    meas = _add_noise(meas, snr_db, rng).astype(np.float32)
+    meas = _add_noise(meas, snr_db, rng, sigma_abs=noise_sigma_abs).astype(np.float32)
+
+    # 7. Optional non-invasive eval set (own RNG stream — steps 1-6 unaffected).
+    #    In-training holdout (removing measurements) was found to destabilize
+    #    the knife-edge joint scene+motion basin; this probe set does not.
+    ev_pat = ev_meas = ev_fidx = None
+    if holdout_extra and holdout_extra > 0 and time_assignment_mode == "uniform":
+        Ke = int(holdout_extra)
+        rng_e = np.random.RandomState(seed + 9999)
+        ev_pat = rng_e.rand(Ke, H, W).astype(np.float32)
+        ev_fidx = np.clip((np.arange(Ke) * T) // Ke, 0, T - 1).astype(np.int64)
+        ev_meas = np.array([np.sum(ev_pat[j] * gt_frames[ev_fidx[j]])
+                            for j in range(Ke)], dtype=np.float64)
+        ev_meas = _add_noise(ev_meas, snr_db, rng_e,
+                             sigma_abs=noise_sigma_abs).astype(np.float32)
 
     return SPIData(
+        eval_patterns=ev_pat, eval_measurements=ev_meas, eval_frame_idx=ev_fidx,
         canonical=canonical, gt_frames=gt_frames.astype(np.float32),
         patterns=patterns, measurements=meas,
         frame_idx=frame_idx, t_grid=t_grid.astype(np.float32),
