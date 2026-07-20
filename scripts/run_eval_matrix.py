@@ -48,7 +48,11 @@ def make_cfg(base, tgt_shape, motion, seed, out_dir, scene_type="gaussian"):
     cfg["motion"]["enable_rotation"] = motion.get("enable_rotation", True)
     cfg["motion"]["poly_degree"] = motion.get("poly_degree", 1)
     if scene_type != "gaussian":
-        cfg["scene"] = {"type": scene_type, "siren_w0": 20.0, "init_mode": "dgi"}
+        # GT-free-tuned INR config: ω₀=10 (SIREN's default 30 injects grid-noise
+        # that prevents joint motion convergence — v diverges; ω₀=10 converges
+        # motion to v_err≈0), random init (a DGI pre-fit freezes the field at a
+        # motion-blur local min that also breaks motion). See spec §5.1.
+        cfg["scene"] = {"type": scene_type, "siren_w0": 10.0, "init_mode": "random"}
         cfg["solver"]["type"] = "sgd"; cfg["solver"]["sgd_steps"] = 4000
         cfg["solver"]["lr_scene"] = 3e-3
     cfg["output_dir"] = out_dir

@@ -35,7 +35,7 @@ class SGDSolver:
                  tv_weight=0.005, lr_scene=3e-3, lr_motion=1e-2,
                  n_steps=800, loss_norm='zscore', temporal_tv_weight=0.0,
                  red_prior=None, red_weight=0.0, freeze_motion=False,
-                 device='cpu'):
+                 motion_warmup=0, device='cpu'):
         """
         loss_norm : 'zscore'     → original independent z-score loss (default)
                     'target_std' → normalize by fixed target std only (方案A)
@@ -70,6 +70,9 @@ class SGDSolver:
         self.red_prior = red_prior
         self.red_weight = red_weight
         self.freeze_motion = freeze_motion
+        self.motion_warmup = motion_warmup   # steps of scene-frozen motion-only optim
+        self._step = 0
+        self._scene_params = list(fwd.scene.parameters())
 
         sp = list(fwd.scene.parameters())
         mp = list(fwd.motion.parameters())
@@ -102,10 +105,19 @@ class SGDSolver:
             z = self.red_prior.proximal(video.detach(), 0.0)
             loss = loss + self.red_weight * 0.5 * F.mse_loss(video, z)
         loss.backward()
+        # Motion warmup: for the first motion_warmup steps optimize ONLY motion
+        # (zero scene grads) so the few-DOF motion locks onto the DGI-pre-fit
+        # canonical before the flexible scene can absorb the motion. Essential for
+        # INR/grid scenes (a SIREN otherwise deforms to explain the data at v=0).
+        if self._step < self.motion_warmup:
+            for p in self._scene_params:
+                if p.grad is not None:
+                    p.grad.zero_()
         torch.nn.utils.clip_grad_norm_(
             list(self.fwd.scene.parameters()) + list(self.fwd.motion.parameters()), 5.0)
         self.optimizer.step()
         self.scheduler.step()
+        self._step += 1
         return {
             "loss_data": loss_d.item(),
             "tv": loss_tv.item(),

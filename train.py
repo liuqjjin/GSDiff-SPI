@@ -284,6 +284,7 @@ def main():
                 sigma_start=getattr(_dp, 'sigma_start', 0.3),
                 sigma_end=getattr(_dp, 'sigma_end', 0.05))
             _red_prior.set_n_steps(cfg.solver.sgd_steps)
+        _mwarm = int(getattr(cfg.solver, 'motion_warmup', 0))
         solver = SGDSolver(
             fwd, pat_tr, y_tr, fidx_tr, tg,
             tv_weight=cfg.solver.tv_weight,
@@ -293,7 +294,7 @@ def main():
             temporal_tv_weight=_temp_w if _use_3dtv else 0.0,
             red_prior=_red_prior, red_weight=_red_w,
             freeze_motion=getattr(cfg.solver, 'freeze_motion', False),
-            device=dev)
+            motion_warmup=_mwarm, device=dev)
 
         N = cfg.solver.sgd_steps
         for i in range(1, N + 1):
