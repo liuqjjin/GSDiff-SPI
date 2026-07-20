@@ -65,18 +65,26 @@ def _tv_l1(x):
 
 
 def _paper_cfg(H, W, T, seed, **kw):
-    """ReCINR's tuned paper operating point (configs/paper_r2.toml), sized to our grid."""
+    """ReCINR config, RE-TUNED for GSDiff's underdetermined random-pattern regime.
+
+    ReCINR's spinning-S-matrix paper knobs (K=25, flow_scale=1.5, tv_xy=3e-7) do
+    NOT transfer: here each frame is underdetermined, so a GT-free coordinate
+    descent + K sweep + best-holdout early stopping moved the operating point to
+    flow_scale=0.5, tv_xy=1e-5, lam_tv_canon=1e-4 and (crucially) n_nodes≈1.7·T
+    render nodes so the 20 measured times interpolate between more warp nodes,
+    forcing smooth low-rank motion instead of per-frame overfitting (11→17 dB).
+    """
     d = dict(img_H=H, img_W=W, K=T, hidden=32, render_layers=3, out_act="softplus",
-             warp_arch="lowrank", warp_order=0, warp_t_harmonics=2, flow_scale=1.5,
+             warp_arch="lowrank", warp_order=0, warp_t_harmonics=2, flow_scale=0.5,
              pe_xy=2, pe_t=5, pe_anneal_frac=0.6, anchor_tau=0.5,
-             warm_epochs=600, flow_only_epochs=600, epochs=1500, lr0=3e-3, lr1=1e-3,
-             lam_flow_t=0.5, lam_flow_xy=0.2, lam_l1=0.05, tv_xy=3e-7,
-             lam_tv_canon=1e-5, lam_ttv=0.0, seed=seed)
+             warm_epochs=300, flow_only_epochs=400, epochs=1200, lr0=3e-3, lr1=1e-3,
+             lam_flow_t=0.5, lam_flow_xy=0.2, lam_l1=0.05, tv_xy=1e-5,
+             lam_tv_canon=1e-4, lam_ttv=0.0, seed=seed)
     d.update(kw)
     return ReCINRConfig(**d)
 
 
-def recinr_baseline(data, device="cuda", n_nodes=None, **cfg_kw):
+def recinr_baseline(data, device="cuda", n_nodes=None, interp=False, **cfg_kw):
     """Run ReCINR on GSDiff-SPI data. Returns (recon [T,H,W], info).
 
     n_nodes = number of continuous render KEY NODES during training (ReCINR's K —
@@ -85,7 +93,7 @@ def recinr_baseline(data, device="cuda", n_nodes=None, **cfg_kw):
     at the T GT frame times for evaluation. Defaults to T.
     """
     H, W, T = data.H, data.W, data.T
-    K_nodes = int(n_nodes) if n_nodes else T
+    K_nodes = int(n_nodes) if n_nodes else int(round(1.7 * T))   # tuned: K≈1.7·T
     cfg = _paper_cfg(H, W, T, seed=int(getattr(data, "seed", 42) or 42), **cfg_kw)
     cfg.K = K_nodes
     torch.manual_seed(cfg.seed); np.random.seed(cfg.seed)
@@ -95,7 +103,14 @@ def recinr_baseline(data, device="cuda", n_nodes=None, **cfg_kw):
                                device=device).unsqueeze(1)            # [K,1,H,W]
     t_grid = torch.as_tensor(data.t_grid, dtype=torch.float32, device=device)  # [T]
     fidx = torch.as_tensor(data.frame_idx, dtype=torch.long, device=device)
-    tau_meas = t_grid[fidx]                                           # [K] each meas' frame time
+    Kmeas = patterns.shape[0]
+    if interp:
+        # ReCINR-native continuous-time sampling: measurement k at t_k=k/(K-1),
+        # matching data generated with time_assignment_mode='interpolation'. Gives
+        # the continuous warp fine temporal sampling instead of 20 blocked times.
+        tau_meas = torch.linspace(0, 1, Kmeas, device=device)        # [K] continuous
+    else:
+        tau_meas = t_grid[fidx]                                      # [K] each meas' frame time
     t_nodes = torch.linspace(0, 1, K_nodes, device=device)           # [K_nodes] render nodes
     t_eval = t_grid                                                  # [T] GT frame times (eval)
     y = torch.as_tensor(data.measurements, dtype=torch.float32, device=device)
@@ -137,6 +152,7 @@ def recinr_baseline(data, device="cuda", n_nodes=None, **cfg_kw):
     opt = torch.optim.Adam(warp_params, lr=cfg.lr0)
     sched = None
     anneal_epochs = max(1, int(cfg.pe_anneal_frac * total_ep))
+    best_val, best_recon = np.inf, None
     for ep in range(total_ep):
         if ep == flow_ep:
             for p in canon_params:
@@ -170,16 +186,27 @@ def recinr_baseline(data, device="cuda", n_nodes=None, **cfg_kw):
         opt.step()
         if sched is not None:
             sched.step()
+        # Best-holdout snapshot early stopping (ReCINR's own protocol): ReCINR
+        # over-trains on GSDiff's underdetermined data (full budget < reduced
+        # budget), so keep the recon at its lowest GT-free holdout residual.
+        if ep >= flow_ep and (ep % 50 == 0 or ep == total_ep - 1):
+            with torch.no_grad():
+                if val_pack is not None:
+                    rec = net.get_key_estimates(t_eval)[0][:, 0].cpu().numpy()
+                    v = holdout_residual(rec, *val_pack)
+                else:
+                    v = float(F.mse_loss(y_pred[0, val_mask], y_target[0, val_mask]).item())
+                    rec = None
+                if v < best_val:
+                    best_val = v
+                    best_recon = rec if rec is not None else \
+                        net.get_key_estimates(t_eval)[0][:, 0].cpu().numpy()
 
     with torch.no_grad():
         net.scene.set_pe_progress(1.0)
-        I_final, _ = net.get_key_estimates(t_eval)           # render at the T GT frame times
-        recon = I_final[:, 0].cpu().numpy()                  # [T,H,W]
-        yv, _, _, _ = net(patterns=patterns, tau_meas=tau_meas, t_nodes=t_nodes, n_cycles=1)
-        holdout = (float(F.mse_loss(yv[0, val_mask], y_target[0, val_mask]).item())
-                   if val_mask.any() else
-                   holdout_residual(recon, *val_pack) if val_pack else None)
-
+        if best_recon is None:                               # no snapshot taken
+            best_recon = net.get_key_estimates(t_eval)[0][:, 0].cpu().numpy()
+    recon, holdout = best_recon, best_val if best_val < np.inf else None
     psnrs, mean_p = evaluate_video(data.gt_frames, recon)
     return recon, {"method": "recinr", "mean_psnr": mean_p, "per_frame_psnr": psnrs,
                    "holdout": holdout, "note": "ReCINR INR (vendored, random-pattern forward)"}

@@ -18,10 +18,10 @@ import yaml
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 from gsdiff.data import generate_spi_data
-from gsdiff.baselines import cs, monin, gidc
+from gsdiff.baselines import cs, monin, gidc, recinr
 from gsdiff.baselines.common import dgi_image, evaluate_video
 
-ALL = ["dgi", "static_cs", "perframe_cs", "monin", "gidc3dtv"]
+ALL = ["dgi", "static_cs", "perframe_cs", "monin", "gidc3dtv", "recinr"]
 
 
 def _gen(cfg):
@@ -80,6 +80,9 @@ def main():
     if "gidc3dtv" in args.baselines:
         recon, info = gidc.dynamic_gidc3dtv(data, device=dev, n_steps=2000)
         record("gidc3dtv", recon, info)
+    if "recinr" in args.baselines:
+        recon, info = recinr.recinr_baseline(data, device=dev)   # tuned K≈1.7T + early stop
+        record("recinr", recon, info)
 
     summary = {"name": args.name, "config": args.config, "seed": cfg.get("seed"),
                "shape": cfg["data"]["shape"], "gt_velocity": cfg["data"].get("gt_velocity"),
