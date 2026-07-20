@@ -1,11 +1,28 @@
-# 忽略模型权重文件夹
+# ── Project-specific: keep the public repo clean ──────────────
+# Model weights (large binaries)
 checkpoints/
 
-# 忽略数据集文件夹
+# Datasets (large binaries)
 data/
 
-# 忽略运行结果文件夹
+# Experiment outputs (figures, checkpoints, per-run json)
 results/
+
+# Literature: copyrighted PDFs + OCR text + internal research/process notes
+literature/
+
+# Internal design/process docs (thinking, not for the public repo)
+UPGRADE_PLAN.md
+
+# Local Claude Code settings + any stray old-machine memory copies
+.claude/settings.local.json
+D--Research-gsdiff-spi/
+
+# Scratch / backups
+*.bak
+*~
+_scratch/
+scratch/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
