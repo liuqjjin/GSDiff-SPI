@@ -76,10 +76,18 @@ def _paper_cfg(H, W, T, seed, **kw):
     return ReCINRConfig(**d)
 
 
-def recinr_baseline(data, device="cuda", **cfg_kw):
-    """Run ReCINR on GSDiff-SPI data. Returns (recon [T,H,W], info)."""
+def recinr_baseline(data, device="cuda", n_nodes=None, **cfg_kw):
+    """Run ReCINR on GSDiff-SPI data. Returns (recon [T,H,W], info).
+
+    n_nodes = number of continuous render KEY NODES during training (ReCINR's K —
+    a bias-variance knob decoupled from the T=20 GT frames). Measurements at the
+    T frame times interpolate between these nodes; the continuous field is queried
+    at the T GT frame times for evaluation. Defaults to T.
+    """
     H, W, T = data.H, data.W, data.T
+    K_nodes = int(n_nodes) if n_nodes else T
     cfg = _paper_cfg(H, W, T, seed=int(getattr(data, "seed", 42) or 42), **cfg_kw)
+    cfg.K = K_nodes
     torch.manual_seed(cfg.seed); np.random.seed(cfg.seed)
 
     # ── data setup: GSDiff patterns + ppf time assignment (R=1, one "cycle") ──
@@ -88,7 +96,8 @@ def recinr_baseline(data, device="cuda", **cfg_kw):
     t_grid = torch.as_tensor(data.t_grid, dtype=torch.float32, device=device)  # [T]
     fidx = torch.as_tensor(data.frame_idx, dtype=torch.long, device=device)
     tau_meas = t_grid[fidx]                                           # [K] each meas' frame time
-    t_nodes = t_grid                                                  # [T] render nodes
+    t_nodes = torch.linspace(0, 1, K_nodes, device=device)           # [K_nodes] render nodes
+    t_eval = t_grid                                                  # [T] GT frame times (eval)
     y = torch.as_tensor(data.measurements, dtype=torch.float32, device=device)
     y_target = ((y - y.mean()) / (y.std(unbiased=False) + 1e-8)).view(1, -1)   # z-score (R=1)
 
@@ -164,7 +173,7 @@ def recinr_baseline(data, device="cuda", **cfg_kw):
 
     with torch.no_grad():
         net.scene.set_pe_progress(1.0)
-        I_final, _ = net.get_key_estimates(t_nodes)          # [T,1,H,W] z-scored
+        I_final, _ = net.get_key_estimates(t_eval)           # render at the T GT frame times
         recon = I_final[:, 0].cpu().numpy()                  # [T,H,W]
         yv, _, _, _ = net(patterns=patterns, tau_meas=tau_meas, t_nodes=t_nodes, n_cycles=1)
         holdout = (float(F.mse_loss(yv[0, val_mask], y_target[0, val_mask]).item())
