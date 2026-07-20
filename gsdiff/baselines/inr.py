@@ -114,6 +114,9 @@ def build_scene(kind="siren", **kw):
     if kind == "siren_small": return SIREN(hidden=54, w0=kw.get("w0", 30.0))
     if kind == "grid":        return GridCanonical(Hc=kw.get("Hc", 64), Wc=kw.get("Wc", 64))
     if kind == "lowrank":     return LowRankCanonical(r=kw.get("r", 32))
+    if kind == "recinr_se2":  # ReCINR's canonical + renderer, rigid SE(2) motion
+        from .recinr import ReCINRCanonicalScene
+        return ReCINRCanonicalScene(kw.get("H", 64), kw.get("W", 64), C=kw.get("C", 32))
     raise ValueError(f"unknown scene kind: {kind}")
 
 

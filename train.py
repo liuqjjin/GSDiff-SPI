@@ -186,7 +186,7 @@ def main():
     else:
         from gsdiff.baselines.inr import build_scene, INRForwardModel
         scene = build_scene(_scene_type, w0=getattr(cfg.scene, 'siren_w0', 20.0),
-                            r=getattr(cfg.scene, 'lowrank_r', 32)).to(dev)
+                            r=getattr(cfg.scene, 'lowrank_r', 32), H=H, W=W).to(dev)
         fwd = INRForwardModel(scene, motion, H, W, time_assignment_mode=_time_mode).to(dev)
     n_scene = sum(p.numel() for p in scene.parameters())
     print(f"Params: scene[{_scene_type}]={n_scene}, motion={motion.num_params()}")
