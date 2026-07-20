@@ -1,12 +1,12 @@
 # ── Project-specific: keep the public repo clean ──────────────
-# Model weights (large binaries)
-checkpoints/
+# Model weights (large binaries) — root-anchored so gsdiff/… source is unaffected
+/checkpoints/
 
-# Datasets (large binaries)
-data/
+# Datasets (large binaries) — root-anchored (NOT gsdiff/data/ source)
+/data/
 
 # Experiment outputs (figures, checkpoints, per-run json)
-results/
+/results/
 
 # Literature: copyrighted PDFs + OCR text + internal research/process notes
 literature/

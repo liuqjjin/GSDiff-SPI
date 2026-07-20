@@ -404,6 +404,42 @@ solver:
 `num_outer − admm_n_warmup` z-step calls. Both values are clamped to `[σ_min, σ_max]` of the
 training schedule (`0.002` and `0.5`).
 
+### 2026-07 upgrade knobs (all default-off; defaults reproduce historical runs bit-exactly)
+
+```yaml
+data:
+  pattern_type: hadamard_cc   # + hadamard_walsh | hadamard_natural | fourier | s_matrix_m
+                              #   (s_matrix now ASSERTS twin-prime H,W; use s_matrix_m for 2^n grids)
+  pattern_order: sequential   # stratified | random — temporal display schedule of ranked patterns;
+                              #   frame_idx[k]=k//ppf makes display order the time axis (interacts with motion)
+  holdout_mod: 0              # 10 → k%10==holdout_offset measurements excluded from training;
+  holdout_offset: 7           #   GT-free holdout_residual reported in results.json (model selection)
+  gt_accel: null              # [ay,ax] — accelerated SE(2) ground truth (custom_se2 explicit branch)
+  gt_beta: null               # angular acceleration
+  noise_sigma_abs: null       # detector-referred absolute noise σ (overrides snr_db).
+                              #   REQUIRED for cross-pattern-family benchmarks: the AC-variance
+                              #   snr_db convention is family-unfair (ordered bases' var(y) is
+                              #   dominated by a few huge low-freq coefficients → same snr_db =
+                              #   ~4x the absolute noise vs random patterns; measured 1.77 vs 0.45)
+motion:
+  poly_degree: 1              # 2 → d(t)=v·t+a·t², angle(t)=ω·t+β·t² (exact transport)
+  enable_affine: false        # true → A(t)=R(angle)·(I+t·L_sym), L symmetric 3-DOF (exact transport)
+solver:
+  hqs: false                  # true → u≡0 (HQS ablation: isolates the ADMM dual's contribution)
+  red_weight: 0.0             # SGD only: >0 adds RED-diff regularizer red_weight·½‖V−D_σ(V)‖²
+                              #   (uses solver.diffusion_prior.checkpoint; σ anneals over sgd_steps)
+  freeze_motion: false        # SGD only: true → static-scene fit (motion-blur lower-bound baseline)
+  diffusion_prior:
+    renoise: false            # true → z-step input re-noised: z=D_σ(v+σε) (on-manifold query)
+    ddim_spacing: linear      # log → log-spaced DDIM σ ladder (consistent w/ the annealing schedule)
+```
+
+Multi-seed protocol: `python scripts/run_multiseed.py --config <yaml> --seeds 7 11 42 --name <exp>
+[--override dotted.key=val ...]` → `results/<exp>/summary.json` (mean±std).
+Hyperparameter search: `python scripts/autoresearch.py --base <yaml> --moves-set tv|diffusion|common`
+— coordinate descent, accepts ONLY on multi-(motion×seed)-mean GT-free holdout, never on PSNR.
+Full design rationale: `UPGRADE_PLAN.md`.
+
 ---
 
 ## Code Style
@@ -417,9 +453,15 @@ training schedule (`0.002` and `0.5`).
 
 ## Current Status
 
-- ADMM + TV (2D/3D) working; SGD baseline working
-- Diffusion prior integrated as PnP z-step replacement (interface-compatible plug-in)
-- SNR correctly calibrated via `np.var(signal)` (AC-based)
+- ADMM + TV (2D/3D) and diffusion (PnP) priors working; SGD baseline working.
+- **Tuned operating point (configs/default.yaml, 2026-07)**: M=1000 Gaussians, `init_mode: dgi_adaptive`,
+  `admm_n_warmup: 20`, `rho: 0.1`, `rho_growth: 1.1`, SNR 25, diffusion Tweedie σ 0.3→0.05.
+  Reaches **35.8 ± 0.3 dB** on the tank SE(2) scene (3 seeds, GT-free-selected). Trajectory from the
+  historical baseline: 27.6 → 32.9 (adaptive init + ρ-continuation) → 35.8 (M=1000).
+- Hyperparameters confirmed locally optimal by `scripts/autoresearch.py` (coordinate descent, GT-free
+  acceptance); only `num_gaussians 500→1000` was accepted.
+- SNR calibrated via `np.var(signal)` (AC-based); `data.noise_sigma_abs` available for cross-pattern-family
+  fairness.
 
 ### Implementation Notes (verified by experiment)
 
@@ -427,6 +469,17 @@ training schedule (`0.002` and `0.5`).
   On that iteration the θ-step runs without the consistency term (z not yet valid), then z_step and
   u_step run to initialize z/u. From `n_warmup+2` onward, full ADMM with proper `target = z − u`.
 - **True ADMM outperforms SGD** once the transition fix is applied and `admm_n_warmup < num_outer`.
+- **`init_mode: dgi_adaptive` is essential for the translation-only regime**: random init collapses
+  ~2/3 seeds at SNR 25 (motion diverges during warmup, ~11 dB); adaptive init (centers ∝ |∇DGI|,
+  amps from local intensity) fixes it (→25 dB) and is neutral-or-better with rotation.
+- **`rho_growth: 1.1` beats 1.05** by ~5 dB at the tuned point (monotone ρ continuation, Chan 2017).
+- **HQS (`hqs: true`, u≡0) ties ADMM with the TV prox but loses ~1 dB with the diffusion prior** — the
+  dual/Bregman memory corrects the learned denoiser's bias. Keep the dual variable.
+- **Model selection: use `data.holdout_extra` (non-invasive eval set), NEVER `holdout_mod`.** Removing
+  in-training measurements destabilizes the bimodal joint scene+motion basin (27→10 dB). autoresearch
+  selects on a per-motion-median residual with a collapse-count guard.
+- **Pattern family**: Bernoulli {0,1} > random U[0,1] by ~2 dB; ordered orthogonal bases (Hadamard /
+  Fourier / S-matrix) fail structurally under the z-score loss regardless of temporal schedule.
 - **`temporal_tv_weight` has an optimal range**: empirically `0.05` works best; `0.02` is too weak
   (insufficient temporal smoothing), `0.08` is too strong (over-smooths across frames).
 - **`admm_soft_tv_weight` must not be set to 0**: removing the soft TV in the θ-step causes a

@@ -149,6 +149,48 @@ The diffusion prior is a lightweight pixel-space video DDPM:
 
 ---
 
+## Results
+
+Default benchmark: 64×64 canonical scene, T = 20 frames, K = 2500 random patterns
+(≈ 3 % per-frame sampling), shared SE(2) motion (translation **v** = [8, 8] px + rotation
+ω = 0.3 rad), SNR 25 dB. All numbers are the mean ± std over 3 seeds {7, 11, 42}, with
+hyperparameters selected on a **ground-truth-free** held-out measurement residual (PSNR is
+reported, never used for selection).
+
+| Configuration | PSNR (dB) | Velocity error (px) |
+|---|---|---|
+| DGI (motion-blurred lower bound) | ~7 | — |
+| SGD (direct Adam, 2D TV) | 22.1 | [0.05, 0.38] |
+| ADMM + 2D TV | 24.4 | [0.06, 0.27] |
+| ADMM + 3D TV | 24.5 | [0.04, 0.27] |
+| ADMM + diffusion prior (PnP) | 27.6 | [0.01, 0.02] |
+| **+ content-adaptive init + ρ-continuation + M = 1000** | **35.8 ± 0.3** | **[0.02, 0.03]** |
+
+The final operating point recovers the SE(2) motion to ≈ 0.03 px translation and ≈ 0.002 rad
+rotation, and reconstructs each frame to ~35 dB from only 125 measurements per frame.
+
+**Verified ablation findings** (each 3-seed, GT-free-selected):
+
+- **True ADMM beats direct SGD** by ~3 dB once the warmup/transition is correct.
+- **The diffusion (PnP) z-step beats the exact TV proximal** by ~1.3 dB at SNR 25.
+- **ADMM beats its HQS reduction (u ≡ 0) only with the diffusion prior** (+1 dB) — the dual /
+  Bregman memory corrects the learned denoiser's systematic bias; with the exact TV prox HQS
+  ties ADMM. This is the mechanistic justification for keeping the dual variable.
+- **Content-adaptive Gaussian initialization** (centers ∝ |∇DGI|) removes a translation-only
+  failure basin (11 → 25 dB) and is the single largest robustness fix.
+- **Bernoulli {0,1} patterns** outperform U[0,1] random by ~2 dB; **coefficient-ordered
+  orthogonal bases** (Hadamard / Fourier / S-matrix) are structurally mismatched to the
+  measurement-domain z-score loss and fail regardless of temporal ordering — a first-principles
+  limitation documented in `THEORY.md`.
+- **Rejected on evidence** (kept off by default): re-noised PnP z-step (−2.9 dB), σ_end → 0.02
+  (−3 dB), latent/VAE priors, adaptive ρ.
+
+Classical and learned **baselines** (Monin-style translation compensation, GIDC / GIDC-3DTV,
+a matched-DOF INR + SE(2) control, and CS lower bounds) and a **multi-scene × multi-motion**
+comparison are included in the evaluation suite; see `configs/` and `scripts/`.
+
+---
+
 ## Installation
 
 ```bash
@@ -211,25 +253,31 @@ All hyperparameters are set in `configs/default.yaml`. Key options:
 seed: 42
 
 scene:
-  num_gaussians: 500        # M: number of 2D Gaussians
+  num_gaussians: 1000       # M: number of 2D Gaussians (capacity was the binding constraint)
   init_scale: 1.5           # initial Gaussian spread (pixels)
-  init_mode: random         # random | dgi (DGI amplitude warm-start)
+  init_mode: dgi_adaptive   # random | dgi | dgi_adaptive (centers ∝ |∇DGI|, amps from intensity)
 
 motion:
   enable_rotation: true     # also learn omega
+  poly_degree: 1            # 2 → accelerated SE(2): d(t)=v·t+a·t², angle(t)=ω·t+β·t²
+  enable_affine: false      # true → A(t)=R(angle)·(I+t·L_sym): scale/shear (exact transport)
 
 data:
   image_size: [64, 64]
   num_frames: 20            # T
   num_patterns: 2500        # K
-  pattern_type: random      # bernoulli | gaussian | random | s_matrix
-  snr_db: 20
+  pattern_type: random      # random | bernoulli | gaussian | hadamard_cc/walsh/natural
+                            #   | fourier | s_matrix (twin-prime H,W) | s_matrix_m (2^n grids)
+  pattern_order: sequential # sequential | stratified | random  (temporal schedule of ranked patterns)
+  snr_db: 25
+  noise_sigma_abs: null     # detector-referred σ (overrides snr_db; use for cross-pattern-family fairness)
   time_assignment_mode: uniform   # uniform | interpolation
   shape: "assets/tank.png"  # built-in: "7" | "L" | "T" | "circle" | image path
-  motion_type: custom_se2   # custom_se2 | translation | rotation | shear | ...
-  motion_mode: 2            # 1: one frame per pattern, 2: fixed T frames
+  motion_type: custom_se2
+  motion_mode: 2
   gt_velocity: [8, 8]       # [v_y, v_x] total pixels over t∈[0,1]
   gt_omega: 0.3             # radians total
+  holdout_extra: 250        # non-invasive GT-free eval set (training unaffected; for model selection)
 
 solver:
   type: admm                # admm | sgd
@@ -244,13 +292,14 @@ solver:
   # ADMM hyperparameters
   num_outer: 80             # outer iterations
   num_inner: 50             # inner gradient steps per outer (80×50 = 4000 total)
-  admm_n_warmup: 40         # warmup iters; MUST be < num_outer for the prior to ever fire
+  admm_n_warmup: 20         # warmup iters; MUST be < num_outer for the prior to ever fire
   rho: 0.1
-  rho_growth: 1.05
+  rho_growth: 1.1           # monotone ρ continuation (Chan 2017); 1.05→1.1 was worth +5 dB
   admm_tv_weight: 0.005     # only used by TV prior (ignored by diffusion prior)
   admm_soft_tv_weight: 0.006  # soft TV inside θ-step (do NOT set to 0)
   admm_lr_scene: 0.9e-2
   admm_lr_motion: 15.0e-2
+  hqs: false                # true → u≡0 (HQS ablation)
 
   # 3D TV (applies to TV prior and to the soft TV inside the θ-step)
   use_3dtv: true
@@ -266,10 +315,10 @@ solver:
     sigma_start: 0.3        # σ at the FIRST z-step (after warmup)
     sigma_end:   0.05       # σ at the LAST z-step
 
-output_dir: ./results/admm_n_warmup_40
+output_dir: ./results/default_run
 ```
 
-`sigma_start` and `sigma_end` define the log-linear σ annealing schedule that the diffusion prior follows over its `num_outer − admm_n_warmup` z-step calls. Both values are clamped to `[σ_min, σ_max]` of the network's noise schedule (defaults `0.002` and `0.5`). If you want larger σ values, retrain the UNet with a larger `sigma_max` in `configs/diffusion_prior.yaml` first.
+`sigma_start` and `sigma_end` define the log-linear σ annealing schedule that the diffusion prior follows over its `num_outer − admm_n_warmup` z-step calls. Both values are clamped to `[σ_min, σ_max]` of the network's noise schedule (defaults `0.002` and `0.5`). The full set of optional knobs (accelerated/affine motion, pattern families and temporal scheduling, HQS ablation, RED-diff, non-invasive holdout) is documented in `CLAUDE.md`; every one defaults off and reproduces the historical behaviour bit-exactly.
 
 ---
 
