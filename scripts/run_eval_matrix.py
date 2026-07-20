@@ -47,14 +47,20 @@ def make_cfg(base, tgt_shape, motion, seed, out_dir, scene_type="gaussian"):
         cfg["data"][k] = motion.get(k, None if k in ("gt_accel", "gt_beta") else cfg["data"].get(k))
     cfg["motion"]["enable_rotation"] = motion.get("enable_rotation", True)
     cfg["motion"]["poly_degree"] = motion.get("poly_degree", 1)
-    if scene_type != "gaussian":
+    if scene_type == "siren":
         # GT-free-tuned INR config: ω₀=10 (SIREN's default 30 injects grid-noise
         # that prevents joint motion convergence — v diverges; ω₀=10 converges
         # motion to v_err≈0), random init (a DGI pre-fit freezes the field at a
         # motion-blur local min that also breaks motion). See spec §5.1.
-        cfg["scene"] = {"type": scene_type, "siren_w0": 10.0, "init_mode": "random"}
+        cfg["scene"] = {"type": "siren", "siren_w0": 10.0, "init_mode": "random"}
         cfg["solver"]["type"] = "sgd"; cfg["solver"]["sgd_steps"] = 4000
         cfg["solver"]["lr_scene"] = 3e-3
+    elif scene_type == "recinr_se2":
+        # ReCINR canonical + rigid SE(2), tuned: coarse 16x16 canonical (default)
+        # + motion warmup so the coarse field cannot absorb the motion.
+        cfg["scene"] = {"type": "recinr_se2", "init_mode": "random"}
+        cfg["solver"]["type"] = "sgd"; cfg["solver"]["sgd_steps"] = 3000
+        cfg["solver"]["lr_scene"] = 3e-3; cfg["solver"]["motion_warmup"] = 500
     cfg["output_dir"] = out_dir
     return cfg
 
@@ -115,6 +121,35 @@ def main():
                                        f"./results/eval_matrix/{cell}_inr", scene_type="siren"),
                               f"{cell}_inr")
                 if r: row["inr_siren"] = r["mean_psnr"]; print(f"  inr      {r['mean_psnr']:.2f}", flush=True)
+            if "recinr_se2" in args.methods:
+                r = run_train(make_cfg(base, TARGETS[tname], MOTIONS[mname], args.seed,
+                                       f"./results/eval_matrix/{cell}_rcse2", scene_type="recinr_se2"),
+                              f"{cell}_rcse2")
+                if r: row["recinr_se2"] = r["mean_psnr"]; print(f"  recinr_se2 {r['mean_psnr']:.2f}", flush=True)
+            if "recinr" in args.methods:
+                import json as _json
+                rp = os.path.join(REPO, "results", "eval_matrix", cell, "recinr.json")
+                if os.path.isfile(rp):
+                    row["recinr"] = _json.load(open(rp))["mean_psnr"]
+                else:
+                    from gsdiff.data import generate_spi_data
+                    from gsdiff.baselines.recinr import recinr_baseline
+                    cfg = make_cfg(base, TARGETS[tname], MOTIONS[mname], args.seed, "x")
+                    dd = cfg["data"]
+                    data = generate_spi_data(
+                        H=dd["image_size"][0], W=dd["image_size"][1], T=dd["num_frames"],
+                        K=dd["num_patterns"], pattern_type=dd.get("pattern_type", "random"),
+                        motion_type=dd.get("motion_type"), snr_db=dd.get("snr_db"),
+                        seed=cfg["seed"], shape=dd["shape"], gt_velocity=dd.get("gt_velocity"),
+                        gt_omega=dd.get("gt_omega"), gt_accel=dd.get("gt_accel"),
+                        gt_beta=dd.get("gt_beta"), holdout_extra=250)
+                    data.seed = cfg["seed"]
+                    rec, info = recinr_baseline(data, device="cuda")
+                    os.makedirs(os.path.dirname(rp), exist_ok=True)
+                    _json.dump({"mean_psnr": info["mean_psnr"], "holdout": info["holdout"]},
+                               open(rp, "w"))
+                    row["recinr"] = info["mean_psnr"]
+                print(f"  recinr   {row['recinr']:.2f}", flush=True)
             if "baselines" in args.methods:
                 b = run_baselines(make_cfg(base, TARGETS[tname], MOTIONS[mname], args.seed,
                                            f"./results/eval_matrix/{cell}"), cell)
@@ -127,7 +162,8 @@ def main():
     os.makedirs(os.path.dirname(out), exist_ok=True)
     json.dump({"table": table, "elapsed": time.time() - t0}, open(out, "w"), indent=2)
     # print the comparison table
-    methods = ["dgi", "static_cs", "perframe_cs", "monin", "gidc3dtv", "inr_siren", "gsdiff"]
+    methods = ["dgi", "static_cs", "perframe_cs", "monin", "gidc3dtv",
+               "recinr", "inr_siren", "recinr_se2", "gsdiff"]
     print("\n\n=== EVAL MATRIX (mean PSNR dB) ===")
     print(f"{'cell':22s} " + " ".join(f"{m:>11s}" for m in methods))
     for cell, row in table.items():
