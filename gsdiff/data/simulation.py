@@ -48,8 +48,30 @@ def load_image(image_path, dim=(28, 28)):
     return img.astype(np.float32)
 
 
+def render_char(ch, H=64, W=64, fill_frac=0.8):
+    """Deterministic centered glyph (digit/letter) → [H,W] in [0,1].
+
+    Uses matplotlib's bundled DejaVuSans font (always available, font-independent
+    of the OS) so digit/letter targets are reproducible. shape='char:5' | 'char:A'.
+    """
+    from PIL import Image, ImageDraw, ImageFont
+    from matplotlib import font_manager
+    fp = font_manager.findfont(font_manager.FontProperties(family="DejaVu Sans"))
+    ss = 4                                        # supersample then downscale (anti-alias)
+    im = Image.new("L", (W * ss, H * ss), 0)
+    draw = ImageDraw.Draw(im)
+    font = ImageFont.truetype(fp, int(H * ss * fill_frac))
+    bb = draw.textbbox((0, 0), ch, font=font)
+    w, h = bb[2] - bb[0], bb[3] - bb[1]
+    draw.text(((W * ss - w) / 2 - bb[0], (H * ss - h) / 2 - bb[1]), ch, fill=255, font=font)
+    im = im.resize((W, H), Image.LANCZOS)
+    return (np.asarray(im, np.float64) / 255.0).astype(np.float32)
+
+
 def make_test_image(shape='7', H=28, W=28):
-    """Built-in test images: '7', 'L', 'T', 'circle'."""
+    """Built-in test images: '7', 'L', 'T', 'circle', or 'char:<glyph>'."""
+    if isinstance(shape, str) and shape.startswith("char:"):
+        return render_char(shape[5:], H, W)
     img = np.zeros((H, W), np.float64)
     if shape == '7':
         cy = H // 4
