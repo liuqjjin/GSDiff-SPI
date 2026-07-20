@@ -19,6 +19,7 @@ import numpy as np
 import yaml
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO)      # for the inline recinr(a) import
 PY = sys.executable
 
 TARGETS = {"tank": "assets/tank.png", "digit5": "char:5", "letterR": "char:R",
