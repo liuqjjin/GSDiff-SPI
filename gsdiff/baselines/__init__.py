@@ -16,7 +16,8 @@ from . import cs
 from . import monin
 from . import gidc
 from . import inr
+from . import recinr
 
 __all__ = ["build_operator", "apply_operator", "adjoint", "admm_tv",
            "dgi_image", "evaluate_video", "select_by_holdout",
-           "holdout_residual", "cs", "monin", "gidc", "inr"]
+           "holdout_residual", "cs", "monin", "gidc", "inr", "recinr"]
