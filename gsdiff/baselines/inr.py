@@ -115,8 +115,11 @@ def build_scene(kind="siren", **kw):
     if kind == "grid":        return GridCanonical(Hc=kw.get("Hc", 64), Wc=kw.get("Wc", 64))
     if kind == "lowrank":     return LowRankCanonical(r=kw.get("r", 32))
     if kind == "recinr_se2":  # ReCINR's canonical + renderer, rigid SE(2) motion
+        # Tuned: a COARSE 16x16 canonical (bilinear-upsampled) stops the per-pixel
+        # feature grid from absorbing the motion (full-res → 9 dB, coarse → ~24 dB).
         from .recinr import ReCINRCanonicalScene
-        return ReCINRCanonicalScene(kw.get("H", 64), kw.get("W", 64), C=kw.get("C", 32))
+        return ReCINRCanonicalScene(kw.get("H", 64), kw.get("W", 64), C=kw.get("C", 32),
+                                    grid_size=kw.get("grid_size", 16))
     raise ValueError(f"unknown scene kind: {kind}")
 
 

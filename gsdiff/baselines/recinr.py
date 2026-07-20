@@ -32,20 +32,31 @@ class ReCINRCanonicalScene(nn.Module):
     does ReCINR's canonical recover the moving scene? Same feature tensor and
     renderer architecture as recinr_model.WarpedCanonicalField, softplus output.
     """
-    def __init__(self, H, W, C=32, render_layers=3):
+    def __init__(self, H, W, C=32, render_layers=3, grid_size=None):
         super().__init__()
         self.H, self.W, self.C = H, W, C
-        self.features = nn.Parameter(0.1 * torch.randn(1, C, H, W))
+        # grid_size < H makes the canonical coarse (bilinear-upsampled) → smooth,
+        # so the rigid SE(2) motion cannot be absorbed by per-pixel flexibility
+        # (the spatial analog of the continuous-warp fix that unlocked variant a).
+        gh = grid_size or H
+        self.gh = gh
+        self.features = nn.Parameter(0.1 * torch.randn(1, C, gh, gh))
         rl = [nn.Linear(C, C), nn.ReLU()]
         for _ in range(max(1, render_layers) - 1):
             rl += [nn.Linear(C, C), nn.ReLU()]
         rl.append(nn.Linear(C, 1))
         self.renderer = nn.Sequential(*rl)
 
+    def _feat_grid(self):
+        if self.gh == self.H:
+            return self.features
+        return F.interpolate(self.features, size=(self.H, self.W),
+                             mode="bilinear", align_corners=True)
+
     def query(self, x_norm):
         # x_norm [N,2] (y,x) in [-1,1]; grid_sample wants (x,y)
         g = torch.stack([x_norm[:, 1], x_norm[:, 0]], -1).view(1, 1, -1, 2)
-        feat = F.grid_sample(self.features, g, mode="bilinear",
+        feat = F.grid_sample(self._feat_grid(), g, mode="bilinear",
                              padding_mode="border", align_corners=True)  # [1,C,1,N]
         feat = feat[0, :, 0, :].t()                                       # [N,C]
         return F.softplus(self.renderer(feat).squeeze(-1))               # [N]
