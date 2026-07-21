@@ -18,10 +18,10 @@ import yaml
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 from gsdiff.data import generate_spi_data
-from gsdiff.baselines import cs, monin, gidc, recinr
+from gsdiff.baselines import cs, monin, gidc, recinr, tv3d
 from gsdiff.baselines.common import dgi_image, evaluate_video
 
-ALL = ["dgi", "static_cs", "perframe_cs", "monin", "gidc3dtv", "recinr"]
+ALL = ["dgi", "static_cs", "perframe_cs", "tv3d", "monin", "gidc3dtv", "recinr"]
 
 
 def _gen(cfg):
@@ -75,6 +75,8 @@ def main():
         recon, info = cs.static_tvcs(data, device=dev); record("static_cs", recon, info)
     if "perframe_cs" in args.baselines:
         recon, info = cs.perframe_tvcs(data, device=dev); record("perframe_cs", recon, info)
+    if "tv3d" in args.baselines:
+        recon, info = tv3d.tv3d(data, device=dev); record("tv3d", recon, info)
     if "monin" in args.baselines:
         recon, info = monin.monin(data, device=dev); record("monin", recon, info)
     if "gidc3dtv" in args.baselines:
