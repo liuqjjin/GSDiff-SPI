@@ -86,12 +86,22 @@ def main():
         recon, info = recinr.recinr_baseline(data, device=dev, seed=cfg.get("seed", 42))
         record("recinr", recon, info)
 
+    # MERGE with an existing baselines.json so re-running a subset of baselines
+    # (e.g. a fixed one) updates only those rows and keeps the rest.
+    bpath = os.path.join(out_dir, "baselines.json")
+    merged = {}
+    if os.path.isfile(bpath):
+        try:
+            merged = json.load(open(bpath, encoding="utf-8")).get("baselines", {})
+        except Exception:
+            merged = {}
+    merged.update(rows)
     summary = {"name": args.name, "config": args.config, "seed": cfg.get("seed"),
                "shape": cfg["data"]["shape"], "gt_velocity": cfg["data"].get("gt_velocity"),
                "gt_omega": cfg["data"].get("gt_omega"), "snr_db": cfg["data"].get("snr_db"),
                "num_patterns": cfg["data"].get("num_patterns"),
-               "elapsed": time.time() - t0, "baselines": rows}
-    with open(os.path.join(out_dir, "baselines.json"), "w", encoding="utf-8") as f:
+               "elapsed": time.time() - t0, "baselines": merged}
+    with open(bpath, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, default=float)
     print(f"→ {out_dir}/baselines.json  ({summary['elapsed']:.0f}s)")
 
