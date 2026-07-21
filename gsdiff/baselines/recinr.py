@@ -95,7 +95,7 @@ def _paper_cfg(H, W, T, seed, **kw):
     return ReCINRConfig(**d)
 
 
-def recinr_baseline(data, device="cuda", n_nodes=None, interp=False, **cfg_kw):
+def recinr_baseline(data, device="cuda", n_nodes=None, interp=False, seed=None, **cfg_kw):
     """Run ReCINR on GSDiff-SPI data. Returns (recon [T,H,W], info).
 
     n_nodes = number of continuous render KEY NODES during training (ReCINR's K —
@@ -105,7 +105,8 @@ def recinr_baseline(data, device="cuda", n_nodes=None, interp=False, **cfg_kw):
     """
     H, W, T = data.H, data.W, data.T
     K_nodes = int(n_nodes) if n_nodes else int(round(1.7 * T))   # tuned: K≈1.7·T
-    cfg = _paper_cfg(H, W, T, seed=int(getattr(data, "seed", 42) or 42), **cfg_kw)
+    _seed = int(seed if seed is not None else getattr(data, "seed", 42) or 42)
+    cfg = _paper_cfg(H, W, T, seed=_seed, **cfg_kw)
     cfg.K = K_nodes
     torch.manual_seed(cfg.seed); np.random.seed(cfg.seed)
 

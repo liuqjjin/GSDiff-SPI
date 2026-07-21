@@ -87,7 +87,11 @@ def _estimate_trajectory(previews, t_grid, n_blocks=5, rng=12, poly_degree=1,
     r_nodes = np.stack([_ncc_shift(means[0], means[j], rng) for j in range(n_blocks)])
     tt = tnodes - tnodes[0]
     if poly_degree == 2:
-        Bnodes = np.stack([tt, tt ** 2], 1)
+        # r_nodes[j] = d(tnodes[j]) - d(tnodes[0]); fit with monomials anchored at
+        # the reference so coef are the true d(t) coefficients (NOT tt² — that
+        # leaves a spurious 2·acc·tnodes[0] linear-in-t error, biasing v_est).
+        t0 = tnodes[0]
+        Bnodes = np.stack([tnodes - t0, tnodes ** 2 - t0 ** 2], 1)
         Bfull = np.stack([tg, tg ** 2], 1)
     else:
         Bnodes = tt[:, None]

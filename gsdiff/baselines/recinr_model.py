@@ -1,11 +1,12 @@
 """
-VENDORED VERBATIM from the user's ReCINR project (D:/SPI/ReCINR/src/recinr/model.py),
-UNMODIFIED. ReCINR's forward already computes a general pattern inner product
+COPIED from the user's ReCINR project (D:/SPI/ReCINR/src/recinr/model.py). The
+ReCINR MODEL CODE below (every class/function) is byte-for-byte unmodified; ONLY
+this header note was prepended by the GSDiff adapter — the original ReCINR file is
+untouched. ReCINR's forward already computes a general pattern inner product
 (Y_key = I_flat @ A_flat.t()), so only the measurement PATTERNS and the time
 assignment change for GSDiff-SPI — the representation, warp, priors, and renderer
 are reused exactly. The GSDiff-SPI adapter (random/bernoulli patterns + ppf frame
-assignment + DGI warm start) lives in gsdiff/baselines/recinr.py; this file is a
-copy, not an edit of the ReCINR source.
+assignment + DGI warm start) lives in gsdiff/baselines/recinr.py.
 
 model.py — ReCINR: canonical + warp INR for spinning cyclic-S single-pixel imaging.
 

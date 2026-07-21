@@ -83,7 +83,7 @@ def main():
         recon, info = gidc.dynamic_gidc3dtv(data, device=dev, n_steps=2000)
         record("gidc3dtv", recon, info)
     if "recinr" in args.baselines:
-        recon, info = recinr.recinr_baseline(data, device=dev)   # tuned K≈1.7T + early stop
+        recon, info = recinr.recinr_baseline(data, device=dev, seed=cfg.get("seed", 42))
         record("recinr", recon, info)
 
     summary = {"name": args.name, "config": args.config, "seed": cfg.get("seed"),

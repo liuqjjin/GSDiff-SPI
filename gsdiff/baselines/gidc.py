@@ -29,7 +29,7 @@ def _zscore(a):
 
 # ── GIDC U-Net (2D, 5-level, no-bias convs + BatchNorm + LeakyReLU, Sigmoid head) ──
 class GIDCUNet2D(nn.Module):
-    def __init__(self, base=16):
+    def __init__(self, base=16, in_channels=1):
         super().__init__()
         c = [base, 2 * base, 4 * base, 8 * base, 16 * base]     # 16,32,64,128,256
 
@@ -38,7 +38,7 @@ class GIDCUNet2D(nn.Module):
                 nn.Conv2d(i, o, 5, padding=2, bias=False), nn.BatchNorm2d(o),
                 nn.LeakyReLU(0.2, inplace=True))
 
-        self.in_conv = nn.Sequential(blk(1, c[0]), blk(c[0], c[0]))
+        self.in_conv = nn.Sequential(blk(in_channels, c[0]), blk(c[0], c[0]))
         self.down = nn.ModuleList()
         for k in range(4):                                       # 4 stride-2 downsamples
             self.down.append(nn.ModuleList([
@@ -149,12 +149,19 @@ def dynamic_gidc3dtv(data, device="cpu", n_steps=2500,
     pat, y, fidx, ep, em, ef, _ = _train_val(data, device)
     A = build_operator(pat).to(device)
     from .common import dgi_image
-    x_in = _zscore(dgi_image(pat, y).to(device)).reshape(1, 1, H, W).repeat(T, 1, 1, 1)
+    # PER-FRAME-DISTINCT fixed input so the net CAN emit distinct frames coupled
+    # only by temporal TV (a tiled-identical input collapses a deterministic CNN
+    # to one static frame — the "dynamic" prior would be static motion-blur).
+    # Channel 0: fixed independent per-frame noise; channel 1: the DGI scene prior.
+    torch.manual_seed(seed)
+    dgi_t = _zscore(dgi_image(pat, y).to(device)).reshape(1, 1, H, W).repeat(T, 1, 1, 1)
+    noise = torch.randn(T, 1, H, W, device=device)
+    x_in = torch.cat([noise, dgi_t], dim=1)                  # [T,2,H,W], fixed
     zy = _zscore(y)
 
     def run(xi_xy, xi_t):
         torch.manual_seed(seed)
-        net = GIDCUNet2D().to(device).train()
+        net = GIDCUNet2D(in_channels=2).to(device).train()
         opt = torch.optim.Adam(net.parameters(), lr=0.05, betas=(0.5, 0.9), eps=1e-8)
         best_res, best = np.inf, None
         for s in range(n_steps):

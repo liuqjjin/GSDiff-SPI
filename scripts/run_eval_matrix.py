@@ -141,11 +141,14 @@ def main():
                         H=dd["image_size"][0], W=dd["image_size"][1], T=dd["num_frames"],
                         K=dd["num_patterns"], pattern_type=dd.get("pattern_type", "random"),
                         motion_type=dd.get("motion_type"), snr_db=dd.get("snr_db"),
+                        speed_factor=dd.get("speed_factor", 1.0),
+                        motion_mode=dd.get("motion_mode", 2),
                         seed=cfg["seed"], shape=dd["shape"], gt_velocity=dd.get("gt_velocity"),
                         gt_omega=dd.get("gt_omega"), gt_accel=dd.get("gt_accel"),
-                        gt_beta=dd.get("gt_beta"), holdout_extra=250)
+                        gt_beta=dd.get("gt_beta"), noise_sigma_abs=dd.get("noise_sigma_abs"),
+                        pattern_order=dd.get("pattern_order", "sequential"), holdout_extra=250)
                     data.seed = cfg["seed"]
-                    rec, info = recinr_baseline(data, device="cuda")
+                    rec, info = recinr_baseline(data, device="cuda", seed=cfg["seed"])
                     os.makedirs(os.path.dirname(rp), exist_ok=True)
                     _json.dump({"mean_psnr": info["mean_psnr"], "holdout": info["holdout"]},
                                open(rp, "w"))
