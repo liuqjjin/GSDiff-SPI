@@ -49,17 +49,20 @@ def make_cfg(base, tgt_shape, motion, seed, out_dir, scene_type="gaussian"):
     cfg["motion"]["enable_rotation"] = motion.get("enable_rotation", True)
     cfg["motion"]["poly_degree"] = motion.get("poly_degree", 1)
     if scene_type == "siren":
-        # GT-free-tuned INR config: ω₀=10 (SIREN's default 30 injects grid-noise
-        # that prevents joint motion convergence — v diverges; ω₀=10 converges
-        # motion to v_err≈0), random init (a DGI pre-fit freezes the field at a
-        # motion-blur local min that also breaks motion). See spec §5.1.
-        cfg["scene"] = {"type": "siren", "siren_w0": 10.0, "init_mode": "random"}
+        # STRICT GT-free-selected INR config (scripts/retune_inr_gtfree.py, selects
+        # on the held-out per-frame residual, never PSNR): ω₀=8 is the most robust
+        # (ω₀≥12 collapses on translation-only; SIREN's default 30 injects grid-noise
+        # that also breaks joint motion convergence). Random init (a DGI pre-fit
+        # freezes the field at a motion-blur local min that breaks motion).
+        cfg["scene"] = {"type": "siren", "siren_w0": 8.0, "init_mode": "random"}
         cfg["solver"]["type"] = "sgd"; cfg["solver"]["sgd_steps"] = 4000
         cfg["solver"]["lr_scene"] = 3e-3
     elif scene_type == "recinr_se2":
-        # ReCINR canonical + rigid SE(2), tuned: coarse 16x16 canonical (default)
-        # + motion warmup so the coarse field cannot absorb the motion.
-        cfg["scene"] = {"type": "recinr_se2", "init_mode": "random"}
+        # ReCINR canonical + rigid SE(2). STRICT GT-free-selected canonical grid=20
+        # (retune_inr_gtfree.py; grid=32 collapses on translation-only) + motion
+        # warmup so the coarse field cannot absorb the motion.
+        cfg["scene"] = {"type": "recinr_se2", "init_mode": "random",
+                        "recinr_grid_size": 20}
         cfg["solver"]["type"] = "sgd"; cfg["solver"]["sgd_steps"] = 3000
         cfg["solver"]["lr_scene"] = 3e-3; cfg["solver"]["motion_warmup"] = 500
     cfg["output_dir"] = out_dir

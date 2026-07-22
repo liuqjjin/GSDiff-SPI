@@ -62,15 +62,6 @@ class SE2Motion(nn.Module):
         S = torch.eye(2, device=t.device) + t.reshape(-1, 1, 1) * L  # [T,2,2]
         return torch.einsum('tij,tjk->tik', R, S)
 
-    def _R(self, t):
-        """Kept for backward compatibility (rotation-only linear part)."""
-        angle = self._angle(t)
-        if angle is None:
-            I = torch.eye(2, device=t.device)
-            return I.unsqueeze(0).expand(t.shape[0], -1, -1)
-        c, s = torch.cos(angle), torch.sin(angle)
-        return torch.stack([c, -s, s, c], -1).reshape(-1, 2, 2)
-
     def _displacement(self, t):
         d = self.velocity.unsqueeze(0) * t.unsqueeze(1)   # [T,2]
         if self.poly_degree == 2:

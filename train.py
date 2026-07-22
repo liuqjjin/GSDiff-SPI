@@ -83,8 +83,23 @@ def save_loss_curve(history, out_path, solver_type):
     fig, ax = plt.subplots(figsize=(8, 4))
     ax.semilogy([h["loss_data"] for h in history], label="data fidelity")
     if "prim_res" in history[0]:
-        ax.semilogy([h["prim_res"] for h in history], label="primal residual")
-    ax.set_xlabel("iteration"); ax.legend(); ax.grid(True, alpha=0.3)
+        # During ADMM warmup z≡0, so prim_res=MSE(video,0)=video energy, NOT a
+        # residual — plotting it next to data fidelity makes the two curves form a
+        # spurious "X" that looks like the losses cancelling. Mask the warmup span
+        # (in_warmup=True) so only the true post-warmup primal residual is drawn,
+        # and overlay the actual ADMM coupling term (ρ/2)‖R(θ)-(z-u)‖².
+        pr = [h["prim_res"] if not h.get("in_warmup", False) else float("nan")
+              for h in history]
+        ax.semilogy(pr, label="primal residual (post-warmup)")
+        if any(h.get("loss_consist", 0) for h in history):
+            lc = [h["loss_consist"] if h.get("loss_consist", 0) > 0 else float("nan")
+                  for h in history]
+            ax.semilogy(lc, label=r"consistency (ρ/2)‖R-(z-u)‖²")
+        n_warmup = sum(bool(h.get("in_warmup", False)) for h in history)
+        if 0 < n_warmup < len(history):
+            ax.axvline(n_warmup, ls="--", color="gray", alpha=0.5,
+                       label=f"warmup end (iter {n_warmup})")
+    ax.set_xlabel("iteration"); ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
     ax.set_title(f"{solver_type} convergence")
     plt.tight_layout(); plt.savefig(out_path, dpi=150); plt.close()
 
@@ -186,7 +201,9 @@ def main():
     else:
         from gsdiff.baselines.inr import build_scene, INRForwardModel
         scene = build_scene(_scene_type, w0=getattr(cfg.scene, 'siren_w0', 20.0),
-                            r=getattr(cfg.scene, 'lowrank_r', 32), H=H, W=W).to(dev)
+                            r=getattr(cfg.scene, 'lowrank_r', 32),
+                            grid_size=getattr(cfg.scene, 'recinr_grid_size', 16),
+                            H=H, W=W).to(dev)
         fwd = INRForwardModel(scene, motion, H, W, time_assignment_mode=_time_mode).to(dev)
     n_scene = sum(p.numel() for p in scene.parameters())
     print(f"Params: scene[{_scene_type}]={n_scene}, motion={motion.num_params()}")
@@ -265,9 +282,14 @@ def main():
             _sigma_str = ""
             if _prior_type == 'diffusion' and hasattr(prior, '_current_sigma'):
                 _sigma_str = f"  σ={prior._current_sigma():.4f}"
+            # Honest ADMM diagnostics: prim_res is only a residual post-warmup
+            # (z≡0 during warmup ⇒ prim=video energy); consist/u_norm/dual_res are
+            # the real coupling terms. Print them so the convergence is legible.
+            _cons = f"  consist={info.get('loss_consist', 0):.5f}  u={info.get('u_norm', 0):.4f}" \
+                if not info.get('in_warmup', True) else "  (warmup)"
             print(f"[{l:3d}/{L}]  data={info['loss_data']:.4f}  "
                   f"prim={info['prim_res']:.6f}  TV/px={tv_pp:.4f}  "
-                  f"rho={info['rho']:.3f}{_sigma_str}  "
+                  f"rho={info['rho']:.3f}{_sigma_str}{_cons}  "
                   f"v={[f'{v:.2f}' for v in mp['velocity']]}  "
                   f"ω={mp.get('omega', 0):.4f}")
 

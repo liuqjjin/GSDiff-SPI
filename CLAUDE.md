@@ -485,6 +485,37 @@ Full design rationale: `UPGRADE_PLAN.md`.
 - **`admm_soft_tv_weight` must not be set to 0**: removing the soft TV in the θ-step causes a
   noticeable drop in reconstruction quality. Keep it at `~0.005–0.006`.
 
+### Algorithm audit (2026-07, finalization) — the "two losses cancel" question
+
+A multi-agent adversarial audit (2DGS render + SE(2) transport + SPI forward + ADMM +
+diffusion PnP + loss) plus per-iteration empirical tracing found **no correctness bug in the
+core algorithm** — Boyd ADMM signs, SE(2) covariance transport, the SPI forward inner product,
+and the independent z-score loss are all verified correct.
+
+- **The "两条 loss 取消" observation is NOT a bug — it is two distinct, benign phenomena:**
+  1. *Warmup plotting artifact.* During warmup `z ≡ 0`, so the curve plotted as "primal
+     residual" (`prim_res = MSE(video, z)`) is actually the video's raw energy `mean(video²)`,
+     not a residual. It *rises* as the scene fills in while data fidelity *falls* → the two
+     curves form a spurious "X", then `prim_res` drops off a cliff at the transition iter when
+     `z` is initialized to ≈`video`. Fixed: `save_loss_curve` now NaN-masks the warmup span and
+     overlays the true consistency term `(ρ/2)‖R(θ)-(z-u)‖²`; the console logs `consist`/`u_norm`.
+  2. *Healthy post-warmup trade-off.* After warmup the data-fidelity loss **rises** (~2×,
+     0.0013→0.0026 on tank) while the consistency term rises and `ρ` grows to ~30. This is the
+     diffusion prior correctly trading measurement-fit for reconstruction quality. Per-iter PSNR
+     tracing proves it is beneficial: PSNR climbs **monotonically 24→36.3 dB** over exactly this
+     phase, peaking at the final outer iter (`peak − final = +0.00 dB`). **Do not "fix" the
+     rising data loss** and **do not cap ρ** — an explicit rho-cap ablation would have frozen
+     PSNR ~3 dB lower; the monotone ρ-continuation is load-bearing (consistent with `rho_growth
+     1.1 > 1.05`). `num_outer=80` lands right at the PSNR peak.
+- **Fixes applied from the audit** (all low-severity, behavior-preserving at the operating point):
+  motion `__init__.py` docstring rotation-center `H/2→(H-1)/2`; `save_loss_curve` warmup mask +
+  consistency overlay; console `consist`/`u_norm`; deleted dead `SE2Motion._R`; `init_from_image`
+  softplus-inverse hardened to the overflow-free identity `y+log(-expm1(-y))`; `DiffusionPrior._n_steps`
+  now `None`-sentinel and `proximal()` raises if `set_n_steps` was skipped (was a silent σ-collapse).
+- **Considered and rejected on evidence:** ρ-cap / residual-balancing (refuted by the PSNR
+  trajectory); top-k Gaussian culling (changes measured `y`, non-result-preserving); `order=3` GT
+  interpolation (introduces ringing the non-negative Gaussian model also cannot match).
+
 ### Diffusion-prior Implementation Notes
 
 - **Do NOT derive σ from `tv_weight/ρ`**. An earlier version computed

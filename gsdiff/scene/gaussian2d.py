@@ -108,10 +108,11 @@ class GaussianScene2D(nn.Module):
             scale         = target_mean / current_mean
 
             # Exact inversion: new_raw = softplus_inv(scale * softplus(raw_amps))
-            # softplus_inv(y) = log(expm1(y))   for y > 0
+            # Overflow-free identity softplus_inv(y) = y + log(-expm1(-y)), which
+            # never forms e^y (log(expm1(y)) blows to +inf for y ≳ 88.7 in fp32).
             old_amps = self.get_amplitudes()                        # [M], all > 0
             new_amps = (old_amps * scale).clamp(min=1e-6)
-            new_raw  = torch.log(torch.expm1(new_amps))
+            new_raw  = new_amps + torch.log(-torch.expm1(-new_amps))
             self.raw_amps.data.copy_(new_raw)
 
         print(f"  Scene init (dgi): mean {current_mean:.4f} → {target_mean:.4f} "

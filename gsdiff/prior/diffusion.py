@@ -46,7 +46,10 @@ class DiffusionPrior:
         self.sigma_start = max(sigma_min, min(sigma_start, sigma_max))
         self.sigma_end = max(sigma_min, min(sigma_end, sigma_max))
         self._call_count = 0
-        self._n_steps = 1  # will be set by caller (= num_outer - n_warmup)
+        # None until set_n_steps() is called (= num_outer - n_warmup). Left unset,
+        # σ would collapse to sigma_end after a single z-step — proximal() raises
+        # instead of silently degrading to a weak-TV-lookalike (see CLAUDE.md).
+        self._n_steps = None
         self.renoise = renoise
         assert ddim_spacing in ('linear', 'log')
         self.ddim_spacing = ddim_spacing
@@ -84,6 +87,10 @@ class DiffusionPrior:
         """
         assert x.ndim == 4 and x.shape[1] == 1, \
             f"Expected [T,1,H,W], got {x.shape}"
+        if self._n_steps is None:
+            raise RuntimeError(
+                "DiffusionPrior.set_n_steps(num_outer - n_warmup) must be called "
+                "before the first z-step (σ schedule is otherwise undefined).")
 
         sigma = self._current_sigma()
         self._call_count += 1
