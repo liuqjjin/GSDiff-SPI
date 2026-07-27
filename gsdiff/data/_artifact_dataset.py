@@ -19,7 +19,10 @@ from ._artifact_identity import (
     validate_exact_int,
     validate_finite_number,
     validate_generation_config,
+    validate_index_array,
+    validate_real_finite_array,
     validate_sha256,
+    validate_time_grid,
 )
 from ._artifact_io import (
     METADATA_MEMBER,
@@ -65,6 +68,21 @@ def _validate_acquisition_shapes(data: SPIAcquisitionData) -> None:
             raise ArtifactValidationError(
                 f"{name} shape must be {shape}, got {getattr(data, name).shape}"
             )
+    validate_real_finite_array(
+        data.patterns, "patterns", shape=expected_shapes["patterns"]
+    )
+    validate_real_finite_array(
+        data.measurements,
+        "measurements",
+        shape=expected_shapes["measurements"],
+    )
+    validate_index_array(
+        data.frame_indices,
+        "frame_indices",
+        shape=expected_shapes["frame_indices"],
+        upper_bound=data.T,
+    )
+    validate_time_grid(data.time_grid, "time_grid", length=data.T)
     optional = (
         data.holdout_patterns,
         data.holdout_measurements,
@@ -84,6 +102,22 @@ def _validate_acquisition_shapes(data: SPIAcquisitionData) -> None:
             or optional[2].shape != (count,)
         ):
             raise ArtifactValidationError("holdout array shapes do not agree")
+        validate_real_finite_array(
+            data.holdout_patterns,
+            "holdout_patterns",
+            shape=(count, data.H, data.W),
+        )
+        validate_real_finite_array(
+            data.holdout_measurements,
+            "holdout_measurements",
+            shape=(count,),
+        )
+        validate_index_array(
+            data.holdout_frame_indices,
+            "holdout_frame_indices",
+            shape=(count,),
+            upper_bound=data.T,
+        )
 
 
 def _validate_acquisition_identity(data: SPIAcquisitionData) -> None:
@@ -220,8 +254,16 @@ def split_spi_data(
         raise ArtifactValidationError(
             "generator_code_version must be a non-empty string"
         )
+    source_dimensions = []
+    for name in ("H", "W", "T", "K"):
+        value = getattr(data, name)
+        if type(value) is not int or value <= 0:
+            raise ArtifactValidationError(
+                f"generated SPIData {name} must be an exact positive integer"
+            )
+        source_dimensions.append(value)
     dimensions = tuple(config[name] for name in ("H", "W", "T", "K"))
-    if dimensions != (int(data.H), int(data.W), int(data.T), int(data.K)):
+    if dimensions != tuple(source_dimensions):
         raise ArtifactValidationError(
             "resolved dimensions do not match generated SPIData"
         )
@@ -238,11 +280,33 @@ def split_spi_data(
         raise ArtifactValidationError(
             "motion velocity and acceleration must each have shape [2]"
         )
-    if not np.array_equal(
-        np.asarray(data.gt_velocity, dtype=np.float64), velocity
-    ) or not np.isclose(float(data.gt_omega), float(motion_parameters["omega"])):
+    source_velocity = validate_real_finite_array(
+        data.gt_velocity, "generated SPIData gt_velocity", shape=(2,)
+    )
+    if not np.issubdtype(source_velocity.dtype, np.floating):
         raise ArtifactValidationError(
-            "resolved motion parameters do not match generated SPIData"
+            "generated SPIData gt_velocity must use a real floating dtype"
+        )
+    expected_source_velocity = np.asarray(
+        motion_parameters["velocity"], dtype=source_velocity.dtype
+    )
+    if not np.array_equal(source_velocity, expected_source_velocity):
+        raise ArtifactValidationError(
+            "generated SPIData gt_velocity disagrees with resolved motion"
+        )
+    source_omega = validate_real_finite_array(
+        data.gt_omega, "generated SPIData gt_omega", shape=()
+    )
+    if not np.issubdtype(source_omega.dtype, np.floating):
+        raise ArtifactValidationError(
+            "generated SPIData gt_omega must use a real floating dtype"
+        )
+    expected_source_omega = np.asarray(
+        motion_parameters["omega"], dtype=source_omega.dtype
+    )
+    if not np.array_equal(source_omega, expected_source_omega):
+        raise ArtifactValidationError(
+            "generated SPIData gt_omega disagrees with resolved motion"
         )
 
     arrays = {
@@ -562,8 +626,7 @@ def _validate_truth(data: EvaluationTruth) -> None:
             raise ArtifactValidationError(
                 f"{name} shape must be {shape}, got {array.shape}"
             )
-        if not np.all(np.isfinite(array)):
-            raise ArtifactValidationError(f"{name} must contain finite values")
+        validate_real_finite_array(array, name, shape=shape)
 
     motion = config["motion"]
     motion_parameters = motion["parameters"]
@@ -610,13 +673,6 @@ def _validate_truth(data: EvaluationTruth) -> None:
     ) or not np.array_equal(data.rotation_trajectory, expected_rotation):
         raise ArtifactValidationError(
             "truth trajectories disagree with dataset identity"
-        )
-    canonical_hash = sha256_bytes(
-        np.ascontiguousarray(data.canonical_image).tobytes(order="C")
-    )
-    if canonical_hash != data.dataset_identity_spec["target_asset_sha256"]:
-        raise ArtifactValidationError(
-            "truth canonical image disagrees with target asset identity"
         )
 
 

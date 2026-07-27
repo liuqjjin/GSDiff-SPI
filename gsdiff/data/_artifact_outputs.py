@@ -3,6 +3,8 @@
 from pathlib import Path
 from typing import Mapping, Sequence
 
+import numpy as np
+
 from ._artifact_dataset import (
     _validate_acquisition_identity,
     _validate_truth,
@@ -14,7 +16,10 @@ from ._artifact_identity import (
     json_native,
     validate_array_descriptor,
     validate_exact_keys,
+    validate_index_array,
+    validate_real_finite_array,
     validate_sha256,
+    validate_time_grid,
 )
 from ._artifact_io import (
     METADATA_MEMBER,
@@ -87,6 +92,24 @@ def validate_evaluation_inputs(
         raise ArtifactValidationError(
             "truth dimensions disagree with acquisition"
         )
+    if (
+        reconstruction.time_grid.dtype != acquisition.time_grid.dtype
+        or not np.array_equal(
+            reconstruction.time_grid, acquisition.time_grid
+        )
+    ):
+        raise ArtifactValidationError(
+            "reconstruction time_grid must exactly match acquisition time_grid"
+        )
+    expected_frame_indices = np.arange(
+        acquisition.T, dtype=reconstruction.frame_indices.dtype
+    )
+    if not np.array_equal(
+        reconstruction.frame_indices, expected_frame_indices
+    ):
+        raise ArtifactValidationError(
+            "reconstruction frame_indices must equal arange(T)"
+        )
 
 
 def _validate_reconstruction(data: ReconstructionOutput) -> None:
@@ -96,16 +119,31 @@ def _validate_reconstruction(data: ReconstructionOutput) -> None:
     T, H, W = data.reconstruction.shape
     if min(T, H, W) <= 0:
         raise ArtifactValidationError("reconstruction dimensions must be positive")
+    validate_real_finite_array(
+        data.reconstruction,
+        "reconstruction",
+        shape=(T, H, W),
+    )
     if data.dgi is not None and data.dgi.shape != (H, W):
         raise ArtifactValidationError("DGI shape must match reconstruction H,W")
+    if data.dgi is not None:
+        validate_real_finite_array(data.dgi, "dgi", shape=(H, W))
     if data.estimated_motion_trajectory.shape != (T, 3):
         raise ArtifactValidationError(
             "estimated motion trajectory must have shape [T,3]"
         )
-    if data.frame_indices.shape != (T,) or data.time_grid.shape != (T,):
-        raise ArtifactValidationError(
-            "frame indices and time grid must each have shape [T]"
-        )
+    validate_real_finite_array(
+        data.estimated_motion_trajectory,
+        "estimated_motion_trajectory",
+        shape=(T, 3),
+    )
+    validate_index_array(
+        data.frame_indices,
+        "frame_indices",
+        shape=(T,),
+        upper_bound=T,
+    )
+    validate_time_grid(data.time_grid, "time_grid", length=T)
     if not data.method_name:
         raise ArtifactValidationError("method_name cannot be empty")
     policy = data.execution_policy

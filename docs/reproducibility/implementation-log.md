@@ -1432,3 +1432,93 @@ This permanent append-only ledger is intentionally empty of implementation recor
   every returned hash equalled the direct file-byte hash.
 - `git diff --check` → exit `0` with silent output. Test output was pristine,
   with no warnings or unexpected skips.
+
+## Task 9 Fix Round 2 — Validate scientific artifact arrays (2026-07-27)
+
+- Started from reviewed Task 9 Fix Round 1 commit
+  `a87ff9f69515b24ba110f956b3ecac560e5f5cba` with a clean tracked
+  worktree. Scope remains Task 9; no Task 10 run identity or run-root behavior
+  was introduced.
+- `target.descriptor` is now an opaque logical ID, not a path-shaped string.
+  It must match ASCII `[A-Za-z0-9][A-Za-z0-9._-]{0,127}`, cannot contain
+  `..`, and therefore cannot contain POSIX/Windows/UNC separators, URI
+  punctuation, or drive syntax. Case-insensitive long capability tokens
+  `truth`, `evaluation`, `evaluator`, `canonical`, `trajectory`, `metric`,
+  `display`, and `normalized` are rejected anywhere; the short token `gt` is
+  rejected only as an exact `[._-]`-delimited segment. Valid examples include
+  `L`, `tank.png`, and `asset-01.v2`. Artifact code never interprets or opens
+  the descriptor.
+- Split-source H/W/T/K fields must be exact positive Python integers; bool,
+  float, string, and NumPy scalar coercions are rejected before comparison.
+  Source velocity and omega must have real floating, finite values and the
+  exact declared shapes. Config expectations are quantized to the source
+  floating dtype before exact comparison, accepting legitimate float32
+  representations such as decimal `0.2` while rejecting representable real
+  mismatches.
+- A shared real-numeric-finite validator rejects bool, object, complex, NaN,
+  and infinity. Acquisition patterns, measurements, time grid, holdout
+  patterns/measurements, truth arrays, reconstruction, DGI, and estimated
+  trajectories use it. Acquisition and reconstruction index arrays require a
+  non-bool integer dtype and values in `[0,T)`.
+- Acquisition and reconstruction time grids have exact shape `[T]`; for
+  `T>1`, every adjacent value must increase strictly. `T=1` is explicitly one
+  arbitrary finite real time value. Direct adjacent comparison avoids
+  unsigned-integer subtraction underflow. Evaluator admission additionally
+  requires reconstruction time-grid dtype and values to match acquisition
+  exactly, and reconstruction frame indices to equal `arange(T)`.
+- Superseding clarification: the Fix Round 1 statement that truth canonical
+  bytes are bound directly to `target_asset_sha256` was incorrect.
+  `target_asset_sha256` retains its original required field/API/identity
+  semantics: it hashes source-asset bytes or another explicitly designated
+  target asset, which ordinarily differs from decoded/resized canonical pixel
+  bytes. Truth canonical-array integrity remains covered by its array
+  descriptor and the truth artifact file-byte hash. No canonical hash was
+  added to the acquisition identity.
+
+### RED/GREEN evidence
+
+- Logical-ID path/capability RED:
+  `6 failed, 3 passed`; initial GREEN: `9 passed`. Reviewer-requested short
+  token extensions were a second RED of `3 failed, 9 passed`, then
+  `12 passed`.
+- Split-source type/motion-precision RED:
+  `21 failed, 88 deselected, 1 warning`; GREEN:
+  `21 passed, 88 deselected`.
+- Scientific arrays/index/time/evaluator RED:
+  `31 failed, 1 passed, 112 deselected`. The one pass was the pre-existing
+  valid `T=1` behavior and is coverage-only. GREEN:
+  `32 passed, 112 deselected`.
+- The reviewer independently demonstrated the real-asset hash rejection on
+  Fix Round 1. A real temporary PNG reproduced it locally as
+  `1 failed, 143 deselected`; removing only the erroneous canonical-pixel
+  equality produced `1 passed, 143 deselected`.
+- Pre-final mutation review exposed unsigned `np.diff` underflow in monotonic
+  checking. Targeted RED was `1 failed, 144 deselected`; direct adjacent
+  comparison produced `1 passed, 144 deselected`.
+
+### Verification
+
+- Final focused artifacts → exit `0`, `145 passed in 7.27s`.
+- Accumulated CPU → exit `0`,
+  `359 passed, 1 deselected in 19.28s`.
+- Real CUDA → exit `0`,
+  `1 passed, 359 deselected in 1.13s`; exactly one executed and zero skipped.
+- Full suite → exit `0`, `360 passed in 19.85s`.
+- Strict environment verification → exit `0`, fingerprint
+  `b5d6922a9f3a9638ee8826b9a74f00998cd3ac81aa25c03de016358e0e435a56`.
+- Strict implementation-provenance verification → exit `0`; four immutable
+  inputs verified at base
+  `a87ff9f69515b24ba110f956b3ecac560e5f5cba`.
+- `D:\conda\envs\spi\python.exe -m pip check` → exit `0`,
+  `No broken requirements found.`
+- `compileall` completed silently with exit `0`.
+- Five-save deterministic audit retained one acquisition hash
+  `1248786ce0f22d193feb97bace37d63f9ba9a3f349042b8dfb5e0b132dea4da9`
+  and one truth hash
+  `81ff0c059b42d452a07668475111e405a94b2a52ba354641309ce71729fd3933`;
+  every returned hash equalled the direct file-byte hash.
+- Static audits reported zero forbidden acquisition fields, zero old blind
+  literal references, zero Task 10 builder references, and 13 exact
+  `blind_method_child` production references.
+- `git diff --check` → exit `0`, silent. Test/verifier output was pristine,
+  with no warnings or unexpected skips.

@@ -12,6 +12,7 @@ import zipfile
 import numpy as np
 import pytest
 import yaml
+from PIL import Image
 
 from gsdiff.data.artifacts import (
     ArtifactValidationError,
@@ -38,12 +39,12 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 AUTHORITATIVE_PYTHON = Path(r"D:\conda\envs\spi\python.exe")
 
 
-def _tiny_source(*, seed=7, shape="L", holdout_count=6):
+def _tiny_source(*, seed=7, shape="L", holdout_count=6, T=3):
     generation_config = {
         "schema": "measurements-v1",
         "H": 8,
         "W": 8,
-        "T": 3,
+        "T": T,
         "K": 12,
         "seed": seed,
         "target": {"kind": "builtin", "descriptor": shape},
@@ -74,7 +75,7 @@ def _tiny_source(*, seed=7, shape="L", holdout_count=6):
     data = generate_spi_data(
         H=8,
         W=8,
-        T=3,
+        T=T,
         K=12,
         pattern_type="bernoulli",
         motion_type="custom_se2",
@@ -607,6 +608,64 @@ def test_generation_config_rejects_capability_smuggling(path, value):
 
 
 @pytest.mark.parametrize(
+    "descriptor",
+    [
+        r"C:\private\evaluation-truth.npz",
+        "/private/evaluation-truth.npz",
+        r"\\server\share\target.png",
+        "../target.png",
+        "https://example.invalid/target.png",
+        "evaluation-truth.npz",
+        "gt.npz",
+        "metrics.json",
+        "trajectory-v1",
+    ],
+    ids=[
+        "windows-absolute",
+        "posix-absolute",
+        "unc",
+        "parent-relative",
+        "uri",
+        "reserved-capability-token",
+        "short-gt-token",
+        "metrics-token",
+        "trajectory-token",
+    ],
+)
+def test_target_descriptor_rejects_paths_uris_and_capability_tokens(
+    descriptor,
+):
+    data, config, target_hash = _tiny_source()
+    config["target"]["descriptor"] = descriptor
+
+    with pytest.raises(ArtifactValidationError):
+        split_spi_data(
+            data,
+            resolved_generation_config=config,
+            generator_code_version="gsdiff-simulation-test-v1",
+            target_asset_sha256=target_hash,
+        )
+
+
+@pytest.mark.parametrize("descriptor", ["L", "tank.png", "asset-01.v2"])
+def test_target_descriptor_accepts_opaque_logical_ids(descriptor):
+    data, config, target_hash = _tiny_source()
+    config["target"]["descriptor"] = descriptor
+
+    acquisition, _ = split_spi_data(
+        data,
+        resolved_generation_config=config,
+        generator_code_version="gsdiff-simulation-test-v1",
+        target_asset_sha256=target_hash,
+    )
+
+    assert (
+        acquisition.resolved_generation_config["target"]["descriptor"]
+        == descriptor
+    )
+
+
+@pytest.mark.parametrize(
     ("metadata_field", "identity_field", "changed"),
     [
         ("seed", "seed", 11),
@@ -714,6 +773,364 @@ def test_split_requires_holdout_metadata_to_match_array_presence_and_count(
         )
 
 
+@pytest.mark.parametrize(
+    ("field", "changed"),
+    [
+        ("H", 8.0),
+        ("W", "8"),
+        ("T", np.int64(3)),
+        ("K", np.int32(12)),
+        ("H", False),
+        ("W", 0),
+    ],
+    ids=[
+        "float",
+        "string",
+        "numpy-int64",
+        "numpy-int32",
+        "bool",
+        "nonpositive",
+    ],
+)
+def test_split_rejects_non_exact_source_dimension_types(field, changed):
+    data, config, target_hash = _tiny_source()
+    setattr(data, field, changed)
+
+    with pytest.raises(
+        ArtifactValidationError, match="generated SPIData.*exact positive integer"
+    ):
+        split_spi_data(
+            data,
+            resolved_generation_config=config,
+            generator_code_version="gsdiff-simulation-test-v1",
+            target_asset_sha256=target_hash,
+        )
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        np.array([1.0], dtype=np.float32),
+        np.array([1.0 + 0.0j, -0.5 + 0.0j]),
+        np.array([1.0, -0.5], dtype=object),
+        np.array([True, False]),
+        np.array([np.nan, -0.5]),
+        np.array([np.inf, -0.5]),
+    ],
+    ids=["shape", "complex", "object", "bool", "nan", "inf"],
+)
+def test_split_rejects_invalid_source_gt_velocity(changed):
+    data, config, target_hash = _tiny_source()
+    data.gt_velocity = changed
+
+    with pytest.raises(ArtifactValidationError, match="gt_velocity"):
+        split_spi_data(
+            data,
+            resolved_generation_config=config,
+            generator_code_version="gsdiff-simulation-test-v1",
+            target_asset_sha256=target_hash,
+        )
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [True, "0.15", np.array([0.15]), 0.15 + 0.0j, np.nan, np.inf],
+    ids=["bool", "string", "array", "complex", "nan", "inf"],
+)
+def test_split_rejects_invalid_source_gt_omega(changed):
+    data, config, target_hash = _tiny_source()
+    data.gt_omega = changed
+
+    with pytest.raises(ArtifactValidationError, match="gt_omega"):
+        split_spi_data(
+            data,
+            resolved_generation_config=config,
+            generator_code_version="gsdiff-simulation-test-v1",
+            target_asset_sha256=target_hash,
+        )
+
+
+def test_split_compares_motion_at_source_float_precision():
+    data, config, target_hash = _tiny_source()
+    config["motion"]["parameters"]["velocity"] = [0.2, -0.1]
+    config["motion"]["parameters"]["omega"] = 0.2
+    data.gt_velocity = np.array([0.2, -0.1], dtype=np.float32)
+    data.gt_omega = np.float32(0.2)
+
+    acquisition, truth = split_spi_data(
+        data,
+        resolved_generation_config=config,
+        generator_code_version="gsdiff-simulation-test-v1",
+        target_asset_sha256=target_hash,
+    )
+
+    np.testing.assert_array_equal(
+        truth.gt_velocity, np.array([0.2, -0.1], dtype=np.float32)
+    )
+    assert acquisition.motion_parameters["omega"] == 0.2
+
+
+@pytest.mark.parametrize("field", ["gt_velocity", "gt_omega"])
+def test_split_rejects_real_source_motion_mismatch(field):
+    data, config, target_hash = _tiny_source()
+    config["motion"]["parameters"]["velocity"] = [0.2, -0.1]
+    config["motion"]["parameters"]["omega"] = 0.2
+    data.gt_velocity = np.array([0.2, -0.1], dtype=np.float32)
+    data.gt_omega = np.float32(0.2)
+    if field == "gt_velocity":
+        data.gt_velocity[1] = np.float32(-0.11)
+    else:
+        data.gt_omega = np.float32(0.21)
+
+    with pytest.raises(ArtifactValidationError, match=field):
+        split_spi_data(
+            data,
+            resolved_generation_config=config,
+            generator_code_version="gsdiff-simulation-test-v1",
+            target_asset_sha256=target_hash,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "mutation"),
+    [
+        ("patterns", "bool"),
+        ("measurements", "complex"),
+        ("time_grid", "nan"),
+        ("holdout_patterns", "inf"),
+        ("holdout_measurements", "bool"),
+    ],
+)
+def test_acquisition_rejects_nonreal_or_nonfinite_scientific_arrays(
+    tmp_path, field, mutation
+):
+    acquisition, _ = _tiny_pair()
+    changed = getattr(acquisition, field).copy()
+    if mutation == "bool":
+        changed = changed.astype(bool)
+    elif mutation == "complex":
+        changed = changed.astype(np.complex64)
+    elif mutation == "nan":
+        changed.flat[0] = np.nan
+    else:
+        changed.flat[0] = np.inf
+    tampered = dataclasses.replace(acquisition, **{field: changed})
+
+    with pytest.raises(
+        ArtifactValidationError, match=f"{field}.*real numeric finite"
+    ):
+        save_acquisition_data(tampered, tmp_path / "measurements.npz")
+
+
+@pytest.mark.parametrize(
+    ("field", "mutation"),
+    [
+        ("frame_indices", "float"),
+        ("frame_indices", "bool"),
+        ("frame_indices", "negative"),
+        ("frame_indices", "out-of-range"),
+        ("holdout_frame_indices", "float"),
+        ("holdout_frame_indices", "negative"),
+        ("holdout_frame_indices", "out-of-range"),
+    ],
+)
+def test_acquisition_rejects_invalid_index_arrays(
+    tmp_path, field, mutation
+):
+    acquisition, _ = _tiny_pair()
+    changed = getattr(acquisition, field).copy()
+    if mutation == "float":
+        changed = changed.astype(np.float64)
+    elif mutation == "bool":
+        changed = changed.astype(bool)
+    elif mutation == "negative":
+        changed[0] = -1
+    else:
+        changed[0] = acquisition.T
+    tampered = dataclasses.replace(acquisition, **{field: changed})
+
+    with pytest.raises(ArtifactValidationError, match=field):
+        save_acquisition_data(tampered, tmp_path / "measurements.npz")
+
+
+@pytest.mark.parametrize(
+    "time_grid",
+    [
+        np.array([0.0, 0.75, 0.5], dtype=np.float32),
+        np.array([0.0, 0.5, 0.5], dtype=np.float32),
+        np.array([1, 0, 2], dtype=np.uint8),
+    ],
+    ids=["decreasing", "duplicate", "unsigned-decreasing"],
+)
+def test_acquisition_time_grid_must_be_strictly_increasing(
+    tmp_path, time_grid
+):
+    acquisition, _ = _tiny_pair()
+    tampered = dataclasses.replace(acquisition, time_grid=time_grid)
+
+    with pytest.raises(ArtifactValidationError, match="strictly increasing"):
+        save_acquisition_data(tampered, tmp_path / "measurements.npz")
+
+
+def test_single_frame_acquisition_accepts_one_finite_time_value():
+    data, config, target_hash = _tiny_source(T=1)
+
+    acquisition, truth = split_spi_data(
+        data,
+        resolved_generation_config=config,
+        generator_code_version="gsdiff-simulation-test-v1",
+        target_asset_sha256=target_hash,
+    )
+
+    np.testing.assert_array_equal(
+        acquisition.time_grid, np.array([0.0], dtype=np.float32)
+    )
+    assert truth.T == 1
+
+
+def test_loader_rejects_nan_even_with_matching_local_array_descriptor(
+    tmp_path,
+):
+    acquisition, _ = _tiny_pair()
+    source = tmp_path / "source.npz"
+    forged = tmp_path / "forged.npz"
+    save_acquisition_data(acquisition, source)
+    changed = acquisition.patterns.copy()
+    changed.flat[0] = np.nan
+    _rewrite_npz(
+        source,
+        forged,
+        lambda members: _replace_array_and_descriptor(
+            members, "patterns", changed
+        ),
+    )
+
+    with pytest.raises(
+        ArtifactValidationError, match="patterns.*real numeric finite"
+    ):
+        load_acquisition_data(forged)
+
+
+@pytest.mark.parametrize(
+    ("field", "mutation"),
+    [
+        ("canonical_image", "bool"),
+        ("gt_frames", "complex"),
+        ("translation_trajectory", "complex"),
+        ("rotation_trajectory", "nan"),
+    ],
+)
+def test_truth_rejects_nonreal_or_nonfinite_scientific_arrays(
+    tmp_path, field, mutation
+):
+    _, truth = _tiny_pair()
+    changed = getattr(truth, field).copy()
+    if mutation == "bool":
+        changed = changed.astype(bool)
+    elif mutation == "complex":
+        changed = changed.astype(np.complex64)
+    else:
+        changed.flat[0] = np.nan
+    tampered = dataclasses.replace(truth, **{field: changed})
+
+    with pytest.raises(
+        ArtifactValidationError, match=f"{field}.*real numeric finite"
+    ):
+        save_evaluation_truth(tampered, tmp_path / "truth.npz")
+
+
+@pytest.mark.parametrize(
+    ("field", "mutation"),
+    [
+        ("reconstruction", "nan"),
+        ("dgi", "inf"),
+        ("estimated_motion_trajectory", "complex"),
+        ("time_grid", "bool"),
+    ],
+)
+def test_reconstruction_rejects_nonreal_or_nonfinite_scientific_arrays(
+    tmp_path, field, mutation
+):
+    acquisition, _ = _tiny_pair()
+    output = _raw_output(acquisition)
+    changed = getattr(output, field).copy()
+    if mutation == "complex":
+        changed = changed.astype(np.complex64)
+    elif mutation == "bool":
+        changed = changed.astype(bool)
+    elif mutation == "nan":
+        changed.flat[0] = np.nan
+    else:
+        changed.flat[0] = np.inf
+    tampered = dataclasses.replace(output, **{field: changed})
+
+    with pytest.raises(
+        ArtifactValidationError, match=f"{field}.*real numeric finite"
+    ):
+        write_method_child_outputs(
+            tmp_path / "outputs", tampered, history=[]
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation", ["float", "bool", "negative", "out-of-range"]
+)
+def test_reconstruction_rejects_invalid_frame_indices(tmp_path, mutation):
+    acquisition, _ = _tiny_pair()
+    output = _raw_output(acquisition)
+    changed = output.frame_indices.copy()
+    if mutation == "float":
+        changed = changed.astype(np.float64)
+    elif mutation == "bool":
+        changed = changed.astype(bool)
+    elif mutation == "negative":
+        changed[0] = -1
+    else:
+        changed[0] = acquisition.T
+    tampered = dataclasses.replace(output, frame_indices=changed)
+
+    with pytest.raises(ArtifactValidationError, match="frame_indices"):
+        write_method_child_outputs(
+            tmp_path / "outputs", tampered, history=[]
+        )
+
+
+def test_reconstruction_time_grid_must_be_strictly_increasing(tmp_path):
+    acquisition, _ = _tiny_pair()
+    output = dataclasses.replace(
+        _raw_output(acquisition),
+        time_grid=np.array([0.0, 0.75, 0.5], dtype=np.float32),
+    )
+
+    with pytest.raises(ArtifactValidationError, match="strictly increasing"):
+        write_method_child_outputs(tmp_path / "outputs", output, history=[])
+
+
+@pytest.mark.parametrize("mutation", ["value", "dtype"])
+def test_evaluator_requires_exact_acquisition_time_grid(mutation):
+    acquisition, truth = _tiny_pair()
+    changed = acquisition.time_grid.copy()
+    if mutation == "value":
+        changed[1] = np.float32(0.4)
+    else:
+        changed = changed.astype(np.float64)
+    output = dataclasses.replace(_raw_output(acquisition), time_grid=changed)
+
+    with pytest.raises(ArtifactValidationError, match="time_grid"):
+        validate_evaluation_inputs(output, acquisition, truth)
+
+
+def test_evaluator_requires_canonical_output_frame_indices():
+    acquisition, truth = _tiny_pair()
+    output = dataclasses.replace(
+        _raw_output(acquisition),
+        frame_indices=np.array([1, 0, 2], dtype=np.int64),
+    )
+
+    with pytest.raises(ArtifactValidationError, match="frame_indices"):
+        validate_evaluation_inputs(output, acquisition, truth)
+
+
 def test_truth_loader_rejects_seed_and_target_swaps_before_evaluation(tmp_path):
     acquisition_seed7, truth_seed7 = _tiny_pair(seed=7, shape="L")
     acquisition_seed11, truth_seed11 = _tiny_pair(seed=11, shape="L")
@@ -819,7 +1236,6 @@ def test_truth_loader_binds_scalar_motion_metadata_to_identity(
 @pytest.mark.parametrize(
     "field",
     [
-        "canonical_image",
         "gt_velocity",
         "gt_acceleration",
         "translation_trajectory",
@@ -850,6 +1266,63 @@ def test_truth_loader_rejects_identity_inconsistent_array_with_forged_digest(
                 acquisition.dataset_identity_sha256
             ),
         )
+
+
+def test_raw_target_asset_hash_does_not_equal_decoded_canonical_hash(
+    tmp_path,
+):
+    target_path = tmp_path / "target.png"
+    pixels = np.arange(64, dtype=np.uint8).reshape(8, 8) * 4
+    Image.fromarray(pixels).save(target_path)
+    raw_target_hash = hashlib.sha256(target_path.read_bytes()).hexdigest()
+    data = generate_spi_data(
+        H=8,
+        W=8,
+        T=3,
+        K=12,
+        pattern_type="bernoulli",
+        motion_type="custom_se2",
+        snr_db=25.0,
+        seed=7,
+        shape=str(target_path),
+        gt_velocity=[1.0, -0.5],
+        gt_omega=0.15,
+        gt_accel=[0.2, 0.1],
+        gt_beta=0.03,
+        noise_sigma_abs=0.01,
+        holdout_extra=6,
+        time_assignment_mode="uniform",
+        pattern_order="stratified",
+    )
+    _, config, _ = _tiny_source()
+    config["target"] = {"kind": "asset", "descriptor": "target.png"}
+    decoded_canonical_hash = hashlib.sha256(
+        np.ascontiguousarray(data.canonical).tobytes()
+    ).hexdigest()
+    assert raw_target_hash != decoded_canonical_hash
+
+    acquisition, truth = split_spi_data(
+        data,
+        resolved_generation_config=config,
+        generator_code_version="gsdiff-simulation-test-v1",
+        target_asset_sha256=raw_target_hash,
+    )
+    acquisition_path = tmp_path / "measurements.npz"
+    truth_path = tmp_path / "truth.npz"
+    save_acquisition_data(acquisition, acquisition_path)
+    save_evaluation_truth(truth, truth_path)
+    loaded_acquisition = load_acquisition_data(
+        acquisition_path, expected_spec=config
+    )
+    loaded_truth = load_evaluation_truth(
+        truth_path,
+        expected_dataset_identity_sha256=(
+            loaded_acquisition.dataset_identity_sha256
+        ),
+    )
+
+    assert loaded_acquisition.target_asset_sha256 == raw_target_hash
+    np.testing.assert_array_equal(loaded_truth.canonical_image, data.canonical)
 
 
 def test_artifact_metadata_is_recursively_immutable():

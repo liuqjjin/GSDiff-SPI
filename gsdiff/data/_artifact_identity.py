@@ -3,6 +3,7 @@
 import hashlib
 import json
 import math
+import re
 from types import MappingProxyType
 from typing import Mapping
 
@@ -10,6 +11,20 @@ import numpy as np
 
 
 _HEX_DIGITS = frozenset("0123456789abcdef")
+_TARGET_DESCRIPTOR_PATTERN = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z", re.ASCII
+)
+_TARGET_DESCRIPTOR_RESERVED_TOKENS = (
+    "truth",
+    "evaluation",
+    "evaluator",
+    "canonical",
+    "trajectory",
+    "metric",
+    "display",
+    "normalized",
+)
+_TARGET_DESCRIPTOR_RESERVED_SEGMENTS = frozenset({"gt"})
 
 
 class ArtifactValidationError(ValueError):
@@ -158,10 +173,94 @@ def validate_finite_number(
     return value
 
 
+def validate_real_finite_array(
+    value: object,
+    field: str,
+    *,
+    shape: tuple[int, ...] | None = None,
+) -> np.ndarray:
+    try:
+        array = np.asarray(value)
+    except (TypeError, ValueError) as exc:
+        raise ArtifactValidationError(
+            f"{field} must be a real numeric finite array"
+        ) from exc
+    if (
+        np.issubdtype(array.dtype, np.bool_)
+        or not np.issubdtype(array.dtype, np.number)
+        or np.issubdtype(array.dtype, np.complexfloating)
+    ):
+        raise ArtifactValidationError(
+            f"{field} must be a real numeric finite array"
+        )
+    if shape is not None and array.shape != shape:
+        raise ArtifactValidationError(f"{field} must have shape {shape}")
+    if not np.all(np.isfinite(array)):
+        raise ArtifactValidationError(
+            f"{field} must be a real numeric finite array"
+        )
+    return array
+
+
+def validate_index_array(
+    value: object,
+    field: str,
+    *,
+    shape: tuple[int, ...],
+    upper_bound: int,
+) -> np.ndarray:
+    array = np.asarray(value)
+    if (
+        np.issubdtype(array.dtype, np.bool_)
+        or not np.issubdtype(array.dtype, np.integer)
+    ):
+        raise ArtifactValidationError(f"{field} must use an integer dtype")
+    if array.shape != shape:
+        raise ArtifactValidationError(f"{field} must have shape {shape}")
+    if np.any(array < 0) or np.any(array >= upper_bound):
+        raise ArtifactValidationError(
+            f"{field} values must be in [0, {upper_bound})"
+        )
+    return array
+
+
+def validate_time_grid(
+    value: object,
+    field: str,
+    *,
+    length: int,
+) -> np.ndarray:
+    array = validate_real_finite_array(value, field, shape=(length,))
+    if length > 1 and not np.all(array[1:] > array[:-1]):
+        raise ArtifactValidationError(f"{field} must be strictly increasing")
+    return array
+
+
 def _validate_nonempty_string(value: object, field: str) -> str:
     if type(value) is not str or not value.strip():
         raise ArtifactValidationError(f"{field} must be a non-empty string")
     return value
+
+
+def _validate_target_descriptor(value: object) -> str:
+    descriptor = _validate_nonempty_string(value, "target.descriptor")
+    descriptor_lower = descriptor.lower()
+    if (
+        _TARGET_DESCRIPTOR_PATTERN.fullmatch(descriptor) is None
+        or ".." in descriptor
+        or any(
+            token in descriptor_lower
+            for token in _TARGET_DESCRIPTOR_RESERVED_TOKENS
+        )
+        or any(
+            segment in _TARGET_DESCRIPTOR_RESERVED_SEGMENTS
+            for segment in re.split(r"[._-]+", descriptor_lower)
+        )
+    ):
+        raise ArtifactValidationError(
+            "target.descriptor must be an opaque logical target ID"
+        )
+    return descriptor
 
 
 def _validate_mapping(value: object, field: str) -> Mapping[str, object]:
@@ -223,9 +322,7 @@ def validate_generation_config(
     validate_exact_keys(target, {"kind", "descriptor"}, "target")
     target_native = {
         "kind": _validate_nonempty_string(target["kind"], "target.kind"),
-        "descriptor": _validate_nonempty_string(
-            target["descriptor"], "target.descriptor"
-        ),
+        "descriptor": _validate_target_descriptor(target["descriptor"]),
     }
 
     pattern = _validate_mapping(
