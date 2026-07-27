@@ -6,7 +6,7 @@ boundary solution ``slope=0, intercept=mean(gt)`` when the unconstrained slope
 is negative. The same boundary is selected for numerically constant
 predictions, defined deterministically as::
 
-    variance(recon) <= eps64 * max(1, mean(recon**2))
+    variance(recon) <= eps64 * max(1, max(abs(recon - mean(recon))))**2
 
 The aligned video is clipped to [0, 1] once and that exact float64 array is used
 for PSNR, SSIM, and normalized RMSE. Legacy per-frame min-max PSNR remains an
@@ -20,9 +20,15 @@ from ..utils import normalize_01_legacy_minmax, psnr_legacy_60db
 
 
 _FLOAT64_EPS = np.finfo(np.float64).eps
+_FLOAT64_MAX = np.finfo(np.float64).max
 _PSNR_MSE_FLOOR = 1e-12
 _PSNR_CAP_DB = 120.0
 _SSIM_WIN_SIZE = 7
+
+
+def _safe_input_abs_bound(size: int) -> float:
+    """Bound values so fourth-order image-metric arithmetic stays finite."""
+    return float((_FLOAT64_MAX / (16.0 * size)) ** 0.25)
 
 
 def _as_float64_video(array: np.ndarray, name: str) -> np.ndarray:
@@ -44,6 +50,12 @@ def _as_float64_video(array: np.ndarray, name: str) -> np.ndarray:
     result = array.astype(np.float64, copy=False)
     if not np.all(np.isfinite(result)):
         raise ValueError(f"{name} must contain only finite values")
+    safe_bound = _safe_input_abs_bound(result.size)
+    if float(np.max(np.abs(result))) > safe_bound:
+        raise ValueError(
+            f"{name} magnitude exceeds the safe evaluability bound "
+            f"{safe_bound:.17g}"
+        )
     return result
 
 
@@ -60,9 +72,41 @@ def _validated_pair(
     return gt64, recon64
 
 
+def _centered_values(
+    values: np.ndarray,
+) -> tuple[float, np.ndarray, float]:
+    """Center without summing the large common offset."""
+    reference = float(values.flat[0])
+    mean = reference + float(np.mean(values - reference))
+    centered = values - mean
+    scale = float(np.max(np.abs(centered)))
+    return mean, centered, scale
+
+
+def _scaled_variance(centered: np.ndarray, scale: float) -> float:
+    if scale == 0.0:
+        return 0.0
+    unit = centered / scale
+    return float(scale * scale * np.mean(unit * unit))
+
+
 def _prediction_variance_threshold(recon64: np.ndarray) -> float:
-    mean_square = float(np.mean(np.square(recon64)))
-    return _FLOAT64_EPS * max(1.0, mean_square)
+    _, _, centered_scale = _centered_values(recon64)
+    return float(
+        _FLOAT64_EPS * max(1.0, centered_scale) ** 2
+    )
+
+
+def _require_finite_numbers(value: object, path: str = "result") -> None:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            _require_finite_numbers(child, f"{path}.{key}")
+    elif isinstance(value, (list, tuple)):
+        for index, child in enumerate(value):
+            _require_finite_numbers(child, f"{path}[{index}]")
+    elif isinstance(value, (float, np.floating)):
+        if not np.isfinite(value):
+            raise ValueError(f"{path} is not finite")
 
 
 def fit_global_affine(
@@ -76,18 +120,36 @@ def fit_global_affine(
     if not isinstance(nonnegative_slope, (bool, np.bool_)):
         raise TypeError("nonnegative_slope must be a boolean")
 
-    prediction_variance = float(np.var(recon64))
-    if prediction_variance <= _prediction_variance_threshold(recon64):
-        return 0.0, float(np.mean(gt64))
-
-    design = np.column_stack(
-        (recon64.reshape(-1), np.ones(recon64.size, dtype=np.float64))
+    gt_mean, gt_centered, gt_scale = _centered_values(gt64)
+    recon_mean, recon_centered, recon_scale = _centered_values(recon64)
+    prediction_variance = _scaled_variance(
+        recon_centered, recon_scale
     )
-    slope, intercept = np.linalg.lstsq(
-        design, gt64.reshape(-1), rcond=None
-    )[0]
+    if prediction_variance <= _prediction_variance_threshold(recon64):
+        return 0.0, gt_mean
+
+    recon_unit = recon_centered / recon_scale
+    recon_unit_variance = float(np.mean(recon_unit * recon_unit))
+    if gt_scale == 0.0:
+        slope = 0.0
+    else:
+        gt_unit = gt_centered / gt_scale
+        scaled_covariance = float(np.mean(recon_unit * gt_unit))
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            slope = (
+                (gt_scale / recon_scale)
+                * (scaled_covariance / recon_unit_variance)
+            )
+    if not np.isfinite(slope):
+        raise ValueError("global affine slope cannot be represented finitely")
     if nonnegative_slope and slope < 0.0:
-        return 0.0, float(np.mean(gt64))
+        return 0.0, gt_mean
+    with np.errstate(over="ignore", invalid="ignore"):
+        intercept = gt_mean - slope * recon_mean
+    if not np.isfinite(intercept):
+        raise ValueError(
+            "global affine intercept cannot be represented finitely"
+        )
     return float(slope), float(intercept)
 
 
@@ -106,7 +168,11 @@ def apply_global_affine(
         raise ValueError("slope must be a finite slope")
     if not np.isfinite(intercept):
         raise ValueError("intercept must be a finite intercept")
-    return np.clip(slope * recon64 + intercept, 0.0, 1.0)
+    with np.errstate(over="ignore", invalid="ignore"):
+        transformed = slope * recon64 + intercept
+    if not np.all(np.isfinite(transformed)):
+        raise ValueError("global affine application produced nonfinite values")
+    return np.clip(transformed, 0.0, 1.0)
 
 
 def evaluate_video_legacy_per_frame(
@@ -123,7 +189,7 @@ def evaluate_video_legacy_per_frame(
         )
         for t in range(gt64.shape[0])
     ]
-    return {
+    payload = {
         "definition_version": "legacy-per-frame-minmax-v1",
         "psnr_legacy_per_frame_minmax": float(np.mean(per_frame)),
         "per_frame_psnr_legacy_per_frame_minmax": per_frame,
@@ -135,6 +201,8 @@ def evaluate_video_legacy_per_frame(
             "psnr_mse_sentinel_threshold": 1e-12,
         },
     }
+    _require_finite_numbers(payload)
+    return payload
 
 
 def evaluate_video_global_affine(
@@ -170,7 +238,7 @@ def evaluate_video_global_affine(
     )
     legacy = evaluate_video_legacy_per_frame(gt64, recon64)
 
-    return {
+    payload = {
         "psnr_global_affine": psnr,
         "ssim_global_affine": float(np.mean(per_frame_ssim)),
         "nrmse_global_affine_l2": nrmse,
@@ -189,7 +257,15 @@ def evaluate_video_global_affine(
                 recon64
             ),
             "prediction_variance_threshold_policy": (
-                "variance <= eps64 * max(1, mean(recon**2))"
+                "variance <= eps64 * "
+                "max(1, max(abs(recon - mean(recon))))**2"
+            ),
+            "input_abs_evaluability_bound": _safe_input_abs_bound(
+                recon64.size
+            ),
+            "input_abs_evaluability_bound_policy": (
+                "max(abs(input)) <= "
+                "(float64_max / (16 * number_of_video_values))**0.25"
             ),
             "alignment_output_clip": [0.0, 1.0],
             "psnr_data_range": 1.0,
@@ -202,3 +278,5 @@ def evaluate_video_global_affine(
             "nrmse_denominator_epsilon": _FLOAT64_EPS,
         },
     }
+    _require_finite_numbers(payload)
+    return payload

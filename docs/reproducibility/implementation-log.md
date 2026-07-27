@@ -336,6 +336,90 @@ This permanent append-only ledger is intentionally empty of implementation recor
 - `git diff --check` → exit `0` with silent output. Test and verifier output
   was pristine, with no warnings or unexpected skips.
 
+## Task 8 Fix Round 1 — Stabilize global affine metrics (2026-07-27)
+
+- Clean independent-fix base:
+  `a83494f4bf06b8d927fd5baae60c6203c17db179`; the Task 8 feature commit
+  was not amended.
+- Root-cause reproduction showed that the raw
+  `[recon_flat, ones]` least-squares design was numerically rank-deficient for
+  the valid exact pair `recon=1e7+gt`. It returned slope
+  `4.999999834498788e-08` and near-zero intercept, producing only
+  `10.731493247071594` dB instead of exact recovery.
+- The former variance threshold used `mean(recon**2)`, so harmless common
+  offsets changed the constant-prediction decision. At `1e308`, reductions
+  and squares overflowed repeatedly, metadata contained infinity, and strict
+  JSON serialization failed only after warnings and arithmetic had occurred.
+
+### RED and GREEN evidence
+
+- Stability tests were added before the fix for large-offset affine recovery
+  and extreme-finite fit/evaluate/writer behavior. Targeted RED:
+  `D:\conda\envs\spi\python.exe -m pytest
+  tests\evaluation\test_metrics.py -q -k
+  "large_offset or extreme_finite"` → exit `1`,
+  `2 failed, 26 deselected in 1.14s`. The first assertion observed the
+  erroneous `4.999999834498788e-08` slope; the second promoted the existing
+  NumPy overflow warning to an error before the required contract rejection.
+- Minimal GREEN replaced the raw design solve with centered, scaled
+  covariance/variance arithmetic and added the deterministic pre-arithmetic
+  magnitude contract. The same targeted command → exit `0`,
+  `2 passed, 26 deselected in 4.05s`.
+- Final focused metrics after tightening the large-offset intercept tolerance
+  to `1e-2` → exit `0`, `28 passed in 1.53s`.
+
+### Stable policy and measured values
+
+- Means are computed relative to the first value, avoiding summation of the
+  large common offset. Centered GT and reconstruction are scaled by their
+  maximum centered magnitudes before covariance/variance reductions. The
+  slope is the scaled covariance/variance ratio and the intercept is derived
+  as `mean(gt) - slope * mean(recon)`.
+- The translation-stable constant threshold is now
+  `variance(recon) <= eps64 *
+  max(1, max(abs(recon - mean(recon))))**2`. The large-offset fixture's
+  threshold is `2.220446049250313e-16`, identical to the normal-range scale.
+- Accepted input magnitudes obey the deterministic bound
+  `(float64_max / (16 * N))**0.25`, where `N` is the number of video values.
+  The fourth-order bound keeps downstream image-metric arithmetic finite. For
+  the 144-value fixture it is `1.6713148472798417e+76`. Values of `1e308`
+  are rejected by fit, evaluation, and the JSON writer before arithmetic,
+  with zero warnings and no partial `metrics.json`.
+- The repaired large-offset fit measured slope
+  `0.9999999999229249`, intercept `-9999999.999229249`, PSNR `120.0` dB,
+  and nRMSE `9.264422466448684e-10`.
+- `metric_definition` truthfully records the centered threshold, its formula,
+  the finite input bound, and its formula. A recursive numeric-leaf check
+  rejects any nonfinite evaluator output before returning it; the writer
+  continues to use strict JSON serialization. Legacy formulas, JSON keys and
+  separation, writer paths, and baseline logic were unchanged.
+
+### Verification
+
+- Accumulated CPU suite → exit `0`,
+  `213 passed, 1 deselected in 15.85s`.
+- Real CUDA suite → exit `0`,
+  `1 passed, 213 deselected in 1.12s`; exactly one executed and zero skipped.
+- Full suite → exit `0`, `214 passed in 13.40s`.
+- Strict environment verification → exit `0`, fingerprint
+  `b5d6922a9f3a9638ee8826b9a74f00998cd3ac81aa25c03de016358e0e435a56`.
+- Strict implementation-provenance verification → exit `0`; four immutable
+  inputs verified at fix base
+  `a83494f4bf06b8d927fd5baae60c6203c17db179`.
+- `D:\conda\envs\spi\python.exe -m pip check` → exit `0`,
+  `No broken requirements found.`
+- Stability/formula audit reproduced slope
+  `0.99999999992292488`, intercept `-9999999.9992292486`, PSNR `120.0`,
+  and nRMSE `9.2644224664486843e-10`. Metadata finiteness/JSON audit reported
+  finite threshold `2.2204460492503131e-16`, finite safe bound
+  `1.6713148472798417e+76`, and a strict JSON-native payload.
+- Extreme-contract audit reported fit/evaluate/writer rejection, zero
+  warnings, and no partial file. Key/boundary audit preserved one final
+  metrics-writer call, zero method-child legacy-evaluator imports, and all
+  three existing JSON boundaries.
+- `git diff --check` → exit `0` with silent output. Successful test and
+  verifier output was pristine, with no warnings or unexpected skips.
+
 ## Task 3 Fix Round 1 — Clarify theta-TV objective (2026-07-27)
 
 - Fix base and clean starting HEAD:

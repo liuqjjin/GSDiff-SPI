@@ -1,4 +1,5 @@
 import json
+import warnings
 
 import numpy as np
 import pytest
@@ -22,6 +23,21 @@ def test_global_affine_metric_recovers_one_known_video_transform():
     assert result["alignment"]["intercept"] == pytest.approx(0.2)
     assert result["psnr_global_affine"] == pytest.approx(120.0)
     assert result["nrmse_global_affine_l2"] < 1e-12
+
+
+def test_global_affine_metric_recovers_large_offset_transform():
+    gt = np.linspace(0, 1, 2 * 8 * 9).reshape(2, 8, 9)
+    recon = 1e7 + gt
+
+    slope, intercept = fit_global_affine(gt, recon)
+    result = evaluate_video_global_affine(gt, recon)
+
+    assert slope == pytest.approx(1.0, abs=1e-8)
+    assert intercept == pytest.approx(-1e7, abs=1e-2)
+    assert result["alignment"]["slope"] == pytest.approx(1.0, abs=1e-8)
+    assert result["alignment"]["intercept"] == pytest.approx(-1e7, abs=1e-2)
+    assert result["psnr_global_affine"] == pytest.approx(120.0)
+    assert result["nrmse_global_affine_l2"] < 1e-8
 
 
 def test_per_frame_minmax_can_hide_different_frame_gains():
@@ -206,6 +222,28 @@ def test_metrics_v1_payload_is_strict_json_native():
 
     encoded = json.dumps(payload, allow_nan=False)
     assert json.loads(encoded) == payload
+
+
+def test_extreme_finite_inputs_are_rejected_before_arithmetic_or_json_write(
+    tmp_path,
+):
+    gt = np.linspace(0.0, 1.0, 2 * 8 * 9).reshape(2, 8, 9)
+    extreme = np.full_like(gt, 1e308)
+    metrics_path = tmp_path / "metrics.json"
+    match = "safe evaluability bound"
+
+    from train import _write_metrics_json
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        with pytest.raises(ValueError, match=match):
+            fit_global_affine(gt, extreme)
+        with pytest.raises(ValueError, match=match):
+            evaluate_video_global_affine(gt, extreme)
+        with pytest.raises(ValueError, match=match):
+            _write_metrics_json(metrics_path, gt, extreme)
+
+    assert not metrics_path.exists()
 
 
 def test_common_evaluate_video_remains_legacy_compatible():
