@@ -94,7 +94,7 @@ def test_freeze_and_active_parameter_helpers_clear_stale_gradients():
     assert active_parameters([frozen, active]) == [active]
 
 
-def test_clip_grad_groups_ignores_frozen_and_empty_groups_in_order():
+def test_clip_grad_groups_ignores_no_grad_frozen_and_empty_groups_in_order():
     from gsdiff.solver.gradients import (
         clip_grad_groups,
         freeze_parameters,
@@ -102,6 +102,7 @@ def test_clip_grad_groups_ignores_frozen_and_empty_groups_in_order():
 
     scene = nn.Parameter(torch.zeros(2))
     motion = nn.Parameter(torch.zeros(2))
+    no_grad = nn.Parameter(torch.tensor(0.0))
     frozen = nn.Parameter(torch.tensor(0.0))
     scene.grad = torch.tensor([3.0, 4.0])
     motion.grad = torch.tensor([0.0, 120.0])
@@ -109,13 +110,14 @@ def test_clip_grad_groups_ignores_frozen_and_empty_groups_in_order():
     frozen.grad = torch.tensor(1e9)
 
     norms = clip_grad_groups(
-        [[], [frozen], [motion], [scene]],
+        [[motion], [no_grad], [], [frozen], [scene]],
         max_norm=10.0,
     )
 
     assert [norm.item() for norm in norms] == pytest.approx([120.0, 5.0])
     assert motion.grad.norm().item() == pytest.approx(10.0)
     assert scene.grad.tolist() == pytest.approx([3.0, 4.0])
+    assert no_grad.grad is None
     assert frozen.grad.item() == 1e9
 
 

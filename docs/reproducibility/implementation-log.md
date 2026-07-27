@@ -610,3 +610,44 @@ This permanent append-only ledger is intentionally empty of implementation recor
   `CosineAnnealingLR` or `eta_min` absolute-floor path. `git diff --check` →
   exit `0` with silent output. All test and verifier output was pristine,
   with no warnings or unexpected skips.
+
+## Task 5 Fix Round 1 — Ignore parameters without gradients (2026-07-27)
+
+- Fix base and clean starting HEAD:
+  `dbce67af00aea1023ef4dc3cd24ecd7fddcd9415`; the original Task 5 commit was
+  not amended.
+- Root cause: `clip_grad_groups` filtered only on `requires_grad`. An active
+  logical group whose parameters all had `grad=None` therefore called
+  `clip_grad_norm_` unnecessarily and inserted a spurious zero tensor into
+  the returned norm sequence.
+- Direct-helper RED:
+  `D:\conda\envs\spi\python.exe -m pytest
+  tests\solver\test_gradient_groups.py::test_clip_grad_groups_ignores_no_grad_frozen_and_empty_groups_in_order
+  -q` → exit `1`, `1 failed in 0.06s`. For logical groups ordered as
+  active-gradient motion, active no-gradient, empty, frozen, and
+  active-gradient scene, the helper returned `[120.0, 0.0, 5.0]` instead of
+  `[120.0, 5.0]`.
+- The minimal fix builds each clipping list from parameters satisfying both
+  `requires_grad` and `grad is not None`. The identical isolated command →
+  exit `0`, `1 passed in 0.03s`. The active no-gradient parameter remained
+  unchanged with `grad=None`; only the two real-gradient norms were returned
+  in original logical-group order.
+- Focused Task 5 suite → exit `0`, `20 passed in 1.11s`.
+- Accumulated CPU suite → exit `0`,
+  `134 passed, 1 deselected in 13.69s`.
+- Real CUDA suite → exit `0`,
+  `1 passed, 134 deselected in 0.90s`; exactly one CUDA test executed and
+  zero skipped.
+- Full suite → exit `0`, `135 passed in 14.74s`.
+- Strict environment verification → exit `0`, fingerprint
+  `b5d6922a9f3a9638ee8826b9a74f00998cd3ac81aa25c03de016358e0e435a56`.
+- Strict implementation-provenance verification → exit `0`; four immutable
+  inputs verified at Fix Round 1 base
+  `dbce67af00aea1023ef4dc3cd24ecd7fddcd9415`.
+- `D:\conda\envs\spi\python.exe -m pip check` → exit `0`,
+  `No broken requirements found.`
+- Targeted clipping search found the sole `clip_grad_norm_` call inside
+  `clip_grad_groups` and the two solver call sites. `git diff` for
+  `sgd.py` and `admm.py` was empty, confirming no solver-flow or scheduler
+  edit. `git diff --check` → exit `0` with silent output. All output was
+  pristine, with no warnings or unexpected skips.

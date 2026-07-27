@@ -26,10 +26,14 @@ def clip_grad_groups(
     groups: Iterable[Iterable[torch.nn.Parameter]],
     max_norm: float,
 ) -> list[torch.Tensor]:
-    """Clip each nonempty active logical group independently."""
+    """Clip each logical group containing active gradients independently."""
     norms = []
     for group in groups:
-        parameters = active_parameters(group)
+        parameters = [
+            parameter
+            for parameter in group
+            if parameter.requires_grad and parameter.grad is not None
+        ]
         if parameters:
             norms.append(torch.nn.utils.clip_grad_norm_(parameters, max_norm))
     return norms
