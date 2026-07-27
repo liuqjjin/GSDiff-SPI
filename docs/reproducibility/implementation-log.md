@@ -741,3 +741,56 @@ This permanent append-only ledger is intentionally empty of implementation recor
   physical zero boundary is applied once in the shared forward renderer.
   `git diff --check` → exit `0` with silent output. All verifier and test
   output was pristine, with no warnings or unexpected skips.
+
+## Task 6 Fix Round 1 — Validate rectangular prefit shapes (2026-07-27)
+
+- Fix base and clean starting HEAD:
+  `345571bc8a269749f23fd74cbdde0df1152285e5`; the original Task 6 commit was
+  not amended.
+- Call-site inspection found one production prefit path:
+  `train.py` passes `normalize_01(dgi_img)`, where `dgi_reconstruct` documents
+  and returns exact `[H,W]`. The explicit compatibility contract accepts only
+  `(Hc,Wc)`, flat `(Hc*Wc,)`, `(1,Hc,Wc)`, and `(1,1,Hc,Wc)`. It rejects
+  transposed or arbitrary same-numel shapes and all non-singleton leading
+  batch/channel dimensions.
+- Shape RED, before production validation changes:
+  `D:\conda\envs\spi\python.exe -m pytest
+  tests\scene\test_rectangular_geometry.py -q` → exit `1`,
+  `2 failed, 32 passed in 0.46s`. Same-numel targets shaped `(64,32)` and
+  `(2048,1)` were silently accepted and reinterpreted as `(32,64)`. The four
+  supported compatibility shapes already passed; `(2,32,64)` and
+  `(1,2,32,64)` were already rejected by size alone.
+- The minimal fix replaces numel-only validation with exact tuple-shape
+  membership before the existing reshape. Errors enumerate the supported
+  shapes and report the received shape. Focused GREEN → exit `0`,
+  `34 passed in 0.39s`. The accepted and rejected matrices above all exercise
+  the real `GridCanonical.prefit`.
+- ReCINR scalar aspect regressions cover portrait `64x32 -> (32,16)`,
+  non-integral landscape `30x47 -> (16,25)`, and non-integral portrait
+  `47x30 -> (25,16)` for `grid_size=16`. Each keeps the short side exactly
+  16. The class documentation now states the implementation's deterministic
+  Python round-to-nearest, ties-to-even rule for the scaled other dimension.
+  Existing explicit tuple behavior remains covered and unchanged.
+
+### Verification
+
+- Focused rectangular suite → exit `0`, `34 passed in 0.39s`.
+- Accumulated CPU suite → exit `0`,
+  `168 passed, 1 deselected in 14.64s`.
+- Real CUDA suite → exit `0`,
+  `1 passed, 168 deselected in 1.13s`; exactly one CUDA test executed and
+  zero skipped.
+- Full suite → exit `0`, `169 passed in 15.13s`.
+- Strict environment verification → exit `0`, fingerprint
+  `b5d6922a9f3a9638ee8826b9a74f00998cd3ac81aa25c03de016358e0e435a56`.
+- Strict implementation-provenance verification → exit `0`; four immutable
+  inputs verified at Fix Round 1 base
+  `345571bc8a269749f23fd74cbdde0df1152285e5`.
+- `D:\conda\envs\spi\python.exe -m pip check` → exit `0`,
+  `No broken requirements found.`
+- Targeted shape/aspect audit reported
+  `numel_only_or_sqrt_prefit_validation=0`, found the exact shape check before
+  the single `(Hc,Wc)` reshape, and found the documented short-side scale plus
+  deterministic `round` path. `git diff --check` → exit `0` with silent
+  output. All test and verifier output was pristine, with no warnings or
+  unexpected skips.

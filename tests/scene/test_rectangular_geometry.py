@@ -160,11 +160,59 @@ def test_grid_prefit_validates_size_and_reshapes_rectangular_target():
         scene.prefit(np.zeros(H * W - 1, dtype=np.float32), torch.empty(0, 2))
 
 
+@pytest.mark.parametrize(
+    "shape",
+    [(H, W), (H * W,), (1, H, W), (1, 1, H, W)],
+)
+def test_grid_prefit_accepts_only_supported_image_shapes(shape):
+    scene = build_scene("grid", H=H, W=W)
+    expected = np.linspace(0.1, 0.9, H * W, dtype=np.float32).reshape(H, W)
+
+    scene.prefit(expected.reshape(shape), torch.empty(H * W, 2))
+
+    torch.testing.assert_close(
+        torch.sigmoid(scene.grid.detach())[0, 0], torch.from_numpy(expected))
+
+
+@pytest.mark.parametrize("shape", [(W, H), (H * W, 1)])
+def test_grid_prefit_rejects_same_numel_unsupported_shapes(shape):
+    scene = build_scene("grid", H=H, W=W)
+    target = np.zeros(shape, dtype=np.float32)
+
+    with pytest.raises(ValueError, match="shape"):
+        scene.prefit(target, torch.empty(H * W, 2))
+
+
+@pytest.mark.parametrize("shape", [(2, H, W), (1, 2, H, W)])
+def test_grid_prefit_rejects_non_singleton_batch_or_channel(shape):
+    scene = build_scene("grid", H=H, W=W)
+
+    with pytest.raises(ValueError):
+        scene.prefit(np.zeros(shape, dtype=np.float32), torch.empty(H * W, 2))
+
+
 def test_recinr_scalar_grid_size_preserves_rectangular_aspect_ratio():
     scene = build_scene("recinr_se2", H=H, W=W, C=4, grid_size=16)
 
     assert (scene.gh, scene.gw) == (16, 32)
     assert scene.features.shape == (1, 4, 16, 32)
+
+
+@pytest.mark.parametrize(
+    ("height", "width", "expected"),
+    [
+        (64, 32, (32, 16)),
+        (30, 47, (16, 25)),
+        (47, 30, (25, 16)),
+    ],
+)
+def test_recinr_scalar_grid_size_preserves_portrait_and_rounded_aspect(
+    height, width, expected
+):
+    scene = ReCINRCanonicalScene(height, width, C=4, grid_size=16)
+
+    assert (scene.gh, scene.gw) == expected
+    assert min(scene.gh, scene.gw) == 16
 
 
 def test_recinr_accepts_explicit_rectangular_grid_size():

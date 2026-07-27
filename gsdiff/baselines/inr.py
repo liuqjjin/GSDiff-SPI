@@ -81,13 +81,20 @@ class GridCanonical(nn.Module):
         return torch.sigmoid(s.reshape(-1))
 
     def prefit(self, target01, x_norm_grid, steps=300, lr=1e-2):
+        """Seed from [Hc,Wc], flat, or singleton-leading image data."""
         with torch.no_grad():                       # invert sigmoid to seed the grid
             t = torch.as_tensor(target01, dtype=torch.float32, device=self.grid.device)
             expected = self.Hc * self.Wc
-            if t.numel() != expected:
+            supported_shapes = (
+                (self.Hc, self.Wc),
+                (expected,),
+                (1, self.Hc, self.Wc),
+                (1, 1, self.Hc, self.Wc),
+            )
+            if tuple(t.shape) not in supported_shapes:
                 raise ValueError(
-                    f"grid prefit target must contain exactly {expected} values, "
-                    f"got {t.numel()}")
+                    "grid prefit target shape must be one of "
+                    f"{supported_shapes}, got {tuple(t.shape)}")
             t = t.clamp(1e-3, 1 - 1e-3).reshape(1, 1, self.Hc, self.Wc)
             self.grid.data.copy_(torch.logit(t))
 

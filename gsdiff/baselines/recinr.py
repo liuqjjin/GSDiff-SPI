@@ -29,6 +29,10 @@ class ReCINRCanonicalScene(nn.Module):
     query(x_norm) so it plugs into INRForwardModel's rigid inverse-SE(2) warp
     (gsdiff/baselines/inr.py) instead of ReCINR's flexible low-rank deformation.
 
+    A scalar grid_size fixes the short side and rounds the scaled long side
+    with Python's deterministic round-to-nearest, ties-to-even rule. A tuple
+    specifies (gh, gw) exactly.
+
     This isolates ReCINR's scene REPRESENTATION from its warp: with only the
     shared 3-DOF SE(2) motion (which cannot deform the scene to absorb motion),
     does ReCINR's canonical recover the moving scene? Same feature tensor and
