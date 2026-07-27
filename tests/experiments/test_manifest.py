@@ -269,6 +269,25 @@ def test_single_handle_reader_detects_same_size_in_place_rewrite(tmp_path: Path,
         manifest_module._read_regular_file(path, "output")
 
 
+def test_output_verification_rejects_entries_added_during_hashing(tmp_path: Path, monkeypatch):
+    path, _ = _write_physical_complete(tmp_path)
+    original_hash = manifest_module._hash_regular_file
+    created = False
+
+    def add_entry_during_hashing(output_path: Path):
+        nonlocal created
+        result = original_hash(output_path)
+        if not created:
+            created = True
+            (path.parent / "raced.txt").write_text("race", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(manifest_module, "_hash_regular_file", add_entry_during_hashing)
+
+    with pytest.raises(ValueError, match="changed while outputs were being verified"):
+        load_complete_manifest(path)
+
+
 def test_load_complete_manifest_rejects_duplicate_json_keys(tmp_path: Path):
     path = tmp_path / "manifest.json"
     path.write_text('{"status":"running","status":"failed"}', encoding="utf-8")
@@ -277,7 +296,7 @@ def test_load_complete_manifest_rejects_duplicate_json_keys(tmp_path: Path):
         load_complete_manifest(path)
 
 
-def test_aggregate_index_rejects_a_dirty_complete_manifest():
+def test_aggregate_index_rejects_a_dirty_complete_manifest(tmp_path: Path):
     dirty = _complete_manifest(_identity(dirty=True))
     run_identity = dirty["identity_sha256"]
     index = {
@@ -293,12 +312,16 @@ def test_aggregate_index_rejects_a_dirty_complete_manifest():
         "run_manifests": [{"identity_sha256": run_identity, "manifest_sha256": hashlib.sha256(canonical_json_bytes(dirty)).hexdigest()}],
     }
 
-    with pytest.raises(ValueError, match="clean complete"):
-        validate_aggregate_index(index, manifests={run_identity: dirty})
+    run_directory = tmp_path / run_identity
+    run_directory.mkdir()
+    path = run_directory / "manifest.json"
+    path.write_bytes(canonical_json_bytes(dirty))
+    with pytest.raises(ValueError, match="dirty"):
+        validate_aggregate_index(index, manifest_paths={run_identity: path})
 
 
-def test_aggregate_index_binds_record_identity_and_canonical_manifest_hash():
-    manifest = _complete_manifest()
+def test_aggregate_index_binds_record_identity_and_canonical_manifest_hash(tmp_path: Path):
+    path, manifest = _write_physical_complete(tmp_path)
     identity = manifest["identity_sha256"]
     index = {
         "schema_version": "experiment-aggregate-v1", "document_kind": "campaign-index",
@@ -308,8 +331,8 @@ def test_aggregate_index_binds_record_identity_and_canonical_manifest_hash():
         "run_manifests": [{"identity_sha256": identity, "manifest_sha256": "3" * 64}],
     }
 
-    with pytest.raises(ValueError, match="manifest hash"):
-        validate_aggregate_index(index, manifests={identity: manifest})
+    with pytest.raises(ValueError, match="physical manifest"):
+        validate_aggregate_index(index, manifest_paths={identity: path})
 
 
 def test_primary_and_supplement_indices_share_one_byte_identical_run_manifest(tmp_path: Path):

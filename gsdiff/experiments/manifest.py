@@ -159,13 +159,12 @@ def validate_manifest(value: Mapping[str, object], *, identity: RunIdentity | No
 def validate_aggregate_index(
     value: Mapping[str, object],
     *,
-    manifests: Mapping[str, Mapping[str, object]] | None = None,
     manifest_paths: Mapping[str, Path] | None = None,
     requirements_lock: Path | None = None,
     environment_lock: Path | None = None,
     live_fingerprint: Mapping[str, object] | None = None,
 ) -> None:
-    """Validate a campaign index without putting campaign data in run manifests."""
+    """Validate index structure; publication eligibility requires manifest_paths."""
     _validate_exact_json(value)
     _raise_schema_errors(_AGGREGATE_VALIDATOR, value, "aggregate index")
     expected = value["expected_identity_sha256s"]
@@ -178,29 +177,6 @@ def validate_aggregate_index(
         raise ValueError("run manifest identities must be sorted and unique")
     if record_ids != expected:
         raise ValueError("campaign index coverage must exactly equal expected identities")
-    if manifests is not None and manifest_paths is not None:
-        raise ValueError("use either structure-only manifests or strict manifest_paths")
-    if manifests is not None:
-        for run_identity in record_ids:
-            manifest = manifests.get(run_identity)
-            if manifest is None:
-                raise ValueError("campaign index is missing its referenced manifest")
-            validate_manifest(manifest)
-            record = next(item for item in records if item["identity_sha256"] == run_identity)
-            if manifest["identity_sha256"] != run_identity:
-                raise ValueError("campaign index identity does not match manifest identity")
-            if record["manifest_sha256"] != sha256_bytes(canonical_json_bytes(manifest)):
-                raise ValueError("campaign index manifest hash does not match canonical manifest")
-            if manifest["status"] != "complete" or manifest["code"]["dirty_worktree"]:
-                raise ValueError("campaign index may reference only clean complete manifests")
-            protocol = manifest["protocol"]
-            assert type(protocol) is dict
-            if (
-                protocol["scientific_contract_id"] != value["scientific_contract_id"]
-                or protocol["scientific_contract_sha256"] != value["scientific_contract_sha256"]
-                or manifest["metric_version"] != value["metric_version"]
-            ):
-                raise ValueError("campaign index protocol or metric version disagrees with manifest")
     if manifest_paths is not None:
         for run_identity in record_ids:
             path = manifest_paths.get(run_identity)
@@ -562,6 +538,11 @@ def _read_regular_file(path: Path, noun: str) -> bytes:
         raise ValueError(f"cannot safely open {noun}: {path}") from error
     try:
         opened = os.fstat(descriptor)
+        # Windows may expose different timestamp precision for lstat versus a
+        # file-handle fstat even without mutation. Bind both pathname checks to
+        # the opened file identity; then require full stable handle metadata.
+        # Task 5's private temporary directory and atomic promotion provide the
+        # stronger writer-side isolation needed against hostile concurrent writes.
         if (
             not stat.S_ISREG(opened.st_mode)
             or _snapshot(before_link)[:2] != _snapshot(opened)[:2]
@@ -594,6 +575,7 @@ def _verify_complete_outputs(manifest_path: Path, manifest: Mapping[str, object]
     }
     for artifact in artifacts:
         expected[artifact["path"]] = (artifact["sha256"], artifact["size_bytes"])
+    initial_inventory = _directory_inventory(root)
     found: set[str] = set()
     for current, directories, files in os.walk(root, followlinks=False):
         current_path = Path(current)
@@ -618,6 +600,20 @@ def _verify_complete_outputs(manifest_path: Path, manifest: Mapping[str, object]
                 raise ValueError(f"output hash or size mismatch: {relative}")
     if found != set(expected):
         raise ValueError("complete manifest is missing a declared output")
+    if _directory_inventory(root) != initial_inventory:
+        raise ValueError("run directory changed while outputs were being verified")
+
+
+def _directory_inventory(root: Path) -> frozenset[tuple[str, tuple[int, int, int, int, int]]]:
+    entries: set[tuple[str, tuple[int, int, int, int, int]]] = set()
+    for current, directories, files in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        _reject_linked_path(current_path)
+        for name in [*directories, *files]:
+            path = current_path / name
+            _reject_linked_path(path)
+            entries.add((path.relative_to(root).as_posix(), _snapshot(os.lstat(path))))
+    return frozenset(entries)
 
 
 def _reject_linked_path(path: Path) -> None:
