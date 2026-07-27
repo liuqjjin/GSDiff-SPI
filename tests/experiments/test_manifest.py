@@ -150,7 +150,7 @@ def test_manifest_rejects_malformed_schema_and_native_values(mutate, message: st
 
 @pytest.mark.parametrize(
     "unsafe_path",
-    ["../escape", "/absolute", "C:/drive", "folder\\file", "folder/CON", "folder/CON.txt", "folder//repeat", "folder/name.", "folder/name:stream"],
+    ["../escape", "/absolute", "C:/drive", "folder\\file", "folder/CON", "folder/CON.txt", "folder/CONIN$", "folder/COM¹", "folder/LPT³", "folder/name*", "folder/name\x01", "folder//repeat", "folder/name.", "folder/name:stream"],
 )
 def test_manifest_rejects_unsafe_output_paths(unsafe_path: str):
     manifest = _complete_manifest()
@@ -210,6 +210,14 @@ def test_load_complete_manifest_rejects_incomplete_or_changed_outputs(tmp_path: 
         load_complete_manifest(path)
 
 
+def test_load_complete_manifest_rejects_an_undeclared_empty_directory(tmp_path: Path):
+    path, _ = _write_physical_complete(tmp_path)
+    (path.parent / "empty").mkdir()
+
+    with pytest.raises(ValueError, match="unlisted output directory"):
+        load_complete_manifest(path)
+
+
 def test_load_complete_manifest_rejects_duplicate_json_keys(tmp_path: Path):
     path = tmp_path / "manifest.json"
     path.write_text('{"status":"running","status":"failed"}', encoding="utf-8")
@@ -253,8 +261,8 @@ def test_aggregate_index_binds_record_identity_and_canonical_manifest_hash():
         validate_aggregate_index(index, manifests={identity: manifest})
 
 
-def test_primary_and_supplement_indices_share_one_byte_identical_run_manifest():
-    manifest = _complete_manifest()
+def test_primary_and_supplement_indices_share_one_byte_identical_run_manifest(tmp_path: Path):
+    manifest_path, manifest = _write_physical_complete(tmp_path)
     identity = manifest["identity_sha256"]
     common = {
         "campaign_sha256": "1" * 64,
@@ -265,11 +273,11 @@ def test_primary_and_supplement_indices_share_one_byte_identical_run_manifest():
     }
 
     primary = build_aggregate_index(
-        campaign_id="primary-v1", expected_identity_sha256s=[identity], manifests={identity: manifest}, **common
+        campaign_id="primary-v1", expected_identity_sha256s=[identity], manifest_paths={identity: manifest_path}, **common
     )
     supplement = build_aggregate_index(
-        campaign_id="supplement-grid-v1", expected_identity_sha256s=[identity], manifests={identity: manifest}, **common
+        campaign_id="supplement-grid-v1", expected_identity_sha256s=[identity], manifest_paths={identity: manifest_path}, **common
     )
 
-    assert canonical_json_bytes(manifest) == canonical_json_bytes(manifest)
+    assert manifest_path.read_bytes() == canonical_json_bytes(manifest)
     assert primary["run_manifests"] == supplement["run_manifests"]

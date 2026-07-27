@@ -38,6 +38,9 @@ _RESERVED_WINDOWS_NAMES = frozenset(
     {"con", "prn", "aux", "nul"}
     | {f"com{number}" for number in range(1, 10)}
     | {f"lpt{number}" for number in range(1, 10)}
+    | {"conin$", "conout$"}
+    | {f"com{suffix}" for suffix in "¹²³"}
+    | {f"lpt{suffix}" for suffix in "¹²³"}
 )
 
 
@@ -55,7 +58,7 @@ def build_manifest(
     failure: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Build a manifest exclusively from a constructed blind-run identity."""
-    if not isinstance(identity, RunIdentity):
+    if type(identity) is not RunIdentity:
         raise TypeError("identity must be a RunIdentity")
     _require_exact_mapping(
         "inputs", inputs,
@@ -154,7 +157,13 @@ def validate_manifest(value: Mapping[str, object], *, identity: RunIdentity | No
 
 
 def validate_aggregate_index(
-    value: Mapping[str, object], *, manifests: Mapping[str, Mapping[str, object]] | None = None
+    value: Mapping[str, object],
+    *,
+    manifests: Mapping[str, Mapping[str, object]] | None = None,
+    manifest_paths: Mapping[str, Path] | None = None,
+    requirements_lock: Path | None = None,
+    environment_lock: Path | None = None,
+    live_fingerprint: Mapping[str, object] | None = None,
 ) -> None:
     """Validate a campaign index without putting campaign data in run manifests."""
     _validate_exact_json(value)
@@ -169,6 +178,8 @@ def validate_aggregate_index(
         raise ValueError("run manifest identities must be sorted and unique")
     if record_ids != expected:
         raise ValueError("campaign index coverage must exactly equal expected identities")
+    if manifests is not None and manifest_paths is not None:
+        raise ValueError("use either structure-only manifests or strict manifest_paths")
     if manifests is not None:
         for run_identity in record_ids:
             manifest = manifests.get(run_identity)
@@ -190,6 +201,32 @@ def validate_aggregate_index(
                 or manifest["metric_version"] != value["metric_version"]
             ):
                 raise ValueError("campaign index protocol or metric version disagrees with manifest")
+    if manifest_paths is not None:
+        for run_identity in record_ids:
+            path = manifest_paths.get(run_identity)
+            if not isinstance(path, Path):
+                raise ValueError("campaign index is missing a manifest path")
+            verified = _load_complete_manifest_raw(
+                path,
+                expected_identity_sha256=run_identity,
+                requirements_lock=requirements_lock,
+                environment_lock=environment_lock,
+                live_fingerprint=live_fingerprint,
+            )
+            if verified is None:
+                raise ValueError("campaign index requires a complete manifest")
+            raw, manifest = verified
+            record = next(item for item in records if item["identity_sha256"] == run_identity)
+            if record["manifest_sha256"] != sha256_bytes(raw):
+                raise ValueError("campaign index manifest hash does not match physical manifest bytes")
+            protocol = manifest["protocol"]
+            assert type(protocol) is dict
+            if (
+                protocol["scientific_contract_id"] != value["scientific_contract_id"]
+                or protocol["scientific_contract_sha256"] != value["scientific_contract_sha256"]
+                or manifest["metric_version"] != value["metric_version"]
+            ):
+                raise ValueError("campaign index protocol or metric version disagrees with manifest")
 
 
 def build_aggregate_index(
@@ -201,7 +238,10 @@ def build_aggregate_index(
     scientific_contract_sha256: str,
     metric_version: str,
     expected_identity_sha256s: Sequence[str],
-    manifests: Mapping[str, Mapping[str, object]],
+    manifest_paths: Mapping[str, Path],
+    requirements_lock: Path | None = None,
+    environment_lock: Path | None = None,
+    live_fingerprint: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Build a campaign-local reference index for immutable clean manifests."""
     if type(expected_identity_sha256s) is not list:
@@ -209,18 +249,21 @@ def build_aggregate_index(
     expected = list(expected_identity_sha256s)
     records: list[dict[str, str]] = []
     for run_identity in expected:
-        manifest = manifests.get(run_identity)
-        if manifest is None:
-            raise ValueError("expected identity has no manifest")
-        validate_manifest(manifest)
-        if manifest["identity_sha256"] != run_identity:
-            raise ValueError("manifest mapping key does not match manifest identity")
-        if manifest["status"] != "complete" or manifest["code"]["dirty_worktree"]:
-            raise ValueError("campaign index may reference only clean complete manifests")
+        path = manifest_paths.get(run_identity)
+        if not isinstance(path, Path):
+            raise ValueError("expected identity has no manifest path")
+        verified = _load_complete_manifest_raw(
+            path, expected_identity_sha256=run_identity,
+            requirements_lock=requirements_lock, environment_lock=environment_lock,
+            live_fingerprint=live_fingerprint,
+        )
+        if verified is None:
+            raise ValueError("campaign index requires a complete manifest")
+        raw, manifest = verified
         records.append(
             {
                 "identity_sha256": run_identity,
-                "manifest_sha256": sha256_bytes(canonical_json_bytes(manifest)),
+                "manifest_sha256": sha256_bytes(raw),
             }
         )
     index: dict[str, object] = {
@@ -235,7 +278,11 @@ def build_aggregate_index(
         "expected_identity_sha256s": sorted(expected),
         "run_manifests": sorted(records, key=lambda item: item["identity_sha256"]),
     }
-    validate_aggregate_index(index, manifests=manifests)
+    validate_aggregate_index(
+        index, manifest_paths=manifest_paths,
+        requirements_lock=requirements_lock, environment_lock=environment_lock,
+        live_fingerprint=live_fingerprint,
+    )
     return index
 
 
@@ -247,9 +294,26 @@ def load_complete_manifest(
     environment_lock: Path | None = None,
     live_fingerprint: Mapping[str, object] | None = None,
 ) -> dict[str, object] | None:
+    """Load a complete manifest; only this public API returns reusable data."""
+    verified = _load_complete_manifest_raw(
+        path, expected_identity_sha256=expected_identity_sha256,
+        requirements_lock=requirements_lock, environment_lock=environment_lock,
+        live_fingerprint=live_fingerprint,
+    )
+    return None if verified is None else verified[1]
+
+
+def _load_complete_manifest_raw(
+    path: Path,
+    *,
+    expected_identity_sha256: str | None = None,
+    requirements_lock: Path | None = None,
+    environment_lock: Path | None = None,
+    live_fingerprint: Mapping[str, object] | None = None,
+) -> tuple[bytes, dict[str, object]] | None:
     """Load a physical clean complete run directory, otherwise fail closed."""
     manifest_path = Path(path)
-    value = _load_unique_json(manifest_path)
+    raw, value = _load_unique_json(manifest_path)
     if type(value) is not dict:
         raise ValueError("manifest JSON must be an object")
     validate_manifest(value)
@@ -265,7 +329,7 @@ def load_complete_manifest(
         raise ValueError("manifest identity does not match expected identity")
     if manifest_path.parent.name != value["identity_sha256"]:
         raise ValueError("complete manifest directory must be the full identity SHA-256")
-    if manifest_path.read_bytes() != canonical_json_bytes(value):
+    if raw != canonical_json_bytes(value):
         raise ValueError("manifest file is not canonical JSON bytes")
     if requirements_lock is None:
         requirements_lock = _DEFAULT_REQUIREMENTS_LOCK
@@ -285,7 +349,7 @@ def load_complete_manifest(
         ):
             raise ValueError("manifest runtime lock hashes do not match the strict environment")
     _verify_complete_outputs(manifest_path, value)
-    return value
+    return raw, value
 
 
 def _validate_manifest_semantics(manifest: Mapping[str, object], *, identity: RunIdentity | None) -> None:
@@ -446,18 +510,24 @@ def _validate_relative_path(value: object) -> None:
     if path.is_absolute() or any(part in ("", ".", "..") for part in raw_parts):
         raise ValueError("output path contains an unsafe component")
     for part in path.parts:
-        stem = part.split(".", 1)[0].casefold()
-        if ":" in part or part.rstrip(". ") != part or stem in _RESERVED_WINDOWS_NAMES:
+        stem = part.split(".", 1)[0].rstrip(" ").casefold()
+        if (
+            ":" in part
+            or part.rstrip(". ") != part
+            or stem in _RESERVED_WINDOWS_NAMES
+            or any(ord(char) < 32 or char in '*?"<>|' for char in part)
+        ):
             raise ValueError("output path contains a Windows-unsafe component")
 
 
-def _load_unique_json(path: Path) -> object:
+def _load_unique_json(path: Path) -> tuple[bytes, object]:
+    raw = _read_regular_file(path, "manifest")
     try:
-        text = path.read_text(encoding="utf-8", errors="strict")
-    except OSError as error:
-        raise ValueError(f"cannot read manifest: {path}") from error
+        text = raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise ValueError("manifest is not strict UTF-8") from error
     try:
-        return json.loads(text, object_pairs_hook=_unique_object)
+        return raw, json.loads(text, object_pairs_hook=_unique_object)
     except json.JSONDecodeError as error:
         raise ValueError("manifest is not valid JSON") from error
 
@@ -469,6 +539,42 @@ def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
             raise ValueError(f"duplicate JSON key: {key!r}")
         result[key] = value
     return result
+
+
+def _snapshot(info: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def _read_regular_file(path: Path, noun: str) -> bytes:
+    _reject_linked_path(path)
+    try:
+        before = os.lstat(path)
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ValueError(f"cannot safely open {noun}: {path}") from error
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or _snapshot(before)[:2] != _snapshot(opened)[:2]:
+            raise ValueError(f"{noun} changed or is not a regular file: {path}")
+        chunks: list[bytes] = []
+        while True:
+            block = os.read(descriptor, 1024 * 1024)
+            if not block:
+                break
+            chunks.append(block)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if _snapshot(opened) != _snapshot(after):
+        raise ValueError(f"{noun} changed while being verified: {path}")
+    return b"".join(chunks)
 
 
 def _verify_complete_outputs(manifest_path: Path, manifest: Mapping[str, object]) -> None:
@@ -488,13 +594,16 @@ def _verify_complete_outputs(manifest_path: Path, manifest: Mapping[str, object]
         current_path = Path(current)
         _reject_linked_path(current_path)
         for directory in directories:
-            _reject_linked_path(current_path / directory)
+            directory_path = current_path / directory
+            _reject_linked_path(directory_path)
+            relative_directory = directory_path.relative_to(root).as_posix()
+            if not any(path.startswith(f"{relative_directory}/") for path in expected):
+                raise ValueError(f"unlisted output directory: {relative_directory}")
         for filename in files:
             path = current_path / filename
             relative = path.relative_to(root).as_posix()
             if relative == manifest_path.name:
                 continue
-            _reject_linked_path(path)
             found.add(relative)
             if relative not in expected:
                 raise ValueError(f"unlisted output file: {relative}")
@@ -518,16 +627,5 @@ def _reject_linked_path(path: Path) -> None:
 
 
 def _hash_regular_file(path: Path) -> tuple[str, int]:
-    with path.open("rb") as stream:
-        before = os.fstat(stream.fileno())
-        if not stat.S_ISREG(before.st_mode):
-            raise ValueError(f"output is not a regular file: {path}")
-        digest = hashlib.sha256()
-        size = 0
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-            size += len(block)
-        after = os.fstat(stream.fileno())
-    if (before.st_dev, before.st_ino, before.st_size) != (after.st_dev, after.st_ino, after.st_size) or size != before.st_size:
-        raise ValueError(f"output changed while being verified: {path}")
-    return digest.hexdigest(), size
+    raw = _read_regular_file(path, "output")
+    return hashlib.sha256(raw).hexdigest(), len(raw)

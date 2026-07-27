@@ -256,23 +256,23 @@ def _validate_exact_json(value: object, path: str = "$") -> None:
 
 
 def _normalize_json(value: object) -> object:
-    if isinstance(value, Mapping):
+    if type(value) in (dict, MappingProxyType):
         normalized: dict[str, object] = {}
         for key, child in value.items():
-            if not isinstance(key, str):
+            if type(key) is not str:
                 raise TypeError("canonical JSON mapping keys must be strings")
             normalized[key] = _normalize_json(child)
         return normalized
-    if isinstance(value, (list, tuple)):
+    if type(value) in (list, tuple):
         return [_normalize_json(child) for child in value]
-    if value is None or isinstance(value, (str, bool, int, float)):
+    if value is None or type(value) in (str, bool, int, float):
         return value
     raise TypeError(f"unsupported canonical JSON value: {type(value).__name__}")
 
 
 def resolved_config_sha256(config: Mapping[str, object]) -> str:
-    if not isinstance(config, Mapping):
-        raise TypeError("config must be a mapping")
+    if type(config) not in (dict, MappingProxyType):
+        raise TypeError("config must be an exact dict or MappingProxyType")
     return sha256_bytes(canonical_json_bytes(_normalize_json(config)))
 
 
@@ -338,7 +338,7 @@ class RunIdentity:
 
 
 def _require_id(name: str, value: object) -> str:
-    if not isinstance(value, str):
+    if type(value) is not str:
         raise TypeError(f"{name} must be a string")
     if _ID_PATTERN.fullmatch(value) is None:
         raise ValueError(f"{name} must match {_ID_PATTERN.pattern}")
@@ -352,7 +352,7 @@ def _require_execution_class(value: object) -> str:
 
 
 def _require_sha256(name: str, value: object) -> str:
-    if not isinstance(value, str):
+    if type(value) is not str:
         raise TypeError(f"{name} must be a string")
     if _SHA256_PATTERN.fullmatch(value) is None:
         raise ValueError(f"{name} must be 64 lowercase hexadecimal characters")
@@ -362,8 +362,8 @@ def _require_sha256(name: str, value: object) -> str:
 def _normalize_named_hashes(
     name: str, values: Mapping[str, str]
 ) -> dict[str, str]:
-    if not isinstance(values, Mapping):
-        raise TypeError(f"{name} must be a mapping")
+    if type(values) not in (dict, MappingProxyType):
+        raise TypeError(f"{name} must be an exact dict or MappingProxyType")
     normalized: dict[str, str] = {}
     for key, value in values.items():
         normalized[_require_id(f"{name} key", key)] = _require_sha256(
