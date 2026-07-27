@@ -10,22 +10,20 @@ rendered video, backpropagated through the rendering pipeline.
 """
 import torch, torch.nn.functional as F
 
+from gsdiff.prior.tv import anisotropic_tv_mean
+
 
 def zscore(y):
     return (y - y.mean()) / (y.std() + 1e-8)
 
 
 def tv_loss(video, temporal_weight=0.0):
-    """Differentiable L1 TV for video [T,1,H,W].
+    """Compatibility wrapper for componentwise anisotropic TV mean.
+
+    Accepts video [T,1,H,W].
     temporal_weight > 0 adds the frame-to-frame temporal term (3D TV).
     """
-    dy = (video[:, :, 1:, :] - video[:, :, :-1, :]).abs().mean()
-    dx = (video[:, :, :, 1:] - video[:, :, :, :-1]).abs().mean()
-    spatial = dy + dx
-    if temporal_weight > 0:
-        dt = temporal_weight * (video[1:] - video[:-1]).abs().mean()
-        return spatial + dt
-    return spatial
+    return anisotropic_tv_mean(video, temporal_weight)
 
 
 class SGDSolver:

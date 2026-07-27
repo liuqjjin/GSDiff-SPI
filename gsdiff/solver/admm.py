@@ -16,6 +16,8 @@ g(z) = λ · TV(z)                          — video-domain regularization
 """
 import torch, torch.nn.functional as F
 
+from gsdiff.prior.tv import anisotropic_tv_mean
+
 
 def zscore(y):
     """Independent z-score: (y - mean) / std."""
@@ -23,16 +25,12 @@ def zscore(y):
 
 
 def _soft_tv(video, temporal_weight=0.0):
-    """Differentiable L1 TV mean-reduced (same as SGDSolver.tv_loss).
+    """Compatibility wrapper for componentwise anisotropic TV mean.
+
+    Accepts video [T,1,H,W].
     temporal_weight > 0 adds frame-to-frame temporal term (3D TV).
     """
-    dy = (video[:, :, 1:, :] - video[:, :, :-1, :]).abs().mean()
-    dx = (video[:, :, :, 1:] - video[:, :, :, :-1]).abs().mean()
-    spatial = dy + dx
-    if temporal_weight > 0:
-        dt = temporal_weight * (video[1:] - video[:-1]).abs().mean()
-        return spatial + dt
-    return spatial
+    return anisotropic_tv_mean(video, temporal_weight)
 
 
 class ADMMSolver:

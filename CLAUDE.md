@@ -109,18 +109,20 @@ Properties:
 - **Scale-invariant** and **DC-invariant**: removes the large DC offset automatically
 - ŷ and y are normalized **independently** (not relative to each other)
 
-TV regularization options:
+The code deliberately uses two distinct TV definitions:
 
-**Spatial TV (2D)**:
+**Differentiable θ-step regularizer (SGD and ADMM soft TV)** — componentwise
+anisotropic mean:
 ```
-TV(V) = mean|V[:,:,1:,:] - V[:,:,:-1,:]| + mean|V[:,:,:,1:] - V[:,:,:,:-1]|
+TVθ(V) = mean|ΔyV| + mean|ΔxV| + α·mean|ΔtV|
 ```
 
-**3D TV (spatial + temporal)** when `use_3dtv: true`:
+**TV z-step proximal and reported energy** — pointwise isotropic sum:
 ```
-TV3D(V) = Σ_{t,i,j} √((α·ΔtV)² + (ΔyV)² + (ΔxV)²)
+TVz(V) = Σ_{t,i,j} √((α·ΔtV)² + (ΔyV)² + (ΔxV)²)
 ```
-where `α = temporal_tv_weight`.
+Here `α = temporal_tv_weight`; `use_3dtv: true` enables the temporal component.
+The reductions and norms are intentionally not interchangeable.
 
 ---
 
@@ -135,7 +137,7 @@ CosineAnnealingLR: lr → 0.1·lr over N=sgd_steps
 
 For i = 1..N:
     ŷ, V = fwd(patterns, frame_idx, t_grid)
-    loss = f(θ) + λ_TV · TV(V)
+    loss = f(θ) + λ_TV · TVθ(V)
     loss.backward()
     clip_grad_norm_(params, 5.0)
     optimizer.step(); scheduler.step()
@@ -156,8 +158,8 @@ Auxiliary variable z (video domain), constraint R(θ) = z via augmented Lagrangi
 ```
 L_ρ(θ, z, u) = f(θ) + g(z) + (ρ/2)‖R(θ) - z + u‖²
 ```
-where `f(θ)` = data fidelity + soft TV. The prior `g(z)` is:
-- **TV mode**: `g(z) = λ·TV(z)`, solved exactly by Chambolle dual projection.
+where `f(θ)` = data fidelity + componentwise anisotropic mean soft TV. The prior `g(z)` is:
+- **TV mode**: `g(z) = λ·TVz(z)`, the pointwise isotropic sum solved by Chambolle dual projection.
 - **Diffusion (PnP) mode**: no explicit `g(z)` — the proximal step is *replaced* by a Gaussian
   video denoiser `D_σ(·)`, following the standard Plug-and-Play ADMM template (Venkatakrishnan
   et al. 2013). The denoiser's σ is chosen by an **independent annealing schedule**, not
@@ -166,11 +168,11 @@ where `f(θ)` = data fidelity + soft TV. The prior `g(z)` is:
 **Three-step iteration**:
 ```
 θ-step (n_inner Adam steps):
-    min_θ  f(θ) + λ_soft·TV(R(θ)) + (ρ/2)‖R(θ) - (z - u)‖²
+    min_θ  f(θ) + λ_soft·TVθ(R(θ)) + (ρ/2)‖R(θ) - (z - u)‖²
     target = z − u   ← Boyd sign convention (CRITICAL)
 
 z-step:
-    TV mode:        z = prox_{(λ/ρ)·TV}(R(θ) + u)        # exact Chambolle
+    TV mode:        z = prox_{(λ/ρ)·TVz}(R(θ) + u)       # exact Chambolle
     PnP (diffusion): z = D_σ_k(R(θ) + u)                  # learned denoiser, σ from schedule
     input = R(θ) + u   ← Boyd sign convention (CRITICAL)
 
@@ -201,7 +203,7 @@ u-step:
 
 #### 7.1 TV Priors (`prior/tv.py`)
 
-**TVPrior (2D)**: Chambolle dual projection, frame-by-frame.
+**TVPrior (2D)**: pointwise isotropic-sum Chambolle dual projection, frame-by-frame.
 - Dual variable: `p ∈ ℝ^{H×W×2}`, step size `τ = 1/8`
 - `proximal(x, weight)` solves `prox_{weight·TV}(x)` exactly. ADMM passes `weight = λ_TV/ρ`.
 
@@ -342,7 +344,8 @@ it received. Only `train.py` needs to know about the diffusion-specific `set_n_s
   - z-step input: `R(θ) + u` (NOT `R(θ) − u`)
   - u-step: `u ← u + R(θ) − z`
 - Measurements z-scored **independently** (pred and target each normalized separately)
-- All losses use **mean** reduction (NOT sum)
+- Differentiable θ-step TV uses a componentwise **mean**; the TV z-step
+  proximal/energy uses a pointwise isotropic **sum**
 - SE(2) rotation center: `((H-1)/2, (W-1)/2)` to match `scipy.ndimage.rotate`
 - SNR: `sig_pow = np.var(signal)` — AC variance, NOT DC mean
 
@@ -447,7 +450,8 @@ Full design rationale: `UPGRADE_PLAN.md`.
 - PyTorch tensors with explicit shape comments
 - Config via YAML (`configs/default.yaml`); no magic numbers in code
 - Each module replaceable (for Phase 2: swap TV → diffusion prior)
-- All losses use mean reduction; grad clipping at 5.0 for stability
+- Differentiable θ-step losses use mean reduction; the TV z-step prior/energy uses an isotropic sum.
+  Gradient clipping is 5.0 for stability.
 
 ---
 

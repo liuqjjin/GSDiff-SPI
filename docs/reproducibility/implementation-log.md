@@ -272,3 +272,66 @@ This permanent append-only ledger is intentionally empty of implementation recor
   `No broken requirements found.`
 - `git diff --check` → exit `0` with silent output. All test and verifier
   output was pristine, with no warnings or unexpected skips.
+
+## Task 3 — Make TV definitions internally consistent (2026-07-27)
+
+- Prior approved commit and clean starting HEAD:
+  `953ce67b30b5abb33a35f9d76f89d36cf71cba4a` on
+  `debug/admm-vs-sgd`.
+- The scientifically intentional objectives remain distinct: the z-step
+  proximal and reported prior energy use a pointwise isotropic sum, while the
+  differentiable theta-step regularizer retains its historical componentwise
+  anisotropic per-axis means. Solver coefficients and reductions were not
+  changed.
+
+### Two-phase TDD evidence
+
+- Energy-value RED, before any production edit:
+  `D:\conda\envs\spi\python.exe -m pytest
+  tests/prior/test_tv3d.py::test_tv3d_energy_uses_pointwise_isotropic_norm
+  tests/prior/test_tv3d.py::test_tv2d_energy_uses_pointwise_isotropic_norm -q`
+  → exit `1`, `2 failed in 0.05s`. Both prior energy methods returned the
+  historical anisotropic value `4.0`, rather than the required isotropic
+  `2 + sqrt(2) = 3.414213562373095`.
+- Named-helper/shared-regularizer RED, still before production edits:
+  `D:\conda\envs\spi\python.exe -m pytest tests/prior/test_tv3d.py
+  tests/solver/test_tv_regularizer.py -q` → exit `1`, collection interrupted
+  with two expected `ImportError`s: `isotropic_tv2d_sum` and
+  `anisotropic_tv_mean` did not exist.
+- Minimal implementation introduced the three named tensor helpers, routed
+  `TVPrior.energy` and `TVPrior3D.energy` through the isotropic helpers, and
+  made both solver functions thin wrappers around the shared anisotropic
+  helper. Focused GREEN, the same two-file command → exit `0`,
+  `22 passed in 0.21s`.
+- Deterministic float64 values were: 2D isotropic
+  `3.4142135623730949`; 3D isotropic at `alpha=0.5`
+  `3.6502815398728847`; historical anisotropic mean at `alpha=0.5`, `1.25`.
+  Both solver wrappers had absolute error `0` against the shared helper.
+- At `alpha=0`, the float64 energy absolute difference from the sum of
+  independent framewise 2D energies was `2.8421709430404007e-14`; the
+  proximal maximum absolute difference was `0` for both weights `0.01` and
+  `0.2`.
+
+### Documentation and verification
+
+- `README.md`, `THEORY.md`, and `CLAUDE.md` now distinguish the theta-step
+  componentwise anisotropic mean from the z-step pointwise isotropic sum.
+  A targeted search found no remaining statements that equate their
+  reductions or definitions.
+- Accumulated CPU suite:
+  `D:\conda\envs\spi\python.exe -m pytest -m "not cuda" -q` → exit `0`,
+  `83 passed, 1 deselected in 12.17s`.
+- Real CUDA suite:
+  `D:\conda\envs\spi\python.exe -m pytest -m cuda -q` → exit `0`,
+  `1 passed, 83 deselected in 0.61s`; one CUDA test executed and zero skipped.
+- Full suite: `D:\conda\envs\spi\python.exe -m pytest -q` → exit `0`,
+  `84 passed in 12.55s`.
+- Strict environment verifier → exit `0`, fingerprint
+  `b5d6922a9f3a9638ee8826b9a74f00998cd3ac81aa25c03de016358e0e435a56`.
+- Strict implementation-provenance verifier → exit `0`; four immutable
+  inputs verified at current commit
+  `953ce67b30b5abb33a35f9d76f89d36cf71cba4a`.
+- `D:\conda\envs\spi\python.exe -m pip check` → exit `0`,
+  `No broken requirements found.`
+- `git diff --check` → exit `0` with silent output. Test and verifier output
+  was pristine, with no warnings or unexpected skips.

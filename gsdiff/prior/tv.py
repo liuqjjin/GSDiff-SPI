@@ -16,6 +16,42 @@ def _gradient3d(video: torch.Tensor, alpha: float) -> torch.Tensor:
     return grad
 
 
+def isotropic_tv2d_sum(video: torch.Tensor) -> torch.Tensor:
+    """Pointwise isotropic spatial TV, sum-reduced over a video."""
+    v = video[:, 0]
+    grad = v.new_zeros(*v.shape, 2)
+    grad[:, :-1, :, 0] = v[:, 1:] - v[:, :-1]
+    grad[:, :, :-1, 1] = v[:, :, 1:] - v[:, :, :-1]
+    return torch.linalg.vector_norm(grad, dim=-1).sum()
+
+
+def isotropic_tv3d_sum(
+    video: torch.Tensor, temporal_weight: float
+) -> torch.Tensor:
+    """Pointwise isotropic spatiotemporal TV, sum-reduced over a video."""
+    grad = _gradient3d(video[:, 0], temporal_weight)
+    return torch.linalg.vector_norm(grad, dim=-1).sum()
+
+
+def anisotropic_tv_mean(
+    video: torch.Tensor, temporal_weight: float = 0.0
+) -> torch.Tensor:
+    """Componentwise anisotropic TV with historical per-axis means."""
+
+    def mean_abs_or_zero(difference):
+        if difference.numel() == 0:
+            return difference.sum()
+        return difference.abs().mean()
+
+    dy = mean_abs_or_zero(video[:, :, 1:, :] - video[:, :, :-1, :])
+    dx = mean_abs_or_zero(video[:, :, :, 1:] - video[:, :, :, :-1])
+    spatial = dy + dx
+    if temporal_weight > 0:
+        dt = mean_abs_or_zero(video[1:] - video[:-1])
+        return spatial + float(temporal_weight) * dt
+    return spatial
+
+
 def _divergence3d(field: torch.Tensor, alpha: float) -> torch.Tensor:
     T, H, W, _ = field.shape
     div = field.new_zeros(T, H, W)
@@ -74,9 +110,7 @@ class TVPrior:
 
     def energy(self, x):
         """TV(x) for [T,1,H,W]."""
-        dy = (x[:, :, 1:, :] - x[:, :, :-1, :]).abs().sum()
-        dx = (x[:, :, :, 1:] - x[:, :, :, :-1]).abs().sum()
-        return (dy + dx).item()
+        return isotropic_tv2d_sum(x).item()
 
 
 class TVPrior3D(TVPrior):
@@ -138,11 +172,4 @@ class TVPrior3D(TVPrior):
 
     def energy(self, x):
         """TV3D(x) for [T,1,H,W] — isotropic pointwise norm, sum-reduced."""
-        v = x[:, 0]   # [T, H, W]
-        alpha = self.temporal_weight
-        # spatial
-        dy = (v[:, 1:, :] - v[:, :-1, :]).abs().sum()
-        dx = (v[:, :, 1:] - v[:, :, :-1]).abs().sum()
-        # temporal
-        dt = alpha * (v[1:] - v[:-1]).abs().sum()
-        return (dy + dx + dt).item()
+        return isotropic_tv3d_sum(x, self.temporal_weight).item()

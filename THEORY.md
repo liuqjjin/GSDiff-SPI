@@ -344,10 +344,11 @@ Chambolle 精确 prox，也可以是一个学习的去噪器——θ 那边完�
 
 θ-step 不是精确解，而是 **n_inner=50 步 Adam**：
 
-    loss = f(θ) + λ_soft·TV_3D(R(θ)) + (ρ/2)·MSE(R(θ), z−u)
+    loss = f(θ) + λ_soft·TV_aniso_mean(R(θ)) + (ρ/2)·MSE(R(θ), z−u)
 
 - `admm_soft_tv_weight=0.006` 的软 TV **不能设 0**（实验验证会明显掉点）：
-  它在 θ 流形内部提供逐步平滑梯度，与 z-step 的先验不重复；
+  它是各差分分量分别取绝对值后求 mean 的各向异性目标，在 θ 流形内部
+  提供逐步平滑梯度；z-step 则是逐点欧氏范数的各向同性 sum，二者并非同一目标；
   3D 版本带 `temporal_tv_weight=0.05` 的时间差分项（0.02 太弱 0.08 过平滑）。
 - 优化器**跨外环持久**（Adam 动量/二阶矩不重置），
   CosineAnnealingLR 以 T_max = num_outer×num_inner = 4000 全程退火，
@@ -423,8 +424,8 @@ Ryu et al. 2019（去噪器收缩性条件）。工程上用三个诊断量监�
 
 ### 5.8 SGD 基线与 RED-diff 变体
 
-SGD（`solver/sgd.py`）：单环 Adam 直接最小化 f + λ·TV_3D(R(θ))，
-TV 梯度直接反传过渲染管线，无 z/u。lr_motion=0.15 是 lr_scene 的
+SGD（`solver/sgd.py`）：单环 Adam 直接最小化
+f + λ·TV_aniso_mean(R(θ))，TV 梯度直接反传过渲染管线，无 z/u。lr_motion=0.15 是 lr_scene 的
 ~17 倍（运动 DOF 少但必须先收敛），CosineAnnealingLR 同预算。
 真 ADMM 修好 transition 后稳定优于 SGD 约 +3 dB。
 `red_weight > 0` 时 SGD 加 RED-diff 式单环扩散正则
@@ -622,12 +623,12 @@ DiffusionPrior，ADMMSolver 只调 `prior.proximal(x, weight)`，
   │    A(t), d(t)  ──SE(2)/仿射──▶  μ_m(t), Σ_m(t)      [T,M,·]
   │    稠密渲染   ──────────────▶  V = R(θ)             [T,1,64,64]
   │    ⟨P_k, V_f(k)⟩ ───────────▶  ŷ                    [2500]
-  │    loss = ½MSE(zs(ŷ), zs(y)) + 0.006·TV3D(V)
+  │    loss = ½MSE(zs(ŷ), zs(y)) + 0.006·TV_aniso_mean(V)
   │           + (ρ/2)·MSE(V, z−u)          ← warmup/transition 时无此项
   │    backward → clip 5.0 → Adam → cosine
   │
   ├─ z-step:  z = prior.proximal(V + u, λ/ρ)
-  │             TV:  Chambolle 精确 prox（2D 逐帧 / 3D 联合）
+  │             TV:  各向同性 sum 的 Chambolle 精确 prox（2D 逐帧 / 3D 联合）
   │             扩散: clamp(D_σ_k(V+u))，σ_k 独立退火，weight 忽略
   ├─ u-step:  u ← u + V − z                 （hqs 时 u≡0）
   └─ ρ ← 1.1·ρ；记录 prim_res / dual_res / u_norm / σ
@@ -643,4 +644,3 @@ DiffusionPrior，ADMMSolver 只调 `prior.proximal(x, weight)`，
 | u_norm | 有界 | 单调无界：θ 流形不可行（5.7） |
 | velocity | →GT | 不动/发散：lr_motion 或初始化问题（2.6） |
 | eval_residual | <0.05 | >0.05：塌缩盆地警报（7.3） |
-

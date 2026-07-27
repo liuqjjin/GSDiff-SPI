@@ -62,15 +62,18 @@ Patterns are random U[0,1] matrices. Frame assignment: `frame_idx[k] = k // ⌈K
 
 ### Loss Function
 
-Both solvers minimize a z-score normalized data fidelity term plus spatial/temporal TV regularization:
+Both solvers use a z-score normalized data fidelity term. Their differentiable θ-step
+regularizer retains the historical componentwise anisotropic mean:
 
 ```
-min_θ   ½ · MSE(zscore(ŷ), zscore(y))  +  λ · TV(V)
+TVθ(V) = mean|ΔyV| + mean|ΔxV| + α·mean|ΔtV|
 ```
 
 Z-score normalization (applied independently to prediction and target) removes the large DC offset of SPI measurements and makes the loss scale-invariant. SNR is defined relative to the AC variance of the measurements (`sig_pow = np.var(y)`).
 
-**Optional 3D TV**: `TV3D(V) = Σ_{t,i,j} √((α·ΔtV)² + (ΔyV)² + (ΔxV)²)` couples temporal frames and suppresses frame-to-frame flicker.
+The TV z-step proximal and its reported energy instead use the pointwise isotropic sum
+`TVz(V) = Σ_{t,i,j} √((α·ΔtV)² + (ΔyV)² + (ΔxV)²)`. These are deliberately
+different objectives; `use_3dtv` adds their respective temporal terms.
 
 ### ADMM Solver
 
@@ -83,14 +86,14 @@ L_ρ(θ, z, u) = f(θ) + g(z) + (ρ/2)‖R(θ) − z + u‖²
 **θ-step** (n_inner Adam steps — decoupled data + soft-TV + consistency):
 ```
 target = z − u
-min_θ  f(θ) + λ_soft·TV(R(θ)) + (ρ/2)‖R(θ) − target‖²
+min_θ  f(θ) + λ_soft·TVθ(R(θ)) + (ρ/2)‖R(θ) − target‖²
 ```
 
 **z-step** — chooses *one* of the two priors below:
 
 - **TV mode** (`prior_type: tv`) — exact Chambolle dual projection:
   ```
-  z = prox_{(λ/ρ)·TV}(R(θ) + u)
+  z = prox_{(λ/ρ)·TVz}(R(θ) + u)
   ```
   2D per-frame (`TVPrior`) or 3D isotropic (`TVPrior3D`, step size `τ = 1/(8 + 4α²)`).
 
@@ -126,7 +129,7 @@ degenerates to SGD with `num_outer × num_inner` steps and the z-step never fire
 Direct end-to-end Adam optimization (no variable splitting):
 
 ```
-loss = ½ MSE(zscore(ŷ), zscore(y)) + λ · TV(V)
+loss = ½ MSE(zscore(ŷ), zscore(y)) + λ · TVθ(V)
 ```
 
 Scene and motion parameters are updated jointly, with separate learning rates (motion lr = 15× scene lr) and CosineAnnealingLR decay.
@@ -301,7 +304,7 @@ solver:
   admm_lr_motion: 15.0e-2
   hqs: false                # true → u≡0 (HQS ablation)
 
-  # 3D TV (applies to TV prior and to the soft TV inside the θ-step)
+  # 3D TV (isotropic sum in the z-step; anisotropic mean in the θ-step)
   use_3dtv: true
   temporal_tv_weight: 0.05  # α: temporal vs spatial balance
 
