@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-07-27T12:06:08.5436850+08:00",
+  "task": "Task 0: Obtain Isolation Consent and Record the Starting State",
+  "repository": {
+    "worktree_path": "D:\\Research\\gsdiff_spi",
+    "implementation_branch": "debug/admm-vs-sgd",
+    "starting_head": "abca49b36439efc6cb607a45c1601e50d84d6656",
+    "plan_baseline_commit": "abca49b36439efc6cb607a45c1601e50d84d6656",
+    "legacy_evidence_baseline": "c03420784bc92b4e9b9eef8330cbd9571ebebc68",
+    "approved_design_commit": "24c1959599d9d775114d068f6de41ef2e31b5e36",
+    "remotes": [
+      {
+        "name": "origin",
+        "fetch": "https://github.com/liuqjjin/GSDiff-SPI.git",
+        "push": "https://github.com/liuqjjin/GSDiff-SPI.git"
+      }
+    ],
+    "initial_clean_state": {
+      "command": "git status --porcelain=v1",
+      "output": "",
+      "is_clean": true,
+      "status_branch_output": "## debug/admm-vs-sgd...origin/debug/admm-vs-sgd [ahead 2]"
+    }
+  },
+  "worktree_detection": {
+    "method": "Compared resolved git-dir and git-common-dir and checked the superproject guard.",
+    "resolved_git_dir": "D:\\Research\\gsdiff_spi\\.git",
+    "resolved_git_common_dir": "D:\\Research\\gsdiff_spi\\.git",
+    "superproject_worktree": "",
+    "registered_worktrees": [
+      {
+        "path": "D:/Research/gsdiff_spi",
+        "head": "abca49b36439efc6cb607a45c1601e50d84d6656",
+        "branch": "refs/heads/debug/admm-vs-sgd"
+      }
+    ],
+    "is_linked_worktree": false,
+    "is_submodule": false
+  },
+  "worktree_decision": {
+    "mode": "in_place",
+    "user_statement": "The user explicitly declined a separate worktree and instructed us to implement in place.",
+    "recorded_at": "2026-07-27T11:51:21.0914366+08:00"
+  },
+  "immutable_inputs": [
+    {
+      "path": "docs/superpowers/specs/2026-07-27-gsdiff-correctness-publication-design.md",
+      "sha256": "60c0a32d8ecf6b54734544a1862b939940a0ff5215546f224e5dab889de6d12a"
+    },
+    {
+      "path": "docs/superpowers/plans/2026-07-27-gsdiff-correctness-reproducibility.md",
+      "sha256": "3e789c278f74fad707f343e793c5eae4b3c808ff89779b16a79a0c86044f68b7"
+    },
+    {
+      "path": "docs/superpowers/plans/2026-07-27-gsdiff-experiments-artifacts.md",
+      "sha256": "a267afd2b270742bb7364eff8e1c23d92a57e310de30ec953bc0a1f5436bcf0e"
+    },
+    {
+      "path": "docs/superpowers/plans/2026-07-27-gsdiff-publication-package.md",
+      "sha256": "a52be20bc7b456de0c77219f45c00e389968a61e9370789a9fa1499c579f830f"
+    }
+  ],
+  "pre_baseline_validation": {
+    "commands": [
+      "D:\\conda\\envs\\spi\\python.exe -m json.tool docs\\reproducibility\\implementation-provenance.json",
+      "D:\\conda\\envs\\spi\\python.exe - (standard-library verifier for Git facts and SHA-256 recomputation)"
+    ],
+    "json_syntax_valid": true,
+    "recorded_git_facts_valid": true,
+    "sha256_entries_valid": 4,
+    "immutable_inputs_match_plan_baseline": true
+  }
+}
