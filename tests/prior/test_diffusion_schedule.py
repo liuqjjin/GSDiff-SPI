@@ -1,9 +1,12 @@
+import json
+import math
+
 import pytest
 import torch
 
 import gsdiff.prior.diffusion as diffusion_module
 from gsdiff.prior.diffusion import DiffusionPrior, log_annealed_sigma
-from train import _record_sigma_used
+from train import _record_sigma_used, _write_results_json
 
 
 class ZeroDenoiser(torch.nn.Module):
@@ -57,6 +60,22 @@ def test_schedule_rejects_index_outside_call_range(index):
     [(0.0, 0.05), (-0.3, 0.05), (0.3, 0.0), (0.3, -0.05)],
 )
 def test_schedule_rejects_nonpositive_sigma_values(sigma_start, sigma_end):
+    with pytest.raises(ValueError, match="sigma_start and sigma_end must be positive"):
+        log_annealed_sigma(0, 4, sigma_start, sigma_end)
+
+
+@pytest.mark.parametrize(
+    ("sigma_start", "sigma_end"),
+    [
+        (math.nan, 0.05),
+        (math.inf, 0.05),
+        (-math.inf, 0.05),
+        (0.3, math.nan),
+        (0.3, math.inf),
+        (0.3, -math.inf),
+    ],
+)
+def test_schedule_rejects_non_finite_sigma_values(sigma_start, sigma_end):
     with pytest.raises(ValueError, match="sigma_start and sigma_end must be positive"):
         log_annealed_sigma(0, 4, sigma_start, sigma_end)
 
@@ -125,6 +144,20 @@ def test_four_proximal_calls_consume_exact_outer_schedule(monkeypatch):
     assert seen == pytest.approx([0.3, 0.16509636, 0.09085603, 0.05])
 
 
+def test_fifth_proximal_call_fails_closed_without_advancing_count(monkeypatch):
+    prior = make_cpu_prior(monkeypatch)
+    prior.set_n_steps(4)
+    x = torch.zeros(2, 1, 3, 4)
+    for _ in range(4):
+        prior.proximal(x, weight=0.0)
+
+    with pytest.raises(IndexError, match="outside"):
+        prior.proximal(x, weight=0.0)
+
+    assert prior._call_count == 4
+    assert prior.last_sigma == 0.05
+
+
 def test_proximal_records_sigma_before_incrementing_call_count(monkeypatch):
     prior = make_cpu_prior(monkeypatch)
     prior.set_n_steps(4)
@@ -169,3 +202,47 @@ def test_training_history_records_consumed_sigma_without_schedule_lookahead():
 
     assert sigma_used == 0.05
     assert info == {"loss_data": 1.0, "sigma_used": 0.05}
+
+
+def test_training_history_skips_warmup_without_consumed_sigma():
+    class WarmupPrior:
+        last_sigma = None
+
+    info = {"in_warmup": True}
+
+    sigma_used = _record_sigma_used(info, WarmupPrior())
+
+    assert sigma_used is None
+    assert info == {"in_warmup": True}
+
+
+def test_training_history_ignores_non_diffusion_prior():
+    info = {"loss_data": 1.0}
+
+    sigma_used = _record_sigma_used(info, object())
+
+    assert sigma_used is None
+    assert info == {"loss_data": 1.0}
+
+
+def test_results_json_persists_history_with_consumed_sigma(tmp_path):
+    results_path = tmp_path / "results.json"
+    results = {"solver": "admm", "mean_psnr": 12.5}
+    history = [
+        {
+            "loss_data": 1.0,
+            "video": torch.ones(2, 1, 3, 4),
+            "sigma_used": 0.3,
+        },
+        {"loss_data": 0.5, "sigma_used": 0.05},
+    ]
+
+    _write_results_json(results_path, results, history)
+
+    persisted = json.loads(results_path.read_text(encoding="utf-8"))
+    assert persisted["solver"] == "admm"
+    assert persisted["mean_psnr"] == 12.5
+    assert persisted["history"] == [
+        {"loss_data": 1.0, "sigma_used": 0.3},
+        {"loss_data": 0.5, "sigma_used": 0.05},
+    ]

@@ -43,9 +43,21 @@ def evaluate(gt_frames, recon_np, label=""):
 
 def _record_sigma_used(info, prior):
     """Record and return the diffusion sigma consumed by the completed step."""
-    sigma_used = prior.last_sigma
-    info["sigma_used"] = sigma_used
+    sigma_used = getattr(prior, "last_sigma", None)
+    if sigma_used is not None:
+        info["sigma_used"] = sigma_used
     return sigma_used
+
+
+def _write_results_json(path, results, history):
+    """Persist the summary and scalar iteration history to one JSON payload."""
+    scalar_history = [
+        {key: value for key, value in entry.items() if key != "video"}
+        for entry in history
+    ]
+    payload = to_native({**results, "history": scalar_history})
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
 
 
 # ─── Visualization ────────────────────────────────────────────
@@ -443,8 +455,7 @@ def main():
         "eval_residual": eval_residual,
         "eval_residual_pf": eval_residual_pf,
     })
-    with open(os.path.join(out_dir, "results.json"), "w", encoding='utf-8') as f:
-        json.dump(results, f, indent=2)
+    _write_results_json(os.path.join(out_dir, "results.json"), results, history)
 
     # Checkpoint
     torch.save({"scene": scene.state_dict(), "motion": motion.state_dict(),

@@ -31,7 +31,8 @@ def log_annealed_sigma(index: int, count: int,
         raise ValueError("count must be >= 1")
     if not 0 <= index < count:
         raise IndexError(f"index {index} outside [0, {count})")
-    if sigma_start <= 0 or sigma_end <= 0:
+    if (not math.isfinite(sigma_start) or not math.isfinite(sigma_end)
+            or sigma_start <= 0 or sigma_end <= 0):
         raise ValueError("sigma_start and sigma_end must be positive")
     if count == 1:
         return float(sigma_end)

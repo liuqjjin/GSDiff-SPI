@@ -454,3 +454,59 @@ This permanent append-only ledger is intentionally empty of implementation recor
   `No broken requirements found.`
 - `git diff --check` → exit `0` with silent output. All test and verifier
   output was pristine, with no warnings or unexpected skips.
+
+## Task 4 Fix Round 1 — Persist consumed diffusion sigma (2026-07-27)
+
+- Fix base and clean starting HEAD:
+  `03818b50c4a750fd974bd46c41579cdcea9bb0cb`; the Task 4 commit was not
+  amended.
+- Non-finite validation RED:
+  `D:\conda\envs\spi\python.exe -m pytest
+  tests/prior/test_diffusion_schedule.py::test_schedule_rejects_non_finite_sigma_values
+  -q` → exit `1`, `4 failed, 2 passed in 0.64s`. NaN and positive infinity
+  were accepted for either endpoint; negative infinity already reached the
+  prior nonpositive guard.
+- After adding the minimal `math.isfinite` guard, the identical test command
+  → exit `0`, `6 passed in 0.57s`. NaN and both infinities now fail closed
+  for either endpoint, alongside the existing zero/negative coverage.
+- Persisted-history RED:
+  `D:\conda\envs\spi\python.exe -m pytest
+  tests/prior/test_diffusion_schedule.py::test_results_json_persists_history_with_consumed_sigma
+  -q` → exit `1` during collection with the expected missing
+  `_write_results_json` import (`1` collection error in `0.57s`).
+- Persisted-history GREEN, identical command → exit `0`,
+  `1 passed in 0.64s`. The same private helper used by the real final
+  `results.json` path retains all existing summary keys, adds scalar
+  iteration `history`, omits the large/non-serializable `video` tensor, and
+  round-trips `sigma_used` values `0.3` and `0.05`.
+- Contract-coverage first run for a real fifth proximal call, diffusion
+  warmup, and a non-diffusion object → exit `1`,
+  `2 failed, 1 passed in 0.66s`. The fifth call already failed closed with
+  `IndexError` without advancing `_call_count`; warmup added a misleading
+  `sigma_used: None`, and a non-diffusion object raised `AttributeError`.
+  The minimal conditional public-property read made the identical three-test
+  command GREEN: `3 passed in 0.53s`.
+
+### Fix Round 1 verification
+
+- Focused Task 4 suite → exit `0`, `30 passed in 0.67s`.
+- Accumulated CPU suite → exit `0`,
+  `114 passed, 1 deselected in 15.18s`.
+- Real CUDA suite → exit `0`,
+  `1 passed, 114 deselected in 1.04s`; exactly one CUDA test executed and
+  zero skipped.
+- Full suite → exit `0`, `115 passed in 22.25s`.
+- Strict environment verification → exit `0`, fingerprint
+  `b5d6922a9f3a9638ee8826b9a74f00998cd3ac81aa25c03de016358e0e435a56`.
+- Strict implementation-provenance verification → exit `0`; four immutable
+  inputs verified at the Fix Round 1 base
+  `03818b50c4a750fd974bd46c41579cdcea9bb0cb`.
+- Fresh targeted JSON persistence test → exit `0`,
+  `1 passed in 0.65s`.
+- Targeted tracked-Python search found `_current_sigma` only in its
+  definition, `DiffusionPrior.proximal`, and tests; `train.py` contains no
+  private schedule call and no misleading `sigma` history field.
+- `D:\conda\envs\spi\python.exe -m pip check` → exit `0`,
+  `No broken requirements found.`
+- `git diff --check` → exit `0` with silent output. All test and verifier
+  output was pristine, with no warnings or unexpected skips.
