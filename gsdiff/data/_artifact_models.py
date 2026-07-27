@@ -7,7 +7,7 @@ import numpy as np
 
 from ._artifact_identity import (
     ArtifactValidationError,
-    json_native,
+    deep_freeze_json,
     optional_readonly_array,
     readonly_array,
 )
@@ -61,10 +61,10 @@ class SPIAcquisitionData:
             "noise_parameters",
             "motion_parameters",
         ):
-            native = json_native(getattr(self, field))
-            if not isinstance(native, dict):
+            frozen = deep_freeze_json(getattr(self, field))
+            if not isinstance(frozen, Mapping):
                 raise ArtifactValidationError(f"{field} must be a mapping")
-            object.__setattr__(self, field, native)
+            object.__setattr__(self, field, frozen)
 
     @property
     def frame_idx(self) -> np.ndarray:
@@ -118,10 +118,10 @@ class EvaluationTruth:
                 self, field, readonly_array(getattr(self, field), field)
             )
         for field in ("dataset_identity_spec", "evaluator_metadata"):
-            native = json_native(getattr(self, field))
-            if not isinstance(native, dict):
+            frozen = deep_freeze_json(getattr(self, field))
+            if not isinstance(frozen, Mapping):
                 raise ArtifactValidationError(f"{field} must be a mapping")
-            object.__setattr__(self, field, native)
+            object.__setattr__(self, field, frozen)
 
 
 @dataclass(frozen=True)
@@ -156,7 +156,7 @@ class ReconstructionOutput:
         object.__setattr__(
             self, "dgi", optional_readonly_array(self.dgi, "dgi")
         )
-        native = json_native(self.method_metadata)
-        if not isinstance(native, dict):
+        frozen = deep_freeze_json(self.method_metadata)
+        if not isinstance(frozen, Mapping):
             raise ArtifactValidationError("method_metadata must be a mapping")
-        object.__setattr__(self, "method_metadata", native)
+        object.__setattr__(self, "method_metadata", frozen)

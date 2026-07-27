@@ -1353,3 +1353,82 @@ This permanent append-only ledger is intentionally empty of implementation recor
   required root labels and aliases.
 - `git diff --check` → exit `0` with silent output. Test and verifier output
   was pristine, with no warnings or unexpected skips.
+
+## Task 9 Fix Round 1 — Harden artifact trust boundaries (2026-07-27)
+
+- Started from the reviewed Task 9 commit
+  `6389b522ee294cd8e58569dfef99f3f2c0bbecc4` with a clean tracked
+  worktree. The fix remains within Task 9; it does not introduce or call the
+  Task 10 run-identity builder.
+- `resolved_generation_config` is now the exact recursive
+  `measurements-v1` schema. Every level rejects missing and extra keys.
+  Dimensions, seeds, holdout counts/offsets, and `motion_mode` use exact
+  integer types; booleans, floats, and strings are not coerced. All numeric
+  physics values must be finite, `sigma_abs` is either null or nonnegative,
+  `motion_mode` is 1 or 2, and pattern-order/time-assignment values are
+  restricted to the implemented enums. Holdout presence and count must agree
+  with each other and with the actual optional arrays.
+- Exact schemas eliminate config capability smuggling: truth paths,
+  canonical/GT values, trajectories, evaluator/metric objects, and target
+  path fields cannot be added at any nesting level. The target descriptor is
+  retained only as a logical string and is never interpreted or opened by
+  artifact code; `target_asset_sha256` remains the content binding.
+- Every redundant acquisition field is cross-checked against the resolved
+  config and the identity spec, including dimensions, seed, pattern/time
+  semantics, noise convention/parameters, and motion model/parameters.
+  Identity descriptors and holdout shapes are also structurally validated.
+  Loaders no longer use integer or float coercions for trust-bearing metadata.
+- Truth validation now binds H/W/T, canonical target bytes, motion
+  model/velocity/acceleration/omega/beta, and both motion trajectories to the
+  shared acquisition identity. Forging truth array descriptors no longer
+  permits identity-inconsistent target or motion values.
+- All three public artifact dataclasses recursively freeze mappings and
+  sequences. Every array is copied into immutable bytes-backed storage, so
+  setting `flags.writeable=True` fails instead of re-enabling mutation.
+  `validate_evaluation_inputs` revalidates reconstruction, acquisition, and
+  truth internal contracts before comparing their identities and dimensions.
+- The blind execution literal is exactly `blind_method_child` in policy
+  construction, validation, serialized method information, and tests.
+
+### RED/GREEN and adversarial evidence
+
+- First focused RED for strict schema, split-brain redundancies, capability
+  injection, holdout consistency, and the blind literal:
+  `32 failed, 27 passed`. Minimal strict-schema/cross-binding GREEN:
+  `59 passed`.
+- Second focused RED for truth binding, recursive immutability, ndarray
+  writeability re-enablement, and evaluator trust revalidation:
+  `15 failed, 60 passed`. Minimal truth/freeze/trust-gate GREEN:
+  `75 passed`.
+- Duplicate ZIP-member rejection, fixed timestamp/mode/compression metadata,
+  and atomic-replace failure cleanup were already defensive in the production
+  codec; their new adversarial coverage passed immediately
+  (`3 passed, 75 deselected`) and is recorded as coverage-only, not fabricated
+  RED evidence.
+- Pre-final self-review found Python equality allowed the redundant metadata
+  seed `7.0` to compare equal to the exact config seed `7`. Its targeted RED
+  was `1 failed, 78 deselected`; exact redundant/identity seed validation
+  produced `1 passed, 78 deselected`.
+
+### Verification
+
+- Final focused artifacts → exit `0`, `79 passed in 9.65s`.
+- Accumulated CPU → exit `0`,
+  `293 passed, 1 deselected in 18.92s`.
+- Real CUDA → exit `0`,
+  `1 passed, 293 deselected in 1.26s`; exactly one executed and zero skipped.
+- Full suite → exit `0`, `294 passed in 19.89s`.
+- Strict environment verification → exit `0`, fingerprint
+  `b5d6922a9f3a9638ee8826b9a74f00998cd3ac81aa25c03de016358e0e435a56`.
+- Strict implementation-provenance verification → exit `0`; four immutable
+  inputs verified at base
+  `6389b522ee294cd8e58569dfef99f3f2c0bbecc4`.
+- `D:\conda\envs\spi\python.exe -m pip check` → exit `0`,
+  `No broken requirements found.`
+- Five-save deterministic audit produced one acquisition hash
+  `1248786ce0f22d193feb97bace37d63f9ba9a3f349042b8dfb5e0b132dea4da9`
+  and one truth hash
+  `81ff0c059b42d452a07668475111e405a94b2a52ba354641309ce71729fd3933`;
+  every returned hash equalled the direct file-byte hash.
+- `git diff --check` → exit `0` with silent output. Test output was pristine,
+  with no warnings or unexpected skips.

@@ -3,11 +3,11 @@ import io
 import hashlib
 import json
 import os
+from collections.abc import Mapping
 from pathlib import Path
 import subprocess
 import sys
 import zipfile
-from copy import deepcopy
 
 import numpy as np
 import pytest
@@ -38,8 +38,9 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 AUTHORITATIVE_PYTHON = Path(r"D:\conda\envs\spi\python.exe")
 
 
-def _tiny_pair(*, seed=7, shape="L", holdout_count=6):
+def _tiny_source(*, seed=7, shape="L", holdout_count=6):
     generation_config = {
+        "schema": "measurements-v1",
         "H": 8,
         "W": 8,
         "T": 3,
@@ -64,6 +65,7 @@ def _tiny_pair(*, seed=7, shape="L", holdout_count=6):
             },
         },
         "holdout": {
+            "present": holdout_count > 0,
             "count": holdout_count,
             "pattern_family": "uniform-random",
             "seed_offset": 9999,
@@ -91,6 +93,13 @@ def _tiny_pair(*, seed=7, shape="L", holdout_count=6):
     target_asset_sha256 = hashlib.sha256(
         np.ascontiguousarray(data.canonical).tobytes()
     ).hexdigest()
+    return data, generation_config, target_asset_sha256
+
+
+def _tiny_pair(*, seed=7, shape="L", holdout_count=6):
+    data, generation_config, target_asset_sha256 = _tiny_source(
+        seed=seed, shape=shape, holdout_count=holdout_count
+    )
     return split_spi_data(
         data,
         resolved_generation_config=generation_config,
@@ -114,14 +123,33 @@ def _direct_sha256(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _json_native_for_test(value):
+    if isinstance(value, Mapping):
+        return {
+            str(key): _json_native_for_test(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_json_native_for_test(item) for item in value]
+    if isinstance(value, np.ndarray):
+        return _json_native_for_test(value.tolist())
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
 def _canonical_json_bytes(value):
     return json.dumps(
-        value,
+        _json_native_for_test(value),
         allow_nan=False,
         ensure_ascii=False,
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
+
+
+def _mutable_json(value):
+    return json.loads(_canonical_json_bytes(value))
 
 
 def _read_metadata(path):
@@ -162,6 +190,34 @@ def _replace_metadata(members, mutator):
     return result
 
 
+def _replace_array_and_descriptor(members, name, array):
+    array = np.ascontiguousarray(array)
+    result = dict(members)
+    result[f"{name}.npy"] = _npy_bytes(array)
+
+    def update_descriptor(metadata):
+        metadata["array_descriptors"][name] = {
+            "dtype": array.dtype.str,
+            "shape": list(array.shape),
+            "sha256": hashlib.sha256(array.tobytes(order="C")).hexdigest(),
+        }
+
+    return _replace_metadata(result, update_descriptor)
+
+
+def _refresh_metadata_identity(metadata):
+    metadata["dataset_identity_sha256"] = hashlib.sha256(
+        _canonical_json_bytes(metadata["dataset_identity_spec"])
+    ).hexdigest()
+
+
+def _set_nested(mapping, path, value):
+    cursor = mapping
+    for key in path[:-1]:
+        cursor = cursor[key]
+    cursor[path[-1]] = value
+
+
 def _raw_output(acquisition):
     return ReconstructionOutput(
         dataset_identity_sha256=acquisition.dataset_identity_sha256,
@@ -183,7 +239,7 @@ def _raw_output(acquisition):
 def _write_entry_config(path, acquisition, output_dir):
     config = {
         "seed": 7,
-        "dataset_spec": acquisition.resolved_generation_config,
+        "dataset_spec": _mutable_json(acquisition.resolved_generation_config),
         "scene": {
             "type": "gaussian",
             "num_gaussians": 4,
@@ -228,7 +284,7 @@ def _assert_blind_output_is_measurement_only(output_dir, expected_identity):
     )
     assert reconstruction.dataset_identity_sha256 == expected_identity
     assert reconstruction.execution_policy == MethodExecutionPolicy(
-        execution_class="method_child_blind",
+        execution_class="blind_method_child",
         truth_access="unavailable",
         promotion_eligible=True,
     )
@@ -336,10 +392,8 @@ def test_dataset_identity_is_canonical_spec_hash_shared_by_pair():
         "time_assignment_mode",
     }
     assert acquisition.dataset_identity_spec["schema"] == "measurements-v1"
-    assert acquisition.dataset_identity_spec["motion"]["parameters"]["acceleration"] == [
-        0.2,
-        0.1,
-    ]
+    identity_motion = acquisition.dataset_identity_spec["motion"]["parameters"]
+    assert identity_motion["acceleration"] == (0.2, 0.1)
     assert acquisition.dataset_identity_spec["motion"]["parameters"]["beta"] == 0.03
 
 
@@ -429,7 +483,7 @@ def test_expected_spec_rejects_every_physics_mismatch(tmp_path, path, changed):
     acquisition, _ = _tiny_pair()
     artifact_path = tmp_path / "measurements.npz"
     save_acquisition_data(acquisition, artifact_path)
-    mismatched = deepcopy(acquisition.resolved_generation_config)
+    mismatched = _mutable_json(acquisition.resolved_generation_config)
     cursor = mismatched
     for key in path[:-1]:
         cursor = cursor[key]
@@ -443,15 +497,221 @@ def test_expected_spec_is_fail_closed_for_missing_or_extra_fields(tmp_path):
     acquisition, _ = _tiny_pair()
     artifact_path = tmp_path / "measurements.npz"
     save_acquisition_data(acquisition, artifact_path)
-    missing = deepcopy(acquisition.resolved_generation_config)
+    missing = _mutable_json(acquisition.resolved_generation_config)
     del missing["noise"]["parameters"]["snr_db"]
-    extra = deepcopy(acquisition.resolved_generation_config)
+    extra = _mutable_json(acquisition.resolved_generation_config)
     extra["motion"]["parameters"]["untrusted_yaml_only"] = 1
 
     with pytest.raises(ArtifactValidationError, match="expected spec"):
         load_acquisition_data(artifact_path, expected_spec=missing)
     with pytest.raises(ArtifactValidationError, match="expected spec"):
         load_acquisition_data(artifact_path, expected_spec=extra)
+
+
+@pytest.mark.parametrize(
+    ("path", "changed"),
+    [
+        (("seed",), False),
+        (("H",), 8.0),
+        (("W",), "8"),
+        (("motion", "parameters", "motion_mode"), 3),
+        (("motion", "parameters", "omega"), float("inf")),
+        (("noise", "parameters", "sigma_abs"), -0.01),
+        (("pattern", "family"), ""),
+        (("pattern", "order"), "unsupported"),
+        (("time_assignment", "mode"), "unsupported"),
+        (("holdout", "seed_offset"), "9999"),
+    ],
+    ids=[
+        "bool-seed",
+        "float-dimension",
+        "string-dimension",
+        "motion-mode-enum",
+        "nonfinite-motion",
+        "negative-sigma",
+        "empty-string",
+        "pattern-order-enum",
+        "time-mode-enum",
+        "string-seed-offset",
+    ],
+)
+def test_split_rejects_non_exact_generation_config_types_and_values(
+    path, changed
+):
+    data, config, target_hash = _tiny_source()
+    _set_nested(config, path, changed)
+
+    with pytest.raises(ArtifactValidationError):
+        split_spi_data(
+            data,
+            resolved_generation_config=config,
+            generator_code_version="gsdiff-simulation-test-v1",
+            target_asset_sha256=target_hash,
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["missing-schema", "wrong-schema", "extra-top", "extra-nested"],
+)
+def test_split_requires_exact_recursive_versioned_config_schema(mutation):
+    data, config, target_hash = _tiny_source()
+    if mutation == "missing-schema":
+        del config["schema"]
+    elif mutation == "wrong-schema":
+        config["schema"] = "measurements-v2"
+    elif mutation == "extra-top":
+        config["truth_path"] = "evaluation-truth.npz"
+    else:
+        config["motion"]["parameters"]["trajectory"] = [[0.0, 0.0, 0.0]]
+
+    with pytest.raises(ArtifactValidationError):
+        split_spi_data(
+            data,
+            resolved_generation_config=config,
+            generator_code_version="gsdiff-simulation-test-v1",
+            target_asset_sha256=target_hash,
+        )
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        (("truth_path",), "evaluation-truth.npz"),
+        (("canonical",), [[0.0]]),
+        (("gt_frames",), [[[0.0]]]),
+        (("target", "path"), "../private/target.png"),
+        (("motion", "parameters", "trajectory"), [[0.0, 0.0, 0.0]]),
+        (("noise", "parameters", "evaluator"), {"metric": "psnr"}),
+    ],
+    ids=[
+        "truth-path",
+        "canonical",
+        "gt-frames",
+        "target-path",
+        "trajectory",
+        "evaluator-metric",
+    ],
+)
+def test_generation_config_rejects_capability_smuggling(path, value):
+    data, config, target_hash = _tiny_source()
+    _set_nested(config, path, value)
+
+    with pytest.raises(ArtifactValidationError):
+        split_spi_data(
+            data,
+            resolved_generation_config=config,
+            generator_code_version="gsdiff-simulation-test-v1",
+            target_asset_sha256=target_hash,
+        )
+
+
+@pytest.mark.parametrize(
+    ("metadata_field", "identity_field", "changed"),
+    [
+        ("seed", "seed", 11),
+        ("pattern_family", "pattern_family", "gaussian"),
+        ("pattern_order", "pattern_order", "random"),
+        ("time_assignment_mode", "time_assignment_mode", "interpolation"),
+        ("noise_convention", "noise", "ac-variance-snr"),
+        ("motion_model", "motion", "translation"),
+    ],
+)
+def test_loader_rejects_split_brain_redundant_physics(
+    tmp_path, metadata_field, identity_field, changed
+):
+    acquisition, _ = _tiny_pair()
+    source = tmp_path / "source.npz"
+    forged = tmp_path / "forged.npz"
+    save_acquisition_data(acquisition, source)
+
+    def mutate(metadata):
+        metadata[metadata_field] = changed
+        if identity_field == "noise":
+            metadata["dataset_identity_spec"]["noise"]["convention"] = changed
+        elif identity_field == "motion":
+            metadata["dataset_identity_spec"]["motion"]["model"] = changed
+        else:
+            metadata["dataset_identity_spec"][identity_field] = changed
+        _refresh_metadata_identity(metadata)
+
+    _rewrite_npz(
+        source,
+        forged,
+        lambda members: _replace_metadata(members, mutate),
+    )
+
+    with pytest.raises(ArtifactValidationError):
+        load_acquisition_data(forged)
+
+
+def test_loader_rejects_coercible_redundant_seed_type(tmp_path):
+    acquisition, _ = _tiny_pair()
+    source = tmp_path / "source.npz"
+    forged = tmp_path / "forged.npz"
+    save_acquisition_data(acquisition, source)
+    _rewrite_npz(
+        source,
+        forged,
+        lambda members: _replace_metadata(
+            members, lambda metadata: metadata.update(seed=7.0)
+        ),
+    )
+
+    with pytest.raises(ArtifactValidationError):
+        load_acquisition_data(forged)
+
+
+def test_loader_rejects_capability_injected_inside_identity_bound_config(
+    tmp_path,
+):
+    acquisition, _ = _tiny_pair()
+    source = tmp_path / "source.npz"
+    forged = tmp_path / "forged.npz"
+    save_acquisition_data(acquisition, source)
+
+    def mutate(metadata):
+        injected = {"metric": "psnr", "path": "evaluation-truth.npz"}
+        metadata["resolved_generation_config"]["noise"]["parameters"][
+            "evaluator"
+        ] = injected
+        metadata["dataset_identity_spec"]["resolved_generation_config"][
+            "noise"
+        ]["parameters"]["evaluator"] = injected
+        _refresh_metadata_identity(metadata)
+
+    _rewrite_npz(
+        source,
+        forged,
+        lambda members: _replace_metadata(members, mutate),
+    )
+
+    with pytest.raises(ArtifactValidationError):
+        load_acquisition_data(forged)
+
+
+@pytest.mark.parametrize(
+    ("present", "count", "holdout_count"),
+    [
+        (False, 6, 6),
+        (True, 7, 6),
+        (True, 1, 0),
+    ],
+)
+def test_split_requires_holdout_metadata_to_match_array_presence_and_count(
+    present, count, holdout_count
+):
+    data, config, target_hash = _tiny_source(holdout_count=holdout_count)
+    config["holdout"]["present"] = present
+    config["holdout"]["count"] = count
+
+    with pytest.raises(ArtifactValidationError):
+        split_spi_data(
+            data,
+            resolved_generation_config=config,
+            generator_code_version="gsdiff-simulation-test-v1",
+            target_asset_sha256=target_hash,
+        )
 
 
 def test_truth_loader_rejects_seed_and_target_swaps_before_evaluation(tmp_path):
@@ -489,6 +749,191 @@ def test_truth_loader_rejects_seed_and_target_swaps_before_evaluation(tmp_path):
         )
 
 
+@pytest.mark.parametrize(
+    ("dimension", "changed"),
+    [
+        ("H", 8.0),
+        ("W", "8"),
+        ("T", True),
+    ],
+)
+def test_truth_loader_rejects_coercible_dimension_metadata(
+    tmp_path, dimension, changed
+):
+    acquisition, truth = _tiny_pair()
+    source = tmp_path / "truth-source.npz"
+    forged = tmp_path / "truth-forged.npz"
+    save_evaluation_truth(truth, source)
+    _rewrite_npz(
+        source,
+        forged,
+        lambda members: _replace_metadata(
+            members,
+            lambda metadata: metadata["dimensions"].update(
+                {dimension: changed}
+            ),
+        ),
+    )
+
+    with pytest.raises(ArtifactValidationError):
+        load_evaluation_truth(
+            forged,
+            expected_dataset_identity_sha256=(
+                acquisition.dataset_identity_sha256
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "changed"),
+    [
+        ("gt_omega", 0.25),
+        ("gt_beta", 0.13),
+        ("motion_model", "translation"),
+    ],
+)
+def test_truth_loader_binds_scalar_motion_metadata_to_identity(
+    tmp_path, field, changed
+):
+    acquisition, truth = _tiny_pair()
+    source = tmp_path / "truth-source.npz"
+    forged = tmp_path / "truth-forged.npz"
+    save_evaluation_truth(truth, source)
+    _rewrite_npz(
+        source,
+        forged,
+        lambda members: _replace_metadata(
+            members, lambda metadata: metadata.update({field: changed})
+        ),
+    )
+
+    with pytest.raises(ArtifactValidationError):
+        load_evaluation_truth(
+            forged,
+            expected_dataset_identity_sha256=(
+                acquisition.dataset_identity_sha256
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "canonical_image",
+        "gt_velocity",
+        "gt_acceleration",
+        "translation_trajectory",
+        "rotation_trajectory",
+    ],
+)
+def test_truth_loader_rejects_identity_inconsistent_array_with_forged_digest(
+    tmp_path, field
+):
+    acquisition, truth = _tiny_pair()
+    source = tmp_path / "truth-source.npz"
+    forged = tmp_path / "truth-forged.npz"
+    save_evaluation_truth(truth, source)
+    changed = getattr(truth, field).copy()
+    changed.flat[0] += np.asarray(0.25, dtype=changed.dtype)
+    _rewrite_npz(
+        source,
+        forged,
+        lambda members: _replace_array_and_descriptor(
+            members, field, changed
+        ),
+    )
+
+    with pytest.raises(ArtifactValidationError):
+        load_evaluation_truth(
+            forged,
+            expected_dataset_identity_sha256=(
+                acquisition.dataset_identity_sha256
+            ),
+        )
+
+
+def test_artifact_metadata_is_recursively_immutable():
+    acquisition, truth = _tiny_pair()
+    output = dataclasses.replace(
+        _raw_output(acquisition),
+        method_metadata={"solver": {"schedule": [1, 2]}},
+    )
+    truth = dataclasses.replace(
+        truth,
+        evaluator_metadata={"report": {"metrics": ["psnr"]}},
+    )
+
+    with pytest.raises(TypeError):
+        acquisition.resolved_generation_config["motion"]["parameters"][
+            "velocity"
+        ][0] = 999.0
+    with pytest.raises((TypeError, AttributeError)):
+        acquisition.dataset_identity_spec["arrays"]["patterns"]["shape"].append(
+            999
+        )
+    with pytest.raises(TypeError):
+        truth.evaluator_metadata["report"]["metrics"][0] = "ssim"
+    with pytest.raises(TypeError):
+        output.method_metadata["solver"]["schedule"][0] = 999
+
+
+@pytest.mark.parametrize(
+    "artifact_array",
+    ["acquisition", "truth", "reconstruction"],
+)
+def test_artifact_arrays_cannot_reenable_writeability(artifact_array):
+    acquisition, truth = _tiny_pair()
+    arrays = {
+        "acquisition": acquisition.patterns,
+        "truth": truth.gt_frames,
+        "reconstruction": _raw_output(acquisition).reconstruction,
+    }
+
+    with pytest.raises(ValueError):
+        arrays[artifact_array].flags.writeable = True
+
+
+def test_evaluator_revalidates_all_artifact_contracts_not_only_identity():
+    acquisition, truth = _tiny_pair()
+    output = _raw_output(acquisition)
+
+    tampered_acquisition = dataclasses.replace(acquisition)
+    changed_measurements = tampered_acquisition.measurements.copy()
+    changed_measurements[0] += 1.0
+    object.__setattr__(
+        tampered_acquisition, "measurements", changed_measurements
+    )
+    with pytest.raises(ArtifactValidationError):
+        validate_evaluation_inputs(output, tampered_acquisition, truth)
+
+    tampered_truth = dataclasses.replace(truth)
+    object.__setattr__(tampered_truth, "gt_omega", truth.gt_omega + 0.1)
+    with pytest.raises(ArtifactValidationError):
+        validate_evaluation_inputs(output, acquisition, tampered_truth)
+
+    tampered_output = dataclasses.replace(output)
+    object.__setattr__(
+        tampered_output,
+        "execution_policy",
+        MethodExecutionPolicy(
+            execution_class="blind_method_child",
+            truth_access="child_visible",
+            promotion_eligible=True,
+        ),
+    )
+    with pytest.raises(ArtifactValidationError):
+        validate_evaluation_inputs(tampered_output, acquisition, truth)
+
+    wrong_shape_output = dataclasses.replace(output)
+    object.__setattr__(
+        wrong_shape_output,
+        "reconstruction",
+        np.zeros((acquisition.T, acquisition.H, acquisition.W - 1)),
+    )
+    with pytest.raises(ArtifactValidationError):
+        validate_evaluation_inputs(wrong_shape_output, acquisition, truth)
+
+
 def test_evaluator_requires_reconstruction_acquisition_truth_identity_equality():
     acquisition, truth = _tiny_pair()
     output = _raw_output(acquisition)
@@ -513,6 +958,57 @@ def test_evaluator_requires_reconstruction_acquisition_truth_identity_equality()
                 dataset_identity_sha256="f" * 64,
             ),
         )
+
+
+def test_loader_rejects_duplicate_zip_members(tmp_path):
+    acquisition, _ = _tiny_pair()
+    path = tmp_path / "measurements.npz"
+    save_acquisition_data(acquisition, path)
+
+    with pytest.warns(UserWarning, match="Duplicate name"):
+        with zipfile.ZipFile(path, "a") as archive:
+            archive.writestr("patterns.npy", _npy_bytes(acquisition.patterns))
+
+    with pytest.raises(ArtifactValidationError, match="duplicate"):
+        load_acquisition_data(path)
+
+
+def test_deterministic_zip_uses_fixed_member_metadata(tmp_path):
+    acquisition, _ = _tiny_pair()
+    path = tmp_path / "measurements.npz"
+    save_acquisition_data(acquisition, path)
+
+    with zipfile.ZipFile(path, "r") as archive:
+        infos = archive.infolist()
+
+    assert [info.filename for info in infos] == sorted(
+        info.filename for info in infos
+    )
+    assert {info.date_time for info in infos} == {(1980, 1, 1, 0, 0, 0)}
+    assert {info.create_system for info in infos} == {3}
+    assert {info.external_attr >> 16 for info in infos} == {0o100600}
+    assert {info.compress_type for info in infos} == {zipfile.ZIP_DEFLATED}
+
+
+def test_atomic_replace_failure_preserves_target_and_cleans_temp(
+    tmp_path, monkeypatch
+):
+    import gsdiff.data._artifact_io as artifact_io
+
+    acquisition, _ = _tiny_pair()
+    path = tmp_path / "measurements.npz"
+    original = b"preexisting-target"
+    path.write_bytes(original)
+
+    def fail_replace(source, destination):
+        raise OSError("injected replace failure")
+
+    monkeypatch.setattr(artifact_io.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="injected replace failure"):
+        save_acquisition_data(acquisition, path)
+
+    assert path.read_bytes() == original
+    assert list(tmp_path.glob(".measurements.npz.*.tmp")) == []
 
 
 @pytest.mark.parametrize(
@@ -641,7 +1137,7 @@ def test_method_execution_policy_separates_blind_and_compatibility():
     )
 
     assert blind == MethodExecutionPolicy(
-        execution_class="method_child_blind",
+        execution_class="blind_method_child",
         truth_access="unavailable",
         promotion_eligible=True,
     )
@@ -694,7 +1190,7 @@ def test_raw_child_outputs_have_only_native_reconstruction_members(tmp_path):
     )
     assert method_info == {
         "dataset_identity_sha256": acquisition.dataset_identity_sha256,
-        "execution_class": "method_child_blind",
+        "execution_class": "blind_method_child",
         "method_metadata": {"solver": "direct-dgi"},
         "method_name": "dgi",
         "promotion_eligible": True,

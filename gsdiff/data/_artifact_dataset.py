@@ -13,8 +13,11 @@ from ._artifact_identity import (
     optional_readonly_array,
     readonly_array,
     sha256_bytes,
+    validate_acquisition_identity_spec,
     validate_array_descriptor,
     validate_exact_keys,
+    validate_exact_int,
+    validate_finite_number,
     validate_generation_config,
     validate_sha256,
 )
@@ -47,6 +50,8 @@ def _acquisition_arrays(
 
 
 def _validate_acquisition_shapes(data: SPIAcquisitionData) -> None:
+    for name in ("H", "W", "T", "K"):
+        validate_exact_int(getattr(data, name), name, minimum=1)
     if min(data.H, data.W, data.T, data.K) <= 0:
         raise ArtifactValidationError("H, W, T, and K must be positive")
     expected_shapes = {
@@ -84,7 +89,94 @@ def _validate_acquisition_shapes(data: SPIAcquisitionData) -> None:
 def _validate_acquisition_identity(data: SPIAcquisitionData) -> None:
     validate_sha256(data.dataset_identity_sha256, "dataset identity")
     validate_sha256(data.target_asset_sha256, "target asset hash")
+    if type(data.generator_code_version) is not str or not (
+        data.generator_code_version.strip()
+    ):
+        raise ArtifactValidationError(
+            "generator_code_version must be a non-empty string"
+        )
+    validate_exact_int(data.seed, "seed")
+    for name in (
+        "pattern_family",
+        "pattern_order",
+        "time_assignment_mode",
+        "noise_convention",
+        "motion_model",
+    ):
+        value = getattr(data, name)
+        if type(value) is not str or not value.strip():
+            raise ArtifactValidationError(f"{name} must be a non-empty string")
     _validate_acquisition_shapes(data)
+    config = validate_generation_config(data.resolved_generation_config)
+    if canonical_json_bytes(config) != canonical_json_bytes(
+        data.resolved_generation_config
+    ):
+        raise ArtifactValidationError(
+            "resolved generation config is not canonical"
+        )
+    identity_config = validate_acquisition_identity_spec(
+        data.dataset_identity_spec
+    )
+    if canonical_json_bytes(identity_config) != canonical_json_bytes(config):
+        raise ArtifactValidationError(
+            "identity config disagrees with acquisition config"
+        )
+    redundant_fields = {
+        "H": data.H,
+        "W": data.W,
+        "T": data.T,
+        "K": data.K,
+        "seed": data.seed,
+        "pattern_family": data.pattern_family,
+        "pattern_order": data.pattern_order,
+        "time_assignment_mode": data.time_assignment_mode,
+        "noise_convention": data.noise_convention,
+        "motion_model": data.motion_model,
+    }
+    expected_fields = {
+        "H": config["H"],
+        "W": config["W"],
+        "T": config["T"],
+        "K": config["K"],
+        "seed": config["seed"],
+        "pattern_family": config["pattern"]["family"],
+        "pattern_order": config["pattern"]["order"],
+        "time_assignment_mode": config["time_assignment"]["mode"],
+        "noise_convention": config["noise"]["convention"],
+        "motion_model": config["motion"]["model"],
+    }
+    if redundant_fields != expected_fields:
+        raise ArtifactValidationError(
+            "redundant acquisition fields disagree with resolved generation config"
+        )
+    if canonical_json_bytes(data.noise_parameters) != canonical_json_bytes(
+        config["noise"]["parameters"]
+    ):
+        raise ArtifactValidationError(
+            "noise parameters disagree with resolved generation config"
+        )
+    if canonical_json_bytes(data.motion_parameters) != canonical_json_bytes(
+        config["motion"]["parameters"]
+    ):
+        raise ArtifactValidationError(
+            "motion parameters disagree with resolved generation config"
+        )
+    holdout_arrays = (
+        data.holdout_patterns,
+        data.holdout_measurements,
+        data.holdout_frame_indices,
+    )
+    holdout_present = all(value is not None for value in holdout_arrays)
+    holdout_count = (
+        data.holdout_patterns.shape[0] if data.holdout_patterns is not None else 0
+    )
+    if (
+        config["holdout"]["present"] != holdout_present
+        or config["holdout"]["count"] != holdout_count
+    ):
+        raise ArtifactValidationError(
+            "holdout config disagrees with array presence or count"
+        )
     expected_spec = acquisition_identity_spec(
         arrays=_acquisition_arrays(data),
         H=data.H,
@@ -124,7 +216,11 @@ def split_spi_data(
 ) -> tuple[SPIAcquisitionData, EvaluationTruth]:
     config = validate_generation_config(resolved_generation_config)
     validate_sha256(target_asset_sha256, "target asset hash")
-    dimensions = tuple(int(config[name]) for name in ("H", "W", "T", "K"))
+    if type(generator_code_version) is not str or not generator_code_version.strip():
+        raise ArtifactValidationError(
+            "generator_code_version must be a non-empty string"
+        )
+    dimensions = tuple(config[name] for name in ("H", "W", "T", "K"))
     if dimensions != (int(data.H), int(data.W), int(data.T), int(data.K)):
         raise ArtifactValidationError(
             "resolved dimensions do not match generated SPIData"
@@ -164,6 +260,27 @@ def split_spi_data(
             data.eval_frame_idx, "holdout_frame_indices"
         ),
     }
+    holdout = config["holdout"]
+    actual_holdout_present = all(
+        arrays[name] is not None
+        for name in (
+            "holdout_patterns",
+            "holdout_measurements",
+            "holdout_frame_indices",
+        )
+    )
+    actual_holdout_count = (
+        arrays["holdout_patterns"].shape[0]
+        if arrays["holdout_patterns"] is not None
+        else 0
+    )
+    if (
+        holdout["present"] != actual_holdout_present
+        or holdout["count"] != actual_holdout_count
+    ):
+        raise ArtifactValidationError(
+            "holdout config disagrees with generated array presence or count"
+        )
     identity_spec = acquisition_identity_spec(
         arrays=arrays,
         H=data.H,
@@ -171,15 +288,15 @@ def split_spi_data(
         T=data.T,
         K=data.K,
         resolved_generation_config=config,
-        generator_code_version=str(generator_code_version),
+        generator_code_version=generator_code_version,
         target_asset_sha256=target_asset_sha256,
-        seed=int(config["seed"]),
-        pattern_family=str(pattern["family"]),
-        pattern_order=str(pattern["order"]),
-        time_assignment_mode=str(time_assignment["mode"]),
-        noise_convention=str(noise["convention"]),
+        seed=config["seed"],
+        pattern_family=pattern["family"],
+        pattern_order=pattern["order"],
+        time_assignment_mode=time_assignment["mode"],
+        noise_convention=noise["convention"],
         noise_parameters=noise["parameters"],
-        motion_model=str(motion["model"]),
+        motion_model=motion["model"],
         motion_parameters=motion_parameters,
         schema=ACQUISITION_SCHEMA,
     )
@@ -188,20 +305,20 @@ def split_spi_data(
         dataset_identity_sha256=dataset_identity_sha256,
         dataset_identity_spec=identity_spec,
         **arrays,
-        H=int(data.H),
-        W=int(data.W),
-        T=int(data.T),
-        K=int(data.K),
+        H=config["H"],
+        W=config["W"],
+        T=config["T"],
+        K=config["K"],
         resolved_generation_config=config,
-        generator_code_version=str(generator_code_version),
+        generator_code_version=generator_code_version,
         target_asset_sha256=target_asset_sha256,
-        seed=int(config["seed"]),
-        pattern_family=str(pattern["family"]),
-        pattern_order=str(pattern["order"]),
-        time_assignment_mode=str(time_assignment["mode"]),
-        noise_convention=str(noise["convention"]),
+        seed=config["seed"],
+        pattern_family=pattern["family"],
+        pattern_order=pattern["order"],
+        time_assignment_mode=time_assignment["mode"],
+        noise_convention=noise["convention"],
         noise_parameters=noise["parameters"],
-        motion_model=str(motion["model"]),
+        motion_model=motion["model"],
         motion_parameters=motion_parameters,
     )
     time_grid = np.asarray(data.t_grid, dtype=np.float64)
@@ -223,10 +340,10 @@ def split_spi_data(
         gt_acceleration=acceleration.astype(np.float32),
         gt_omega=omega,
         gt_beta=beta,
-        motion_model=str(motion["model"]),
-        H=int(data.H),
-        W=int(data.W),
-        T=int(data.T),
+        motion_model=motion["model"],
+        H=config["H"],
+        W=config["W"],
+        T=config["T"],
         evaluator_metadata={},
     )
     _validate_acquisition_identity(acquisition)
@@ -344,17 +461,22 @@ def load_acquisition_data(
     if not isinstance(dimensions, Mapping):
         raise ArtifactValidationError("dimensions must be an object")
     validate_exact_keys(dimensions, {"H", "W", "T", "K"}, "dimensions")
-    config = metadata["resolved_generation_config"]
-    if not isinstance(config, Mapping):
-        raise ArtifactValidationError(
-            "resolved_generation_config must be an object"
-        )
-    if expected_spec is not None and canonical_json_bytes(
-        config
-    ) != canonical_json_bytes(expected_spec):
-        raise ArtifactValidationError(
-            "stored acquisition does not match expected spec"
-        )
+    for name in ("H", "W", "T", "K"):
+        validate_exact_int(dimensions[name], f"dimensions.{name}", minimum=1)
+    config = validate_generation_config(metadata["resolved_generation_config"])
+    if expected_spec is not None:
+        try:
+            validated_expected_spec = validate_generation_config(expected_spec)
+        except ArtifactValidationError as exc:
+            raise ArtifactValidationError(
+                f"expected spec is invalid: {exc}"
+            ) from exc
+        if canonical_json_bytes(config) != canonical_json_bytes(
+            validated_expected_spec
+        ):
+            raise ArtifactValidationError(
+                "stored acquisition does not match expected spec"
+            )
     data = SPIAcquisitionData(
         dataset_identity_sha256=metadata["dataset_identity_sha256"],
         dataset_identity_spec=metadata["dataset_identity_spec"],
@@ -365,14 +487,14 @@ def load_acquisition_data(
         holdout_patterns=arrays.get("holdout_patterns"),
         holdout_measurements=arrays.get("holdout_measurements"),
         holdout_frame_indices=arrays.get("holdout_frame_indices"),
-        H=int(dimensions["H"]),
-        W=int(dimensions["W"]),
-        T=int(dimensions["T"]),
-        K=int(dimensions["K"]),
+        H=dimensions["H"],
+        W=dimensions["W"],
+        T=dimensions["T"],
+        K=dimensions["K"],
         resolved_generation_config=config,
         generator_code_version=metadata["generator_code_version"],
         target_asset_sha256=metadata["target_asset_sha256"],
-        seed=int(metadata["seed"]),
+        seed=metadata["seed"],
         pattern_family=metadata["pattern_family"],
         pattern_order=metadata["pattern_order"],
         time_assignment_mode=metadata["time_assignment_mode"],
@@ -415,8 +537,17 @@ def _validate_truth(data: EvaluationTruth) -> None:
     expected_identity = sha256_bytes(canonical_json_bytes(data.dataset_identity_spec))
     if data.dataset_identity_sha256 != expected_identity:
         raise ArtifactValidationError("dataset identity mismatch")
-    if data.dataset_identity_spec.get("schema") != ACQUISITION_SCHEMA:
-        raise ArtifactValidationError("truth carries an invalid identity spec")
+    config = validate_acquisition_identity_spec(data.dataset_identity_spec)
+    for name in ("H", "W", "T"):
+        validate_exact_int(getattr(data, name), f"truth {name}", minimum=1)
+    if (data.H, data.W, data.T) != (
+        config["H"],
+        config["W"],
+        config["T"],
+    ):
+        raise ArtifactValidationError(
+            "truth dimensions disagree with dataset identity"
+        )
     expected_shapes = {
         "canonical_image": (data.H, data.W),
         "gt_frames": (data.T, data.H, data.W),
@@ -425,13 +556,68 @@ def _validate_truth(data: EvaluationTruth) -> None:
         "gt_velocity": (2,),
         "gt_acceleration": (2,),
     }
-    if min(data.H, data.W, data.T) <= 0:
-        raise ArtifactValidationError("truth dimensions must be positive")
     for name, shape in expected_shapes.items():
-        if getattr(data, name).shape != shape:
+        array = getattr(data, name)
+        if array.shape != shape:
             raise ArtifactValidationError(
-                f"{name} shape must be {shape}, got {getattr(data, name).shape}"
+                f"{name} shape must be {shape}, got {array.shape}"
             )
+        if not np.all(np.isfinite(array)):
+            raise ArtifactValidationError(f"{name} must contain finite values")
+
+    motion = config["motion"]
+    motion_parameters = motion["parameters"]
+    if data.motion_model != motion["model"]:
+        raise ArtifactValidationError(
+            "truth motion model disagrees with dataset identity"
+        )
+    gt_omega = validate_finite_number(data.gt_omega, "truth gt_omega")
+    gt_beta = validate_finite_number(data.gt_beta, "truth gt_beta")
+    if (
+        gt_omega != motion_parameters["omega"]
+        or gt_beta != motion_parameters["beta"]
+    ):
+        raise ArtifactValidationError(
+            "truth angular motion disagrees with dataset identity"
+        )
+    expected_velocity = np.asarray(
+        motion_parameters["velocity"], dtype=data.gt_velocity.dtype
+    )
+    expected_acceleration = np.asarray(
+        motion_parameters["acceleration"], dtype=data.gt_acceleration.dtype
+    )
+    if not np.array_equal(data.gt_velocity, expected_velocity) or not (
+        np.array_equal(data.gt_acceleration, expected_acceleration)
+    ):
+        raise ArtifactValidationError(
+            "truth linear motion disagrees with dataset identity"
+        )
+    time_grid = np.linspace(0.0, 1.0, data.T).astype(np.float32).astype(
+        np.float64
+    )
+    expected_translation = (
+        time_grid[:, None]
+        * np.asarray(motion_parameters["velocity"], dtype=np.float64)
+        + time_grid[:, None] ** 2
+        * np.asarray(motion_parameters["acceleration"], dtype=np.float64)
+    ).astype(data.translation_trajectory.dtype)
+    expected_rotation = (
+        time_grid * float(motion_parameters["omega"])
+        + time_grid**2 * float(motion_parameters["beta"])
+    ).astype(data.rotation_trajectory.dtype)
+    if not np.array_equal(
+        data.translation_trajectory, expected_translation
+    ) or not np.array_equal(data.rotation_trajectory, expected_rotation):
+        raise ArtifactValidationError(
+            "truth trajectories disagree with dataset identity"
+        )
+    canonical_hash = sha256_bytes(
+        np.ascontiguousarray(data.canonical_image).tobytes(order="C")
+    )
+    if canonical_hash != data.dataset_identity_spec["target_asset_sha256"]:
+        raise ArtifactValidationError(
+            "truth canonical image disagrees with target asset identity"
+        )
 
 
 def save_evaluation_truth(data: EvaluationTruth, path: Path) -> str:
@@ -487,6 +673,10 @@ def load_evaluation_truth(
     if not isinstance(dimensions, Mapping):
         raise ArtifactValidationError("dimensions must be an object")
     validate_exact_keys(dimensions, {"H", "W", "T"}, "truth dimensions")
+    for name in ("H", "W", "T"):
+        validate_exact_int(dimensions[name], f"truth dimensions.{name}", minimum=1)
+    validate_finite_number(metadata["gt_omega"], "truth gt_omega")
+    validate_finite_number(metadata["gt_beta"], "truth gt_beta")
     data = EvaluationTruth(
         dataset_identity_sha256=metadata["dataset_identity_sha256"],
         dataset_identity_spec=metadata["dataset_identity_spec"],
@@ -496,12 +686,12 @@ def load_evaluation_truth(
         rotation_trajectory=arrays["rotation_trajectory"],
         gt_velocity=arrays["gt_velocity"],
         gt_acceleration=arrays["gt_acceleration"],
-        gt_omega=float(metadata["gt_omega"]),
-        gt_beta=float(metadata["gt_beta"]),
+        gt_omega=metadata["gt_omega"],
+        gt_beta=metadata["gt_beta"],
         motion_model=metadata["motion_model"],
-        H=int(dimensions["H"]),
-        W=int(dimensions["W"]),
-        T=int(dimensions["T"]),
+        H=dimensions["H"],
+        W=dimensions["W"],
+        T=dimensions["T"],
         evaluator_metadata=metadata["evaluator_metadata"],
     )
     _validate_truth(data)

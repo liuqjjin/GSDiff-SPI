@@ -3,6 +3,10 @@
 from pathlib import Path
 from typing import Mapping, Sequence
 
+from ._artifact_dataset import (
+    _validate_acquisition_identity,
+    _validate_truth,
+)
 from ._artifact_identity import (
     ArtifactValidationError,
     array_descriptor,
@@ -35,7 +39,7 @@ METHOD_INFO_SCHEMA = "method-info-v1"
 def method_execution_policy(*, truth_path: Path | None) -> MethodExecutionPolicy:
     if truth_path is None:
         return MethodExecutionPolicy(
-            execution_class="method_child_blind",
+            execution_class="blind_method_child",
             truth_access="unavailable",
             promotion_eligible=True,
         )
@@ -48,7 +52,7 @@ def method_execution_policy(*, truth_path: Path | None) -> MethodExecutionPolicy
 
 def require_promotion_eligible(policy: MethodExecutionPolicy) -> None:
     if (
-        policy.execution_class != "method_child_blind"
+        policy.execution_class != "blind_method_child"
         or policy.truth_access != "unavailable"
         or policy.promotion_eligible is not True
     ):
@@ -62,6 +66,9 @@ def validate_evaluation_inputs(
     acquisition: SPIAcquisitionData,
     truth: EvaluationTruth,
 ) -> None:
+    _validate_reconstruction(reconstruction)
+    _validate_acquisition_identity(acquisition)
+    _validate_truth(truth)
     identities = {
         reconstruction.dataset_identity_sha256,
         acquisition.dataset_identity_sha256,
@@ -70,6 +77,15 @@ def validate_evaluation_inputs(
     if len(identities) != 1:
         raise ArtifactValidationError(
             "reconstruction/acquisition/truth dataset identity mismatch"
+        )
+    expected_shape = (acquisition.T, acquisition.H, acquisition.W)
+    if reconstruction.reconstruction.shape != expected_shape:
+        raise ArtifactValidationError(
+            "reconstruction dimensions disagree with acquisition"
+        )
+    if (truth.T, truth.H, truth.W) != expected_shape:
+        raise ArtifactValidationError(
+            "truth dimensions disagree with acquisition"
         )
 
 
@@ -94,14 +110,14 @@ def _validate_reconstruction(data: ReconstructionOutput) -> None:
         raise ArtifactValidationError("method_name cannot be empty")
     policy = data.execution_policy
     if policy.execution_class not in {
-        "method_child_blind",
+        "blind_method_child",
         "compatibility_unblinded",
     }:
         raise ArtifactValidationError("unknown execution class")
     if policy.truth_access not in {"unavailable", "child_visible"}:
         raise ArtifactValidationError("unknown truth access policy")
     if (
-        policy.execution_class == "method_child_blind"
+        policy.execution_class == "blind_method_child"
         and (
             policy.truth_access != "unavailable"
             or policy.promotion_eligible is not True
