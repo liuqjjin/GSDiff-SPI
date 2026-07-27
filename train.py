@@ -41,6 +41,13 @@ def evaluate(gt_frames, recon_np, label=""):
     return psnrs, m
 
 
+def _record_sigma_used(info, prior):
+    """Record and return the diffusion sigma consumed by the completed step."""
+    sigma_used = prior.last_sigma
+    info["sigma_used"] = sigma_used
+    return sigma_used
+
+
 # ─── Visualization ────────────────────────────────────────────
 def save_comparison_figure(gt, dgi_img, recon_np, out_path, title=""):
     """Save GT vs DGI vs Recon for first/mid/last frames."""
@@ -274,14 +281,17 @@ def main():
         L = cfg.solver.num_outer
         for l in range(1, L + 1):
             info = solver.step()
+            sigma_used = None
+            if _prior_type == 'diffusion':
+                sigma_used = _record_sigma_used(info, prior)
             history.append(info)
             mp = motion.get_params_dict()
             # Per-pixel TV for readable numbers
             npix = T * H * W
             tv_pp = info['tv'] / npix
             _sigma_str = ""
-            if _prior_type == 'diffusion' and hasattr(prior, '_current_sigma'):
-                _sigma_str = f"  σ={prior._current_sigma():.4f}"
+            if sigma_used is not None:
+                _sigma_str = f"  σ={sigma_used:.4f}"
             # Honest ADMM diagnostics: prim_res is only a residual post-warmup
             # (z≡0 during warmup ⇒ prim=video energy); consist/u_norm/dual_res are
             # the real coupling terms. Print them so the convergence is legible.

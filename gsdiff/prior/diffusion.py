@@ -24,6 +24,27 @@ from .noise_schedule import NoiseSchedule
 from .unet3d import UNet3D
 
 
+def log_annealed_sigma(index: int, count: int,
+                       sigma_start: float, sigma_end: float) -> float:
+    """Return one point on an endpoint-inclusive log-linear schedule."""
+    if count < 1:
+        raise ValueError("count must be >= 1")
+    if not 0 <= index < count:
+        raise IndexError(f"index {index} outside [0, {count})")
+    if sigma_start <= 0 or sigma_end <= 0:
+        raise ValueError("sigma_start and sigma_end must be positive")
+    if count == 1:
+        return float(sigma_end)
+    if index == 0:
+        return float(sigma_start)
+    if index == count - 1:
+        return float(sigma_end)
+    t = index / (count - 1)
+    return math.exp(
+        (1.0 - t) * math.log(sigma_start) + t * math.log(sigma_end)
+    )
+
+
 class DiffusionPrior:
 
     def __init__(self, checkpoint_path: str, device='cpu',
@@ -46,6 +67,7 @@ class DiffusionPrior:
         self.sigma_start = max(sigma_min, min(sigma_start, sigma_max))
         self.sigma_end = max(sigma_min, min(sigma_end, sigma_max))
         self._call_count = 0
+        self._last_sigma = None
         # None until set_n_steps() is called (= num_outer - n_warmup). Left unset,
         # σ would collapse to sigma_end after a single z-step — proximal() raises
         # instead of silently degrading to a weak-TV-lookalike (see CLAUDE.md).
@@ -62,15 +84,22 @@ class DiffusionPrior:
 
     def set_n_steps(self, n: int):
         """Set total number of z-step calls (= num_outer - n_warmup)."""
-        self._n_steps = max(n, 1)
+        if n < 1:
+            raise ValueError("n must be >= 1")
+        self._n_steps = n
         self._call_count = 0
+        self._last_sigma = None
+
+    @property
+    def last_sigma(self) -> float | None:
+        """Sigma consumed by the most recent proximal call, if any."""
+        return self._last_sigma
 
     def _current_sigma(self) -> float:
         """Log-linear σ annealing: sigma_start → sigma_end over n_steps calls."""
-        t = min(self._call_count / self._n_steps, 1.0)
-        # log-linear interpolation (same shape as noise schedule)
-        log_s = (1.0 - t) * math.log(self.sigma_start) + t * math.log(self.sigma_end)
-        return math.exp(log_s)
+        return log_annealed_sigma(
+            self._call_count, self._n_steps, self.sigma_start, self.sigma_end
+        )
 
     # ── proximal: same signature as TVPrior.proximal ───────────
     def proximal(self, x: torch.Tensor, weight: float) -> torch.Tensor:
@@ -93,6 +122,7 @@ class DiffusionPrior:
                 "before the first z-step (σ schedule is otherwise undefined).")
 
         sigma = self._current_sigma()
+        self._last_sigma = sigma
         self._call_count += 1
 
         with torch.no_grad():
@@ -129,8 +159,8 @@ class DiffusionPrior:
         return v - sigma * eps_pred
 
     # ── internal: multi-step DDIM ──────────────────────────────
-    def _multistep_ddim(self, z_noisy, sigma_start):
-        """DDIM from sigma_start down to sigma_min."""
+    def _ddim_sigma_ladder(self, sigma_start):
+        """Build the endpoint-inclusive internal DDIM sigma ladder."""
         if self.ddim_spacing == 'log':
             sigmas = torch.logspace(
                 math.log10(sigma_start), math.log10(self.schedule.sigma_min),
@@ -139,6 +169,13 @@ class DiffusionPrior:
             sigmas = torch.linspace(
                 sigma_start, self.schedule.sigma_min,
                 self.denoise_steps + 1, device=self.device)
+        sigmas[0] = sigma_start
+        sigmas[-1] = self.schedule.sigma_min
+        return sigmas
+
+    def _multistep_ddim(self, z_noisy, sigma_start):
+        """DDIM from sigma_start down to sigma_min."""
+        sigmas = self._ddim_sigma_ladder(sigma_start)
         z = z_noisy
         z0_pred = z_noisy
         for i in range(self.denoise_steps):

@@ -368,3 +368,89 @@ This permanent append-only ledger is intentionally empty of implementation recor
   `No broken requirements found.`
 - `git diff --check` → exit `0` with silent output. All test and verifier
   output was pristine, with no warnings or unexpected skips.
+
+## Task 4 — Make diffusion annealing endpoints exact (2026-07-27)
+
+- Prior approved commit and clean starting HEAD:
+  `fbaf6c0d6a796c225988432047e1b7c96a2aed48` on
+  `debug/admm-vs-sgd`.
+- Root cause: `_current_sigma()` divided the zero-based call count by
+  `_n_steps`, so the final planned call used `(n-1)/n` and never reached
+  `sigma_end`. After each z-step, `train.py` queried `_current_sigma()` again
+  and therefore displayed the next call's sigma rather than the value just
+  consumed.
+
+### Strict TDD RED/GREEN
+
+- Pure helper RED, before the helper existed:
+  `D:\conda\envs\spi\python.exe -m pytest
+  tests/prior/test_diffusion_schedule.py -q` → exit `1` during collection with
+  the expected `ImportError: cannot import name 'log_annealed_sigma'`;
+  one collection error.
+- Minimal helper GREEN, identical command → exit `0`,
+  `10 passed in 0.06s`. The helper validates `count`, the zero-based index,
+  and positive sigma inputs; a one-call schedule returns the exact end, and
+  multi-call schedules return exact Python-float endpoints with log-linear
+  interiors.
+- Actual prior/proximal RED, before changing prior accounting:
+  the focused file → exit `1`, `9 failed, 10 passed in 0.13s`. The historical
+  four-call sequence was
+  `[0.3, 0.1916829312738817, 0.12247448713915889,
+  0.07825422900366437]`; `last_sigma` and the inspectable DDIM ladder were
+  absent, and `set_n_steps(0)` did not raise.
+- Actual prior/proximal GREEN → exit `0`, `19 passed in 0.08s`. Tests exercise
+  real `proximal()` on CPU through an actual `DiffusionPrior` constructor with
+  only the external checkpoint/model boundary replaced by a shape-preserving
+  zero-output denoiser. The real proximal input/output contract remained
+  `[T,1,H,W]`.
+- Training-history RED:
+  `D:\conda\envs\spi\python.exe -m pytest
+  tests/prior/test_diffusion_schedule.py::test_training_history_records_consumed_sigma_without_schedule_lookahead
+  -q` → exit `1` during collection with the expected missing
+  `_record_sigma_used` import.
+- Training-history GREEN, identical command → exit `0`,
+  `1 passed in 3.08s`; final focused Task 4 suite → exit `0`,
+  `20 passed in 0.55s`.
+
+### Endpoint and accounting evidence
+
+- Four outer calls consume
+  `[0.3, 0.1650963624447313, 0.09085602964160698, 0.05]`; a one-call
+  schedule consumes exactly `0.05`.
+- For requested start `0.3`, `sigma_min=0.002`, and three DDIM steps, the
+  float32 linear ladder was
+  `[0.30000001192092896, 0.2006666660308838, 0.10133333504199982,
+  0.0020000000949949026]`; the log ladder was
+  `[0.30000001192092896, 0.056462161242961884, 0.010626583360135555,
+  0.0020000000949949026]`. Both include the requested endpoints at tensor
+  precision and retain the historical decreasing order.
+- `last_sigma` starts and resets to `None`, is read-only, and is set to the
+  current outer sigma before `_call_count` increments. `set_n_steps(0)` now
+  raises `ValueError`.
+- After `solver.step()` completes the current z-step, `train.py` records the
+  public `prior.last_sigma` as `info["sigma_used"]` and uses the same value for
+  console output. A targeted tracked-Python search found `_current_sigma`
+  only in its definition and inside `DiffusionPrior.proximal`; no
+  post-proximal private lookahead label remains.
+
+### Verification
+
+- Accumulated CPU suite:
+  `D:\conda\envs\spi\python.exe -m pytest -m "not cuda" -q` → exit `0`,
+  `104 passed, 1 deselected in 15.31s`.
+- Real CUDA suite:
+  `D:\conda\envs\spi\python.exe -m pytest -m cuda -q` → exit `0`,
+  `1 passed, 104 deselected in 1.07s`; exactly one CUDA test executed and
+  zero skipped.
+- Full suite:
+  `D:\conda\envs\spi\python.exe -m pytest -q` → exit `0`,
+  `105 passed in 23.91s`.
+- Strict environment verification → exit `0`, fingerprint
+  `b5d6922a9f3a9638ee8826b9a74f00998cd3ac81aa25c03de016358e0e435a56`.
+- Strict implementation-provenance verification → exit `0`; four immutable
+  inputs verified at the pre-Task commit
+  `fbaf6c0d6a796c225988432047e1b7c96a2aed48`.
+- `D:\conda\envs\spi\python.exe -m pip check` → exit `0`,
+  `No broken requirements found.`
+- `git diff --check` → exit `0` with silent output. All test and verifier
+  output was pristine, with no warnings or unexpected skips.
