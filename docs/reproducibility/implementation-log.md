@@ -934,3 +934,133 @@ This permanent append-only ledger is intentionally empty of implementation recor
 - `git diff --check` → exit `0` with silent output. The diff contained only
   the three intended Task 7 test files plus this append-only ledger entry.
   Output was pristine, with no warnings or unexpected skips.
+
+## Task 8 — Add `metrics-v1` and explicit legacy metrics (2026-07-27)
+
+- Clean approved base:
+  `2c8b34329b6f3759b91d8b452a3e9c49c6e4a6b7` on
+  `debug/admm-vs-sgd`; tracked and untracked status was empty before work.
+- Legacy inventory before implementation found one deliberately preserved
+  formula. `train.evaluate` and `gsdiff.baselines.common.evaluate_video` both
+  clipped each reconstruction frame below at zero, independently min-max
+  normalized reconstruction and ground truth with a constant-range threshold
+  of `1e-8`, and passed the pair to `gsdiff.utils.psnr_fn`, whose
+  `MSE < 1e-12` branch returned the historical 60-dB sentinel. DGI instead
+  independently min-max normalized one DGI image and the canonical image and
+  used the same 60-dB helper. These formulas were preserved under explicit
+  legacy names rather than selected as primary metrics.
+- The plan's opening file list and staging example omitted the sole real
+  `baselines.json` writer, `scripts/run_baselines.py`, while the binding task
+  requirement mandated a root legacy definition label for that file. The
+  scoped resolution was to modify only that writer's serialization: no
+  baseline algorithm, execution, method-child behavior, or unrelated field
+  changed.
+
+### RED and GREEN evidence
+
+- Known-affine import RED was captured while `gsdiff.evaluation` did not
+  exist:
+  `D:\conda\envs\spi\python.exe -m pytest
+  tests\evaluation\test_metrics.py -q` → exit `1`,
+  `ModuleNotFoundError: No module named 'gsdiff.evaluation'`, one collection
+  error in `0.10s`.
+- API-only `NotImplementedError` placeholders then allowed all behavior and
+  input contracts to be written before implementation. Edge-contract RED →
+  exit `1`, `20 failed in 0.19s`; every failure reached the intentional
+  placeholder. Coverage included known-affine recovery, differing frame-gain
+  cheating, constant predictions, negative correlation, explicit negative
+  slope opt-out, clipped float64 application, metadata, non-array/non-numeric/
+  mismatched/nonfinite/malformed inputs, and the SSIM spatial boundary.
+- Minimal pure-metric GREEN → exit `0`, `20 passed in 0.29s`.
+- Serialization integration tests were then added before integration.
+  Integration RED → exit `1`, `22 passed, 2 failed in 0.91s`; the failures
+  were the intentionally absent `_write_metrics_json` and
+  `_write_baselines_json`.
+- Final focused GREEN:
+  `D:\conda\envs\spi\python.exe -m pytest
+  tests\evaluation\test_metrics.py -q` → exit `0`,
+  `24 passed in 0.89s`. A later fresh focused run after annotations was
+  `24 passed in 1.39s`. The existing results/history writer regression suite
+  also remained GREEN: `30 passed in 0.70s`.
+- Pre-staging self-review found that zero-length spatial axes passed the
+  general 3-D validation and reached inconsistent downstream behavior:
+  `fit_global_affine` returned `(0,0)` with NumPy empty-reduction warnings,
+  `apply_global_affine` returned an empty array, and the two evaluators raised
+  different downstream errors. The focused contract RED was
+  `2 failed, 24 deselected, 10 warnings in 0.34s`. The root cause was the
+  validator checking non-empty `T` but not non-empty `H,W`; the minimal shared
+  validation added an explicit positive-spatial-dimension error. Final
+  focused GREEN → exit `0`, `26 passed in 1.12s`, with no warnings.
+
+### Definitions and integration
+
+- `fit_global_affine` solves one float64 least-squares system
+  `[recon_flat, ones] @ [slope, intercept] ~= gt_flat` over the complete
+  video. The default nonnegative policy selects
+  `slope=0, intercept=mean(gt)` when the unconstrained slope is negative or
+  when
+  `variance(recon) <= eps64 * max(1, mean(recon**2))`.
+- `apply_global_affine` returns the one float64
+  `clip(slope * recon + intercept, 0, 1)` array consumed unchanged by all
+  primary image metrics. Primary PSNR is
+  `-10 log10(max(MSE, 1e-12))`, capped numerically at 120 dB; SSIM is the
+  mean of per-frame `structural_similarity` values with `data_range=1` and
+  fixed `win_size=7`, requiring `H,W >= 7`; nRMSE is
+  `||aligned-gt||_2 / max(||gt||_2, eps64)`.
+- Known-affine recovery measured slope `1.6999999999999988`, intercept
+  `0.20000000000000026`, PSNR `120.0` dB, and nRMSE
+  `3.407460242541517e-16`.
+- The two-frame differing-gain fixture measured global slope
+  `0.33189361218458746`, intercept `0.292566492384633`, primary PSNR
+  `12.998621540547393` dB, and legacy PSNR `60.0` dB: a
+  `47.00137845945261`-dB cheating gap. Constant prediction and negative
+  correlation both selected the boundary `(0.0, 0.5)` and returned finite
+  metrics; opting out of the nonnegative constraint recovered slope `-1` and
+  intercept `1`.
+- `metrics.json` is written once after final reconstruction from the final
+  `[T,H,W]` reconstruction and ground truth. Its root contains
+  `definition_version="metrics-v1"`,
+  `psnr_global_affine`, `ssim_global_affine`,
+  `nrmse_global_affine_l2`, labelled
+  `psnr_legacy_per_frame_minmax`, `alignment`, and JSON-native
+  `metric_definition` metadata including the variance, clipping, PSNR, SSIM,
+  and nRMSE policies.
+- Compatibility `results.json` preserves `mean_psnr`, `per_frame_psnr`,
+  `dgi_psnr`, history, and all existing fields, while declaring root
+  `metric_definition_version="legacy-per-frame-minmax-v1"`. Its aliases are
+  `mean_psnr_legacy_per_frame_minmax`,
+  `per_frame_psnr_legacy_per_frame_minmax`, and the deliberately distinct
+  `dgi_psnr_legacy_canonical_minmax_60db`. It contains no primary global
+  affine key.
+- `baselines.json` declares the same root legacy definition. Every method row
+  preserves `mean_psnr` and `per_frame_psnr` and adds
+  `mean_psnr_legacy_per_frame_minmax` and
+  `per_frame_psnr_legacy_per_frame_minmax`. Only the common compatibility
+  adapter calls `evaluate_video_legacy_per_frame`; no baseline method child
+  directly imports or calls it.
+
+### Verification
+
+- Fresh accumulated CPU suite after the self-review fix → exit `0`,
+  `211 passed, 1 deselected in 13.33s`.
+- Real CUDA suite → exit `0`,
+  `1 passed, 211 deselected in 1.19s`; exactly one executed and zero skipped.
+- Full suite → exit `0`, `212 passed in 13.72s`.
+- Strict environment verification → exit `0`, fingerprint
+  `b5d6922a9f3a9638ee8826b9a74f00998cd3ac81aa25c03de016358e0e435a56`.
+- Strict implementation-provenance verification → exit `0`; four immutable
+  inputs verified at the approved base
+  `2c8b34329b6f3759b91d8b452a3e9c49c6e4a6b7`.
+- `D:\conda\envs\spi\python.exe -m pip check` → exit `0`,
+  `No broken requirements found.`
+- Independent formula audit matched the direct least-squares, clipped-array,
+  PSNR, SSIM, and nRMSE calculations exactly. The audit fixture measured
+  slope `0.52233394585058834`, intercept `0.15599013272581511`, PSNR
+  `22.636881044371059`, SSIM `0.71673241888650085`, and nRMSE
+  `0.13080952673187204`.
+- Targeted key/boundary audit reported one and only one train metrics-writer
+  call, zero method-child references to the explicit legacy evaluator, strict
+  separation of `metrics.json` from `results.json`/`baselines.json`, and all
+  required root labels and aliases.
+- `git diff --check` → exit `0` with silent output. Test and verifier output
+  was pristine, with no warnings or unexpected skips.

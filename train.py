@@ -13,6 +13,10 @@ import numpy as np, torch, yaml
 
 from gsdiff.utils import (set_seed, get_device, ensure_dir, normalize_01,
                            psnr_fn, to_native, save_gif, _to_ns)
+from gsdiff.evaluation.metrics import (
+    evaluate_video_global_affine,
+    evaluate_video_legacy_per_frame,
+)
 from gsdiff.scene import GaussianScene2D
 from gsdiff.motion import SE2Motion
 from gsdiff.forward import SPIForwardModel
@@ -29,14 +33,10 @@ def parse_args():
 
 
 def evaluate(gt_frames, recon_np, label=""):
-    """Per-frame PSNR between GT and reconstruction (both [T,H,W] numpy)."""
-    T = gt_frames.shape[0]
-    psnrs = []
-    for t in range(T):
-        g = normalize_01(gt_frames[t])
-        r = normalize_01(np.clip(recon_np[t], 0, None))
-        psnrs.append(psnr_fn(r, g))
-    m = float(np.mean(psnrs))
+    """Compatibility adapter for explicitly labelled legacy PSNR."""
+    result = evaluate_video_legacy_per_frame(gt_frames, recon_np)
+    psnrs = result["per_frame_psnr_legacy_per_frame_minmax"]
+    m = result["psnr_legacy_per_frame_minmax"]
     print(f"  {label:8s} PSNR: {m:.2f} dB  [first={psnrs[0]:.1f}, last={psnrs[-1]:.1f}]")
     return psnrs, m
 
@@ -50,14 +50,32 @@ def _record_sigma_used(info, prior):
 
 
 def _write_results_json(path, results, history):
-    """Persist the summary and scalar iteration history to one JSON payload."""
+    """Persist explicitly labelled legacy compatibility results and history."""
     scalar_history = [
         {key: value for key, value in entry.items() if key != "video"}
         for entry in history
     ]
-    payload = to_native({**results, "history": scalar_history})
+    payload = {**results, "history": scalar_history}
+    payload["metric_definition_version"] = "legacy-per-frame-minmax-v1"
+    aliases = {
+        "mean_psnr": "mean_psnr_legacy_per_frame_minmax",
+        "per_frame_psnr": "per_frame_psnr_legacy_per_frame_minmax",
+        "dgi_psnr": "dgi_psnr_legacy_canonical_minmax_60db",
+    }
+    for compatibility_name, explicit_name in aliases.items():
+        if compatibility_name in payload:
+            payload[explicit_name] = payload[compatibility_name]
+    payload = to_native(payload)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
+
+
+def _write_metrics_json(path, gt_frames, recon_np):
+    """Evaluate the final video once and persist the primary metrics payload."""
+    payload = evaluate_video_global_affine(gt_frames, recon_np)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, allow_nan=False)
+    return payload
 
 
 # ─── Visualization ────────────────────────────────────────────
@@ -399,6 +417,9 @@ def main():
     # ── 7. Evaluate ───────────────────────────────────────────
     print("\n=== Results ===")
     psnrs, mean_p = evaluate(data.gt_frames, recon_np, cfg.solver.type)
+    _write_metrics_json(
+        os.path.join(out_dir, "metrics.json"), data.gt_frames, recon_np
+    )
 
     me = motion.get_params_dict()
     vel_err = [abs(float(me['velocity'][i]) - float(data.gt_velocity[i])) for i in range(2)]

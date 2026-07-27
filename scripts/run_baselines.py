@@ -24,6 +24,24 @@ from gsdiff.baselines.common import dgi_image, evaluate_video
 ALL = ["dgi", "static_cs", "perframe_cs", "tv3d", "monin", "gidc3dtv", "recinr"]
 
 
+def _write_baselines_json(path, summary):
+    """Write a legacy-labelled baseline payload with explicit row aliases."""
+    payload = dict(summary)
+    payload["metric_definition_version"] = "legacy-per-frame-minmax-v1"
+    payload["baselines"] = {
+        name: {
+            **row,
+            "mean_psnr_legacy_per_frame_minmax": row["mean_psnr"],
+            "per_frame_psnr_legacy_per_frame_minmax": row[
+                "per_frame_psnr"
+            ],
+        }
+        for name, row in summary["baselines"].items()
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, default=float)
+
+
 def _gen(cfg):
     dd = cfg["data"]
     return generate_spi_data(
@@ -101,8 +119,7 @@ def main():
                "gt_omega": cfg["data"].get("gt_omega"), "snr_db": cfg["data"].get("snr_db"),
                "num_patterns": cfg["data"].get("num_patterns"),
                "elapsed": time.time() - t0, "baselines": merged}
-    with open(bpath, "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2, default=float)
+    _write_baselines_json(bpath, summary)
     print(f"→ {out_dir}/baselines.json  ({summary['elapsed']:.0f}s)")
 
 

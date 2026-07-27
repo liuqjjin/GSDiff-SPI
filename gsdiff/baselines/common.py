@@ -9,13 +9,14 @@ Conventions (verified against the baseline specs, 2026-07):
   materialized A and A.T are provably adjoint. This matches SPIForwardModel.measure.
 - Measurements are conditioned by DIVIDING by their global std (NO mean removal;
   mean removal would break physical non-negativity and desync A from y).
-- Evaluation is per-frame normalize_01 then psnr_fn — identical to train.evaluate().
+- Compatibility evaluation is the explicitly named legacy per-frame min-max
+  definition — identical to train.evaluate().
 """
 import numpy as np
 import torch
 
+from ..evaluation.metrics import evaluate_video_legacy_per_frame
 from ..prior.tv import TVPrior
-from ..utils import normalize_01, psnr_fn
 from ..data.dgi import dgi_reconstruct
 
 
@@ -102,13 +103,14 @@ def dgi_image(patterns, measurements):
 
 # ── Comparison-neutral evaluation (identical to train.evaluate) ──
 def evaluate_video(gt_frames, recon):
-    """Per-frame PSNR: normalize_01 both, clip recon>=0, psnr_fn. → (psnrs, mean)."""
+    """Compatibility adapter for legacy per-frame min-max PSNR."""
     gt = gt_frames.cpu().numpy() if torch.is_tensor(gt_frames) else np.asarray(gt_frames)
     rc = recon.cpu().numpy() if torch.is_tensor(recon) else np.asarray(recon)
-    T = gt.shape[0]
-    psnrs = [psnr_fn(normalize_01(np.clip(rc[t], 0, None)), normalize_01(gt[t]))
-             for t in range(T)]
-    return psnrs, float(np.mean(psnrs))
+    result = evaluate_video_legacy_per_frame(gt, rc)
+    return (
+        result["per_frame_psnr_legacy_per_frame_minmax"],
+        result["psnr_legacy_per_frame_minmax"],
+    )
 
 
 # ── GT-free hyperparameter selection ─────────────────────────

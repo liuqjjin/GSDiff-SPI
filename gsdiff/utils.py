@@ -22,15 +22,23 @@ def load_config(path):
 
 def ensure_dir(p): os.makedirs(p, exist_ok=True)
 
-def psnr_fn(pred, target):
+def psnr_legacy_60db(pred, target):
+    """Historical PSNR helper with a 60-dB exact-recovery sentinel."""
     mse = np.mean((pred - target)**2)
     if mse < 1e-12: return 60.0
     return 10 * np.log10(1.0 / mse)
 
-def normalize_01(x):
+
+def normalize_01_legacy_minmax(x):
+    """Historical min-max normalization, including its constant-image policy."""
     lo, hi = x.min(), x.max()
     if hi - lo < 1e-8: return np.zeros_like(x)
     return (x - lo) / (hi - lo)
+
+
+# Backward-compatible names used throughout visualization and older scripts.
+psnr_fn = psnr_legacy_60db
+normalize_01 = normalize_01_legacy_minmax
 
 def to_native(obj):
     if isinstance(obj, (np.floating,)): return float(obj)
