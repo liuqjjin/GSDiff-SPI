@@ -1933,3 +1933,72 @@ This permanent append-only ledger is intentionally empty of implementation recor
 - CUDA and the full suite were not repeated for this annotation-only repair;
   the prior Fix Round 2 real-CUDA/JUnit and full-suite gates remain the latest
   behavioral evidence. No final Task 10 closure was written.
+
+## Task 10 implementation closure — Reviewer approved (2026-07-27)
+
+### Exact implementation range
+
+- Approved Task 10 base:
+  `a4211fe372476afb9a48a672b9589c47810d7aa4`.
+- Feature commit:
+  `c5b75d30cf7942f863d98c1f783e539737cdef4c`
+  (`feat: add canonical experiment identities`).
+- Fix Round 1:
+  `cde16b25aa9fb98fe97fa0f0b110d555211f0707`
+  (`fix: close run identity trust gaps`).
+- Fix Round 2:
+  `8d44c28cede13beeb7df7e6f814c748a19ab0b71`
+  (`fix: detect hidden tracked source changes`).
+- Fix Round 3:
+  `cf52494c3c6c9a4f1dec309c22e4fd308c574c10`
+  (`fix: correct source input annotation`).
+- The exact implementation commit range is
+  `c5b75d30cf7942f863d98c1f783e539737cdef4c^..cf52494c3c6c9a4f1dec309c22e4fd308c574c10`.
+
+### Approved interface deviation
+
+- The controller approved replacing the information-incomplete
+  `git_state(repo)` Task 10 interface with required
+  `git_state(repo, source_roots)` and no unsafe default.
+- Conventional whole-repository Git dirtiness remains enforced. Source-aware
+  cleanliness additionally compares the exact actual `source-tree-v1`
+  snapshot with the deterministic clean-HEAD snapshot under the same
+  validated roots, exclusions, path ordering, and index/working framing.
+  Thus ignored source inputs and tracked content, presence, index, or mode
+  differences hidden from porcelain are dirty, while an unchanged flagged
+  file, ignored input outside the roots, and an exact excluded ignored input
+  remain scientifically clean.
+- Existing Windows roots use filesystem identity for unique Git spelling;
+  fully deleted pure-ASCII case aliases require one unique Git prefix,
+  non-ASCII missing aliases fail closed, and ambiguous case-colliding
+  candidates fail closed.
+
+### Final accumulated implementation evidence
+
+- Final focused identity suite after the annotation correction:
+  `111 passed in 32.56s`.
+- Final independent identity/runtime/environment compatibility suite:
+  `130 passed in 32.98s`.
+- Latest accumulated CPU behavioral suite:
+  `486 passed, 1 deselected in 50.87s`.
+- Latest real CUDA suite:
+  `1 passed, 486 deselected in 1.17s`; the fresh JUnit verifier reported
+  `tests=1 failures=0 errors=0 skipped=0`.
+- Latest full behavioral suite:
+  `487 passed in 52.39s`.
+- `compileall` completed silently with exit `0`.
+- Strict environment verification passed with fingerprint
+  `b5d6922a9f3a9638ee8826b9a74f00998cd3ac81aa25c03de016358e0e435a56`.
+- Strict implementation-provenance verification passed with four immutable
+  inputs at final implementation commit
+  `cf52494c3c6c9a4f1dec309c22e4fd308c574c10`.
+- `pip check` reported `No broken requirements found.`
+- Independent parent-versus-Fix-Round-2 source-tree audits were byte-exact
+  across clean, unstaged, staged, staged/worktree-HEAD, ignored-untracked,
+  staged-delete, and index-mode states.
+- Final independent review verdict: **APPROVED**, with
+  **0 Blocker, 0 Major, 0 Minor** open findings.
+
+This closes the Task 10 implementation ledger only. It does not claim the
+separate final plan-completion gate, which remains to be run after this
+immutable closure commit.
