@@ -1755,3 +1755,77 @@ This permanent append-only ledger is intentionally empty of implementation recor
   silently with exit `0`.
 - `D:\conda\envs\spi\python.exe -m pip check` completed with exit `0`:
   `No broken requirements found.`
+
+## Task 10 Fix Round 1 — Close run identity trust gaps (2026-07-27)
+
+- Fix Round 1 started from exact reviewed commit
+  `c5b75d30cf7942f863d98c1f783e539737cdef4c` with parent
+  `a4211fe372476afb9a48a672b9589c47810d7aa4` and a clean worktree.
+- Independent review reported zero blocker, two major, and one minor finding:
+  ignored identity-bearing source did not dirty the Git state; Windows
+  case-only direct-file roots could discard the staged index view; and the
+  recursively read-only payload could not pass through the public canonical
+  JSON serializer.
+
+### Approved corrective interface deviation
+
+- The controller approved replacing the information-incomplete
+  `git_state(repo)` Task 10 interface with required
+  `git_state(repo, source_roots)`. There is no unsafe default. The explicit
+  roots are validated and scanned through the same collector used by
+  `source_tree_sha256()`.
+- Conventional whole-repository Git status remains authoritative for tracked
+  and ordinary untracked changes. In addition, any ignored untracked regular
+  input in the source-root scan makes the state dirty. Ignored inputs outside
+  the roots and exact artifact, result, cache, environment, trash, and
+  generated-paper exclusions inside them do not independently dirty the
+  state.
+- Existing Windows roots and direct files are reconciled to a unique Git
+  spelling only through `os.path.samefile`. Multiple case-colliding Git
+  candidates fail closed. A fully deleted root first uses exact Git spelling;
+  Windows additionally permits one unique pure-ASCII case-only prefix, so
+  deleted `src` and `SRC` produce the same hash. Missing non-ASCII lookalikes
+  such as `straße` and `strasse` are never folded and fail closed.
+- `canonical_json_bytes()` now recursively normalizes public read-only
+  mappings and tuples before serialization. The payload remains recursively
+  immutable, and serializing `identity.payload()` returns the exact stored
+  canonical bytes.
+
+### RED/GREEN evidence
+
+- The combined focused RED run reported
+  `8 failed, 100 deselected in 3.26s`. The failures directly reproduced the
+  mapping-proxy serialization error; the required source-aware Git-state
+  interface and three ignored-path classifications; the case-only direct-file
+  staged-content collision; the fully deleted ASCII alias rejection; and
+  missing ambiguity rejection for case-colliding Git paths.
+- The same group plus the existing non-ASCII missing-root regression was
+  GREEN at `9 passed, 99 deselected in 4.70s`.
+- Final focused identity suite:
+  `108 passed in 24.82s`.
+- Identity plus existing runtime/environment-lock compatibility suites:
+  `127 passed in 26.93s`.
+
+### Fix Round 1 verification
+
+- Accumulated CPU suite → exit `0`,
+  `484 passed, 1 deselected in 45.00s`.
+- Fresh real CUDA suite → exit `0`,
+  `1 passed, 484 deselected in 1.20s`; the checked-in JUnit verifier reported
+  `tests=1 failures=0 errors=0 skipped=0`.
+- Full suite → exit `0`, `485 passed in 45.62s`.
+- `D:\conda\envs\spi\python.exe -m compileall -q gsdiff scripts train.py`
+  completed silently with exit `0`.
+- Strict environment verification → exit `0`, fingerprint
+  `b5d6922a9f3a9638ee8826b9a74f00998cd3ac81aa25c03de016358e0e435a56`.
+- Strict implementation-provenance verification → exit `0`; four immutable
+  inputs verified at current commit
+  `c5b75d30cf7942f863d98c1f783e539737cdef4c`.
+- `D:\conda\envs\spi\python.exe -m pip check` → exit `0`,
+  `No broken requirements found.`
+- Live source-aware Git-state audit returned exact commit
+  `c5b75d30cf7942f863d98c1f783e539737cdef4c`, branch
+  `debug/admm-vs-sgd`, `dirty=true`, the required baseline, and source-tree
+  hash `f1391109e6db65336782c469631be12cac0757c86d88ddc810c8e4948445468d`
+  for `gsdiff`, `scripts`, and `train.py`.
+- `git diff --check` completed silently with exit `0`.

@@ -92,7 +92,7 @@ _RUN_IDENTITY_FIELDS = frozenset(
 
 def canonical_json_bytes(value: Any) -> bytes:
     return json.dumps(
-        value,
+        _normalize_json(value),
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
@@ -373,9 +373,18 @@ def build_run_identity(
     )
 
 
-def git_state(repo: Path) -> dict[str, object]:
-    resolved_repo = Path(repo).resolve(strict=True)
-    commit = _git_bytes(resolved_repo, "rev-parse", "HEAD").strip().decode(
+def git_state(
+    repo: Path, source_roots: Sequence[Path]
+) -> dict[str, object]:
+    (
+        resolved_repo,
+        head,
+        head_modes,
+        index_entries,
+        _tracked_paths,
+        scanned_files,
+    ) = _collect_source_inputs(repo, source_roots)
+    commit = head.decode(
         "ascii", errors="strict"
     )
     branch_result = subprocess.run(
@@ -397,10 +406,14 @@ def git_state(repo: Path) -> dict[str, object]:
         check=True,
         capture_output=True,
     ).stdout
+    all_tracked_paths = head_modes.keys() | index_entries.keys()
+    has_untracked_source_input = any(
+        relative not in all_tracked_paths for relative in scanned_files
+    )
     return {
         "commit": commit,
         "branch": branch,
-        "dirty": bool(status),
+        "dirty": bool(status) or has_untracked_source_input,
         "baseline": _GIT_BASELINE,
     }
 
@@ -494,19 +507,70 @@ def _path_is_in_source_roots(relative: str, roots: tuple[str, ...]) -> bool:
     )
 
 
-def _canonical_tracked_root(
+def _tracked_root_prefixes(
     relative: str, tracked_paths: set[str]
-) -> str | None:
+) -> set[str]:
     root_parts = tuple(relative.split("/"))
     candidates: set[str] = set()
     for tracked_path in tracked_paths:
         tracked_parts = tuple(tracked_path.split("/"))
         if len(tracked_parts) < len(root_parts):
             continue
-        prefix = tracked_parts[: len(root_parts)]
-        if prefix == root_parts:
-            candidates.add("/".join(prefix))
-    return candidates.pop() if len(candidates) == 1 else None
+        candidates.add("/".join(tracked_parts[: len(root_parts)]))
+    return candidates
+
+
+def _canonical_existing_root(
+    repo: Path,
+    path: Path,
+    relative: str,
+    tracked_paths: set[str],
+) -> str:
+    if os.name != "nt":
+        return relative
+    same_paths: set[str] = set()
+    for candidate in _tracked_root_prefixes(relative, tracked_paths):
+        candidate_path = repo.joinpath(*candidate.split("/"))
+        try:
+            if candidate_path.exists() and os.path.samefile(path, candidate_path):
+                same_paths.add(candidate)
+        except OSError as error:
+            raise ValueError(
+                f"source root identity cannot be resolved: {path}"
+            ) from error
+    if len(same_paths) > 1:
+        raise ValueError(
+            f"ambiguous case-colliding Git source roots for {relative!r}"
+        )
+    return same_paths.pop() if same_paths else relative
+
+
+def _ascii_lower(value: str) -> str | None:
+    try:
+        value.encode("ascii", errors="strict")
+    except UnicodeEncodeError:
+        return None
+    return value.lower()
+
+
+def _canonical_missing_root(
+    relative: str, tracked_paths: set[str]
+) -> str | None:
+    candidates = _tracked_root_prefixes(relative, tracked_paths)
+    exact = {candidate for candidate in candidates if candidate == relative}
+    if len(exact) == 1:
+        return exact.pop()
+    if os.name != "nt":
+        return None
+    folded = _ascii_lower(relative)
+    if folded is None:
+        return None
+    matching = {
+        candidate
+        for candidate in candidates
+        if _ascii_lower(candidate) == folded
+    }
+    return matching.pop() if len(matching) == 1 else None
 
 
 def _resolve_inside_repo(repo: Path, path: Path) -> Path:
@@ -535,10 +599,10 @@ def _is_reparse_or_symlink(path_stat: os.stat_result) -> bool:
 def _scan_source_path(
     repo: Path,
     path: Path,
+    relative: str,
     files: set[str],
     active_directories: set[str],
 ) -> None:
-    relative = _repo_relative(repo, path)
     if relative and _is_excluded_source_path(relative):
         return
     path_stat = _lstat(path)
@@ -568,10 +632,18 @@ def _scan_source_path(
         )
         for entry in entries:
             child = Path(entry.path)
-            child_relative = _repo_relative(repo, child)
+            child_relative = (
+                f"{relative}/{entry.name}" if relative else entry.name
+            )
             if _is_excluded_source_path(child_relative):
                 continue
-            _scan_source_path(repo, child, files, active_directories)
+            _scan_source_path(
+                repo,
+                child,
+                child_relative,
+                files,
+                active_directories,
+            )
     finally:
         active_directories.remove(directory_key)
 
@@ -601,7 +673,7 @@ def _normalize_source_roots(
             resolved = lexical.resolve(strict=False)
             if not _is_within_repo(repo, resolved):
                 raise ValueError(f"source root escapes the repository: {root}")
-            canonical_relative = _canonical_tracked_root(
+            canonical_relative = _canonical_missing_root(
                 relative, tracked_paths
             )
             if canonical_relative is None:
@@ -615,7 +687,12 @@ def _normalize_source_roots(
                     f"source root symlink or reparse point is not regular: {root}"
                 )
             lexical = resolved
-            relative = _repo_relative(repo, lexical)
+            relative = _canonical_existing_root(
+                repo,
+                lexical,
+                _repo_relative(repo, lexical),
+                tracked_paths,
+            )
         if relative and _is_excluded_source_path(relative):
             raise ValueError(f"source root is excluded by literal policy: {root}")
         paths[relative] = lexical
@@ -625,38 +702,17 @@ def _normalize_source_roots(
     return tuple(paths[relative] for relative in ordered_relatives), ordered_relatives
 
 
-def _effective_executable_mode(
-    path: Path,
-    relative: str,
-    head_modes: Mapping[str, str],
-    index_entries: Mapping[str, tuple[str, str]],
-) -> bool:
-    index_entry = index_entries.get(relative)
-    if os.name == "nt":
-        return (
-            index_entry[0] if index_entry is not None else head_modes.get(relative)
-        ) == "100755"
-    return bool(path.stat().st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH))
-
-
-def _update_source_snapshot_frame(
-    digest: Any,
-    marker: bytes,
-    executable: bool | None,
-    content: bytes | None,
-) -> None:
-    digest.update(marker)
-    if content is None:
-        digest.update(b"-")
-        digest.update((0).to_bytes(8, "big"))
-        digest.update(b"\0" * 32)
-        return
-    digest.update(b"X" if executable else b"R")
-    digest.update(len(content).to_bytes(8, "big"))
-    digest.update(hashlib.sha256(content).digest())
-
-
-def source_tree_sha256(repo: Path, source_roots: Sequence[Path]) -> str:
+def _collect_source_inputs(
+    repo: Path,
+    source_roots: Sequence[Path],
+) -> tuple[
+    Path,
+    bytes,
+    dict[str, str],
+    dict[str, tuple[str, str]],
+    set[str],
+    set[str],
+]:
     resolved_repo = Path(repo).resolve(strict=True)
     if (
         _git_bytes(resolved_repo, "rev-parse", "--is-inside-work-tree").strip()
@@ -703,10 +759,66 @@ def source_tree_sha256(repo: Path, source_roots: Sequence[Path]) -> str:
                 f"for source path {relative!r}"
             )
     scanned_files: set[str] = set()
-    for root in roots:
+    for root, relative in zip(roots, root_relatives, strict=True):
         if _lstat(root) is None:
             continue
-        _scan_source_path(resolved_repo, root, scanned_files, set())
+        _scan_source_path(
+            resolved_repo,
+            root,
+            relative,
+            scanned_files,
+            set(),
+        )
+    return (
+        resolved_repo,
+        head,
+        head_modes,
+        index_entries,
+        tracked_paths,
+        scanned_files,
+    )
+
+
+def _effective_executable_mode(
+    path: Path,
+    relative: str,
+    head_modes: Mapping[str, str],
+    index_entries: Mapping[str, tuple[str, str]],
+) -> bool:
+    index_entry = index_entries.get(relative)
+    if os.name == "nt":
+        return (
+            index_entry[0] if index_entry is not None else head_modes.get(relative)
+        ) == "100755"
+    return bool(path.stat().st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH))
+
+
+def _update_source_snapshot_frame(
+    digest: Any,
+    marker: bytes,
+    executable: bool | None,
+    content: bytes | None,
+) -> None:
+    digest.update(marker)
+    if content is None:
+        digest.update(b"-")
+        digest.update((0).to_bytes(8, "big"))
+        digest.update(b"\0" * 32)
+        return
+    digest.update(b"X" if executable else b"R")
+    digest.update(len(content).to_bytes(8, "big"))
+    digest.update(hashlib.sha256(content).digest())
+
+
+def source_tree_sha256(repo: Path, source_roots: Sequence[Path]) -> str:
+    (
+        resolved_repo,
+        head,
+        head_modes,
+        index_entries,
+        tracked_paths,
+        scanned_files,
+    ) = _collect_source_inputs(repo, source_roots)
     effective_paths = tracked_paths | scanned_files
 
     digest = hashlib.sha256()

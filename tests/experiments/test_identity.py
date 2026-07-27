@@ -198,6 +198,15 @@ def test_payload_returns_a_new_recursively_read_only_decoding():
         first["assets_sha256"]["target"] = "0" * 64  # type: ignore[index]
 
 
+def test_public_canonical_json_serializes_read_only_payload_to_stored_bytes():
+    run_identity = _make_identity()
+
+    assert (
+        identity.canonical_json_bytes(run_identity.payload())
+        == run_identity.canonical_payload_json
+    )
+
+
 def test_run_identity_rejects_mutable_noncanonical_or_hash_mismatched_bytes():
     valid = _make_identity()
 
@@ -527,7 +536,7 @@ def test_only_exact_blind_method_child_execution_is_accepted(
 def test_git_state_reports_full_commit_branch_cleanliness_and_baseline(
     git_repo: Path,
 ):
-    state = identity.git_state(git_repo)
+    state = identity.git_state(git_repo, [Path("src")])
 
     assert state == {
         "commit": _git(git_repo, "rev-parse", "HEAD"),
@@ -538,7 +547,36 @@ def test_git_state_reports_full_commit_branch_cleanliness_and_baseline(
     assert len(state["commit"]) == 40
 
     (git_repo / "src" / "main.py").write_text("VALUE = 2\n", encoding="utf-8")
-    assert identity.git_state(git_repo)["dirty"] is True
+    assert identity.git_state(git_repo, [Path("src")])["dirty"] is True
+
+
+def test_git_state_treats_ignored_untracked_input_inside_source_root_as_dirty(
+    git_repo: Path,
+):
+    assert identity.git_state(git_repo, [Path("src")])["dirty"] is False
+    (git_repo / "src" / "plugin.ignored.py").write_text(
+        "PLUGIN = True\n", encoding="utf-8"
+    )
+
+    assert identity.git_state(git_repo, [Path("src")])["dirty"] is True
+
+
+def test_git_state_ignores_literal_exclusion_inside_source_root(git_repo: Path):
+    ignored_cache = git_repo / "src" / "__pycache__" / "plugin.ignored.py"
+    ignored_cache.parent.mkdir()
+    ignored_cache.write_text("CACHE = True\n", encoding="utf-8")
+
+    assert identity.git_state(git_repo, [Path("src")])["dirty"] is False
+
+
+def test_git_state_ignores_ignored_untracked_input_outside_source_roots(
+    git_repo: Path,
+):
+    (git_repo / "docs" / "plugin.ignored.py").write_text(
+        "PLUGIN = True\n", encoding="utf-8"
+    )
+
+    assert identity.git_state(git_repo, [Path("src")])["dirty"] is False
 
 
 @pytest.mark.parametrize(
@@ -560,7 +598,7 @@ def test_unicode_git_repo_roots_use_explicit_utf8(
     _git(repo, "commit", "-m", "initial")
 
     source_hash = identity.source_tree_sha256(repo, [Path("src")])
-    state = identity.git_state(repo)
+    state = identity.git_state(repo, [Path("src")])
 
     assert len(source_hash) == 64
     assert state["commit"] == _git(repo, "rev-parse", "HEAD")
@@ -764,6 +802,68 @@ def test_source_root_case_alias_cannot_create_a_second_windows_identity(
     source.write_bytes(head_content)
 
     assert identity.source_tree_sha256(git_repo, [Path("SRC")]) != canonical
+
+
+def test_case_only_direct_file_root_keeps_staged_index_content_on_windows(
+    git_repo: Path,
+):
+    if os.name != "nt":
+        pytest.skip("Windows filesystem identity regression")
+
+    original = git_repo / "src" / "main.py"
+    canonical = git_repo / "src" / "Main.py"
+    _git(git_repo, "mv", "src/main.py", "src/Main.py")
+    _git(git_repo, "commit", "-m", "canonical mixed-case source")
+    canonical.rename(original)
+    head_content = original.read_bytes()
+    before = identity.source_tree_sha256(git_repo, [Path("src/main.py")])
+
+    original.write_text("VALUE = 999\n", encoding="utf-8")
+    _git(git_repo, "add", "-u")
+    original.write_bytes(head_content)
+
+    assert _git(git_repo, "diff", "--cached", "--name-only") == "src/Main.py"
+    assert identity.source_tree_sha256(
+        git_repo, [Path("src/main.py")]
+    ) != before
+
+
+def test_fully_deleted_ascii_case_alias_uses_unique_git_prefix_on_windows(
+    git_repo: Path,
+):
+    if os.name != "nt":
+        pytest.skip("Windows filesystem identity regression")
+
+    _git(git_repo, "rm", "src/main.py")
+
+    canonical = identity.source_tree_sha256(git_repo, [Path("src")])
+    alias = identity.source_tree_sha256(git_repo, [Path("SRC")])
+    assert alias == canonical
+
+
+def test_ambiguous_case_colliding_git_paths_fail_closed_on_windows(
+    git_repo: Path,
+):
+    if os.name != "nt":
+        pytest.skip("Windows filesystem identity regression")
+
+    object_id = subprocess.run(
+        ["git", "hash-object", "-w", "--stdin"],
+        cwd=git_repo,
+        check=True,
+        input=b"VALUE = 2\n",
+        capture_output=True,
+    ).stdout.decode("ascii").strip()
+    _git(
+        git_repo,
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        f"100644,{object_id},src/Main.py",
+    )
+
+    with pytest.raises(ValueError, match="ambiguous|unique|colliding"):
+        identity.source_tree_sha256(git_repo, [Path("src/main.py")])
 
 
 def test_missing_source_root_does_not_use_unicode_casefold_alias(

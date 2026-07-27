@@ -104,18 +104,25 @@ Resolved configurations are recursively copied into ordinary JSON mappings and
 arrays before compact, sorted-key UTF-8 serialization. NaN and infinities are
 rejected. The run identity stores only those immutable canonical bytes; their
 SHA-256 is the full storage identity. `RunIdentity.payload()` decodes a new
-recursively read-only view for each manifest consumer. Direct dataclass
-construction revalidates the complete field set, canonical bytes, blind
-execution class, IDs, hashes, dirty/source pairing, payload hash, and display
-ID, so it cannot bypass the builder gate.
+recursively read-only view for each manifest consumer.
+`canonical_json_bytes(identity.payload())` returns the exact stored canonical
+bytes, including when the view contains nested read-only mapping proxies and
+tuples. Direct dataclass construction revalidates the complete field set,
+canonical bytes, blind execution class, IDs, hashes, dirty/source pairing,
+payload hash, and display ID, so it cannot bypass the builder gate.
 
 A clean identity requires `dirty_worktree=false` and a null source-tree hash.
 A diagnostic dirty identity requires `dirty_worktree=true` and a valid
 source-tree SHA-256. Publication campaigns reject dirty execution, and later
 aggregation/promotion code must not treat diagnostic runs as locked evidence.
-`git_state()` reports the full commit, symbolic branch (or null when detached),
-complete Git dirtiness including untracked files, and evidence baseline
-`c03420784bc92b4e9b9eef8330cbd9571ebebc68`.
+`git_state(repo, source_roots)` requires the same explicit source roots as
+`source_tree_sha256()`. It reports the full commit, symbolic branch (or null
+when detached), and evidence baseline
+`c03420784bc92b4e9b9eef8330cbd9571ebebc68`. Its dirty flag preserves
+whole-repository Git dirtiness for tracked and ordinary untracked files, and
+additionally treats ignored untracked regular inputs inside the validated
+source roots as dirty. Ignored files outside the roots and exact literal
+exclusions inside them do not independently dirty the worktree.
 
 ### `source-tree-v1` framing
 
@@ -124,12 +131,15 @@ resolved Git worktree root. Those roots are the only allowlist for both tracked
 and untracked paths. An ignored untracked file inside a root is included; the
 implementation deliberately does not consult `.gitignore`. HEAD paths, index
 paths, and scanned working files outside the roots do not enter the hash.
-Existing roots are canonicalized to their resolved filesystem spelling; a
-missing root that represents staged deletion is accepted only under its unique
-exact Git path prefix. Existing Windows case aliases therefore use filesystem
-proof, while nonexistent Unicode lookalikes fail closed rather than relying on
-over-broad case folding. This prevents one physical directory from creating a
-second identity or losing the index view.
+Existing Windows roots, including direct files, are reconciled to a unique Git
+prefix only when `samefile` proves the filesystem object is identical; multiple
+case-colliding Git candidates fail closed. A missing root that represents
+staged deletion uses an exact Git prefix on all platforms. On Windows, a
+pure-ASCII case-only alias is additionally accepted only when it maps to one
+unique Git prefix. Missing non-ASCII lookalikes fail closed rather than using
+Unicode lower- or case-folding. Thus `src` and fully deleted `SRC` share one
+deletion identity, while `straße` cannot alias `strasse`, and a case-only
+direct-file root cannot discard its staged index view.
 
 Git subprocess output is captured as bytes. Commit and mode fields use strict
 ASCII; Git paths and symbolic branch names use strict UTF-8. Worktree-root
