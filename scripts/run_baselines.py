@@ -11,13 +11,22 @@ Usage:
         --baselines dgi static_cs perframe_cs monin gidc3dtv
 """
 import argparse, json, os, sys, time
+from pathlib import Path
+from types import SimpleNamespace
 import numpy as np
 import torch
 import yaml
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
-from gsdiff.data import generate_spi_data
+from gsdiff.data import (
+    ReconstructionOutput,
+    generate_spi_data,
+    load_acquisition_data,
+    load_evaluation_truth,
+    method_execution_policy,
+    write_method_child_outputs,
+)
 from gsdiff.baselines import cs, monin, gidc, recinr, tv3d
 from gsdiff.baselines.common import dgi_image, evaluate_video
 
@@ -57,23 +66,83 @@ def _gen(cfg):
         holdout_extra=int(dd.get("holdout_extra", 250) or 250))
 
 
-def main():
+def _compatibility_data(acquisition, truth):
+    return SimpleNamespace(
+        **vars(acquisition),
+        frame_idx=acquisition.frame_indices,
+        t_grid=acquisition.time_grid,
+        eval_patterns=acquisition.holdout_patterns,
+        eval_measurements=acquisition.holdout_measurements,
+        eval_frame_idx=acquisition.holdout_frame_indices,
+        gt_frames=truth.gt_frames,
+        gt_velocity=truth.gt_velocity,
+    )
+
+
+def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
     ap.add_argument("--name", required=True)
     ap.add_argument("--baselines", nargs="+", default=ALL)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    args = ap.parse_args()
+    ap.add_argument("--measurements-path", default=None)
+    ap.add_argument("--truth-path", default=None)
+    ap.add_argument("--output-dir", default=None)
+    args = ap.parse_args(argv)
 
     with open(args.config, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
-    data = _gen(cfg)
+    measurements_path = (
+        Path(args.measurements_path).expanduser().resolve(strict=True)
+        if args.measurements_path
+        else None
+    )
+    truth_path = (
+        Path(args.truth_path).expanduser().resolve(strict=True)
+        if args.truth_path
+        else None
+    )
+    if truth_path is not None and measurements_path is None:
+        raise ValueError("--truth-path requires --measurements-path")
+    blind_method_child = measurements_path is not None and truth_path is None
+    execution_policy = method_execution_policy(truth_path=truth_path)
+    acquisition = None
+    if measurements_path is not None:
+        if not isinstance(cfg.get("dataset_spec"), dict):
+            raise ValueError(
+                "method-child config requires complete dataset_spec"
+            )
+        acquisition = load_acquisition_data(
+            measurements_path, expected_spec=cfg["dataset_spec"]
+        )
+        data = acquisition
+        if truth_path is not None:
+            truth = load_evaluation_truth(
+                truth_path,
+                expected_dataset_identity_sha256=(
+                    acquisition.dataset_identity_sha256
+                ),
+            )
+            data = _compatibility_data(acquisition, truth)
+    else:
+        data = _gen(cfg)
     dev = args.device
-    out_dir = os.path.join(REPO, "results", args.name)
+    out_dir = args.output_dir or os.path.join(REPO, "results", args.name)
     os.makedirs(out_dir, exist_ok=True)
     rows = {}
+    raw_result = None
+    if blind_method_child and (
+        len(args.baselines) != 1 or args.baselines[0] != "dgi"
+    ):
+        raise ValueError(
+            "blind run_baselines currently supports one dgi method child"
+        )
 
     def record(name, recon, info=None):
+        nonlocal raw_result
+        if blind_method_child:
+            raw_result = (name, np.asarray(recon), info or {})
+            return
         psnrs, mean_p = evaluate_video(data.gt_frames, recon)
         row = {"mean_psnr": mean_p, "per_frame_psnr": psnrs}
         if info:
@@ -104,6 +173,33 @@ def main():
         recon, info = recinr.recinr_baseline(data, device=dev, seed=cfg.get("seed", 42))
         record("recinr", recon, info)
 
+    if blind_method_child:
+        if raw_result is None:
+            raise RuntimeError("selected method did not produce a reconstruction")
+        method_name, reconstruction, info = raw_result
+        dgi = np.asarray(reconstruction[0], dtype=np.float32)
+        output = ReconstructionOutput(
+            dataset_identity_sha256=acquisition.dataset_identity_sha256,
+            reconstruction=reconstruction.astype(np.float32, copy=False),
+            dgi=dgi,
+            estimated_motion_trajectory=np.zeros(
+                (acquisition.T, 3), dtype=np.float32
+            ),
+            frame_indices=np.arange(acquisition.T, dtype=np.int64),
+            time_grid=acquisition.time_grid,
+            method_name=method_name,
+            method_metadata={
+                "baseline": method_name,
+                "device": dev,
+                "motion_estimate_available": False,
+                **info,
+            },
+            execution_policy=execution_policy,
+        )
+        write_method_child_outputs(Path(out_dir), output, history=[])
+        print(f"→ {out_dir}/reconstruction.npz")
+        return
+
     # MERGE with an existing baselines.json so re-running a subset of baselines
     # (e.g. a fixed one) updates only those rows and keeps the rest.
     bpath = os.path.join(out_dir, "baselines.json")
@@ -119,6 +215,12 @@ def main():
                "gt_omega": cfg["data"].get("gt_omega"), "snr_db": cfg["data"].get("snr_db"),
                "num_patterns": cfg["data"].get("num_patterns"),
                "elapsed": time.time() - t0, "baselines": merged}
+    if truth_path is not None:
+        summary.update({
+            "execution_class": execution_policy.execution_class,
+            "truth_access": execution_policy.truth_access,
+            "promotion_eligible": execution_policy.promotion_eligible,
+        })
     _write_baselines_json(bpath, summary)
     print(f"→ {out_dir}/baselines.json  ({summary['elapsed']:.0f}s)")
 

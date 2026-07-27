@@ -336,6 +336,147 @@ This permanent append-only ledger is intentionally empty of implementation recor
 - `git diff --check` → exit `0` with silent output. Test and verifier output
   was pristine, with no warnings or unexpected skips.
 
+## Task 9 — Add immutable SPI dataset artifacts (2026-07-27)
+
+- Prior approved commit and clean starting HEAD:
+  `fd91434f3a48864b58027b3fd03f9a28e0cf1781` on
+  `debug/admm-vs-sgd`. Tracked status was empty before work.
+- Schema inventory covered the complete pre-change `SPIData` surface:
+  canonical image, GT frames, measurement patterns/values/frame indices/time
+  grid, GT velocity/omega, motion type, H/W/T/K/SNR, and optional independent
+  eval patterns/values/frame indices. Generator-only acceleration, beta,
+  time-assignment, pattern-order, and absolute-noise inputs were not retained
+  in `SPIData`; the artifact split therefore requires the complete resolved
+  generation config and derives explicit translation/rotation trajectories
+  from its velocity/acceleration/omega/beta values.
+- The frozen acquisition schema contains only patterns, measurements,
+  measurement frame indices, time grid, optional holdout arrays, H/W/T/K,
+  complete acquisition/generator metadata, and the shared dataset identity.
+  The frozen truth schema contains the canonical image, GT video, translation
+  and rotation trajectories, GT motion parameters, and evaluator-only
+  metadata. No opaque Python object or pickle field is accepted.
+
+### RED and GREEN evidence
+
+- Initial import RED, after the round-trip test existed and before any
+  production module:
+  `D:\conda\envs\spi\python.exe -m pytest
+  tests/data/test_artifacts.py -q` → exit `1`,
+  `ModuleNotFoundError: No module named 'gsdiff.data.artifacts'`, one
+  collection error in `0.14s`.
+- All deterministic, corruption/mismatch, forbidden-field, capability,
+  entry-point, and raw-output tests were then written before behavior
+  implementation. A frozen API-only `NotImplementedError` skeleton produced
+  behavior RED: exit `1`, `28 failed in 3.05s`; every test reached an
+  intentional unimplemented public contract.
+- Core artifact GREEN for round-trip, deterministic bytes, canonical
+  identity, acquisition isolation, absent holdout, and direct file hash:
+  `6 passed, 22 deselected in 0.45s`.
+- Full pre-entrypoint isolation was `25 passed, 3 failed in 3.50s`: one test
+  expected object-array rejection at save although the frozen constructor
+  rejected it earlier, and the two intentional entry-point failures were
+  `train.main` lacking argv support and `run_baselines.py` rejecting the new
+  CLI arguments.
+- The approved structure adjustment split the initially large focused module
+  without changing its public API. Final responsibility boundaries are:
+  `artifacts.py` public facade (49 lines), frozen models (162), canonical
+  identity/array descriptors (210), deterministic atomic I/O (149),
+  acquisition/truth codecs (508), and reconstruction/policy outputs (301).
+  After the move, `compileall` passed, core remained
+  `6 passed, 22 deselected`, and the full suite preserved the exact
+  `25 passed, 3 known failed` state.
+- Entry-point GREEN:
+  `D:\conda\envs\spi\python.exe -m pytest
+  tests/data/test_artifacts.py -q` → exit `0`,
+  `29 passed in 5.61s`. Both real `main` paths completed while
+  `generate_spi_data` was patched to raise. `train.py` executed one real SGD
+  reconstruction step; `run_baselines.py` executed the real DGI method.
+  A print-only compatibility defect exposed by the tiny holdout
+  (`None` per-frame probe residual formatted as a float) was fixed to print
+  `n/a`; no metric definition or value changed.
+
+### Identity, integrity, and capability boundary
+
+- `dataset_identity_sha256` is SHA-256 of canonical UTF-8 JSON with sorted
+  keys, compact separators, no NaN, and these exact top-level keys:
+  `schema`, `resolved_generation_config`, `generator_code_version`,
+  `target_asset_sha256`, `seed`, `pattern_family`, `pattern_order`,
+  `time_assignment_mode`, `noise`, `motion`, `dimensions`, and `arrays`.
+  `schema` is `measurements-v1`; `noise` carries convention plus parameters;
+  `motion` carries model plus parameters including velocity, acceleration,
+  omega, and beta; every acquisition array entry is either explicit null or
+  an exact dtype/shape/content-SHA descriptor. The complete resolved config
+  is included verbatim after canonical JSON normalization.
+- The truth file declares `evaluation-truth-v1` outside the shared
+  identity-bearing acquisition spec and has its own truth-array descriptors.
+  This keeps the paired identity equal while ensuring acquisition metadata
+  never names or exposes canonical/GT/truth/trajectory/evaluator fields.
+  Acquisition and truth file-byte SHA-256 values remain separate integrity
+  values.
+- Deterministic NPZ uses NPY members, uint8 NPY
+  `__metadata_json__`, lexicographically sorted ZIP members, the fixed
+  `1980-01-01 00:00:00` timestamp, fixed Unix mode, DEFLATE level 9, and
+  ZIP64 disabled. Saves go to a sibling temporary file, flush and `fsync`,
+  close, then `os.replace`; failure cleanup removes the temporary sibling.
+- Loaders reject malformed ZIP/JSON/NPY, object arrays, missing or extra
+  members, inconsistent optional-array flags, wrong schema, dtype/shape/hash
+  mismatch, inconsistent identity specs, and wrong expected identity.
+  `expected_spec` compares canonical complete mappings, so missing, extra, or
+  changed time assignment, pattern family/order, noise convention, or motion
+  model fails closed. Truth loading requires an explicit expected identity;
+  seed and target swaps fail before evaluation. The evaluator helper requires
+  reconstruction, acquisition, and truth identities to be equal.
+- The real DGI method child ran with a cwd initially containing exactly
+  `measurements.npz`. Its argv contained the Python executable, baseline
+  entry point, non-truth config, method name, DGI selection, CPU device,
+  relative measurements path, and output directory. Its sanitized environment
+  contained only PATH, PYTHON encoding/path, and SYSTEMROOT; argv, environment,
+  and cwd contained no truth path/capability. It wrote only
+  `reconstruction.npz`, `iteration-history.jsonl`, and `method-info.json`.
+  A separate deliberate process attempting to open
+  `evaluation-truth.npz` failed with `FileNotFoundError`.
+- Blind raw reconstruction members are `reconstruction`, optional `dgi`,
+  `estimated_motion_trajectory`, `frame_indices`, `time_grid`, and canonical
+  metadata. Both real entry paths were audited to contain no config, image,
+  GIF, checkpoint, results, metrics, canonical/GT/evaluator/display-normalized
+  value, or GT-derived metric in their blind output directories.
+- Explicit measurement plus truth compatibility paths load the truth only
+  from the explicit argument and label results with
+  `execution_class="compatibility_unblinded"`,
+  `truth_access="child_visible"`, and `promotion_eligible=false`. The public
+  `require_promotion_eligible` guard rejects this policy. Task 9 contains no
+  `build_run_identity` reference. Per the approved sequencing clarification,
+  the explicit identity-builder rejection test is deferred to Task 10, where
+  that function is introduced along with complete-manifest and
+  content-addressed run-root enforcement.
+
+### Verification
+
+- Focused artifact suite → exit `0`, `29 passed in 5.61s`.
+- Accumulated CPU suite → exit `0`,
+  `243 passed, 1 deselected in 18.42s`.
+- Real CUDA suite → exit `0`,
+  `1 passed, 243 deselected in 1.13s`; exactly one CUDA test executed and
+  zero skipped.
+- Full suite → exit `0`, `244 passed in 17.69s`.
+- Strict environment verification → exit `0`, fingerprint
+  `b5d6922a9f3a9638ee8826b9a74f00998cd3ac81aa25c03de016358e0e435a56`.
+- Strict implementation-provenance verification → exit `0`; four immutable
+  inputs verified at approved Task 9 base
+  `fd91434f3a48864b58027b3fd03f9a28e0cf1781`.
+- `D:\conda\envs\spi\python.exe -m pip check` → exit `0`,
+  `No broken requirements found.`
+- Independent five-save deterministic audit produced one acquisition hash
+  `e3290d03b049d73c942cfa130f8c3490bcf33ce1c65fe5774152879aac0fbd02`
+  and one truth hash
+  `065dea4c23c4ac529f9cd5b3dcccd3a5906343322b41f6d581b39ee54af1ae75`;
+  every returned hash equalled the direct file-byte hash.
+- Forbidden-field/capability source audit reported
+  `acquisition_forbidden_dataclass_fields=0` and
+  `task9_build_run_identity_references=0`.
+- `git diff --check` → exit `0` with silent output. Test and verifier output
+  was pristine, with no warnings or unexpected skips.
+
 ## Task 8 Fix Round 1 — Stabilize global affine metrics (2026-07-27)
 
 - Clean independent-fix base:

@@ -7,6 +7,8 @@ Usage:
     python train.py --config configs/default.yaml
 """
 import argparse, json, os, time
+from pathlib import Path
+from types import SimpleNamespace
 import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np, torch, yaml
@@ -22,14 +24,26 @@ from gsdiff.motion import SE2Motion
 from gsdiff.forward import SPIForwardModel
 from gsdiff.prior import TVPrior, TVPrior3D
 from gsdiff.solver import ADMMSolver, SGDSolver
-from gsdiff.data import generate_spi_data, dgi_reconstruct
+from gsdiff.data import (
+    ReconstructionOutput,
+    dgi_reconstruct,
+    generate_spi_data,
+    load_acquisition_data,
+    load_evaluation_truth,
+    method_execution_policy,
+    write_method_child_outputs,
+)
 
 
-def parse_args():
+def parse_args(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument("--config", default="configs/default.yaml")
     p.add_argument("--solver", default=None)
-    return p.parse_args()
+    p.add_argument("--measurements-path", default=None)
+    p.add_argument("--truth-path", default=None)
+    p.add_argument("--output-dir", default=None)
+    p.add_argument("--device", default=None)
+    return p.parse_args(argv)
 
 
 def evaluate(gt_frames, recon_np, label=""):
@@ -142,8 +156,40 @@ def save_loss_curve(history, out_path, solver_type):
 
 
 # ─── Main ─────────────────────────────────────────────────────
-def main():
-    args = parse_args()
+def _compatibility_data(acquisition, truth):
+    return SimpleNamespace(
+        **vars(acquisition),
+        frame_idx=acquisition.frame_indices,
+        t_grid=acquisition.time_grid,
+        eval_patterns=acquisition.holdout_patterns,
+        eval_measurements=acquisition.holdout_measurements,
+        eval_frame_idx=acquisition.holdout_frame_indices,
+        canonical=truth.canonical_image,
+        gt_frames=truth.gt_frames,
+        gt_velocity=truth.gt_velocity,
+        gt_omega=truth.gt_omega,
+        motion_type=truth.motion_model,
+    )
+
+
+def _estimated_motion_trajectory(motion_parameters, time_grid):
+    times = np.asarray(time_grid, dtype=np.float64)
+    velocity = np.asarray(motion_parameters["velocity"], dtype=np.float64)
+    acceleration = np.asarray(
+        motion_parameters.get("accel", [0.0, 0.0]), dtype=np.float64
+    )
+    translation = (
+        times[:, None] * velocity + times[:, None] ** 2 * acceleration
+    )
+    rotation = (
+        times * float(motion_parameters.get("omega", 0.0))
+        + times**2 * float(motion_parameters.get("beta", 0.0))
+    )
+    return np.column_stack((translation, rotation)).astype(np.float32)
+
+
+def main(argv=None):
+    args = parse_args(argv)
     with open(args.config, encoding='utf-8') as f:
         raw = yaml.safe_load(f)
     cfg = _to_ns(raw)
@@ -151,59 +197,96 @@ def main():
         cfg.solver.type = args.solver
 
     set_seed(cfg.seed)
-    dev = get_device()
-    out_dir = cfg.output_dir
+    dev = torch.device(args.device) if args.device else get_device()
+    out_dir = args.output_dir or cfg.output_dir
     ensure_dir(out_dir)
 
-    with open(os.path.join(out_dir, "config.yaml"), "w", encoding='utf-8') as f:
-        yaml.dump(raw, f)
+    measurements_path = (
+        Path(args.measurements_path).expanduser().resolve(strict=True)
+        if args.measurements_path
+        else None
+    )
+    truth_path = (
+        Path(args.truth_path).expanduser().resolve(strict=True)
+        if args.truth_path
+        else None
+    )
+    if truth_path is not None and measurements_path is None:
+        raise ValueError("--truth-path requires --measurements-path")
+    blind_method_child = measurements_path is not None and truth_path is None
+    execution_policy = method_execution_policy(truth_path=truth_path)
+
+    if not blind_method_child:
+        with open(os.path.join(out_dir, "config.yaml"), "w", encoding='utf-8') as f:
+            yaml.dump(raw, f)
 
     print(f"Device: {dev}, Solver: {cfg.solver.type}")
 
-    # ── 1. Generate data ──────────────────────────────────────
-    H, W = cfg.data.image_size
-    T, K = cfg.data.num_frames, cfg.data.num_patterns
-
-    _time_mode = getattr(cfg.data, 'time_assignment_mode', 'uniform')
-
-    data = generate_spi_data(
-        H=H, W=W, T=T, K=K,
-        pattern_type=cfg.data.pattern_type,
-        motion_type=cfg.data.motion_type,
-        speed_factor=cfg.data.speed_factor,
-        snr_db=cfg.data.snr_db,
-        seed=cfg.seed,
-        shape=cfg.data.shape,
-        motion_mode=cfg.data.motion_mode,
-        gt_velocity=list(cfg.data.gt_velocity) if hasattr(cfg.data, 'gt_velocity') else None,
-        gt_omega=cfg.data.gt_omega if hasattr(cfg.data, 'gt_omega') else None,
-        gt_accel=list(cfg.data.gt_accel) if getattr(cfg.data, 'gt_accel', None) else None,
-        gt_beta=getattr(cfg.data, 'gt_beta', None),
-        noise_sigma_abs=getattr(cfg.data, 'noise_sigma_abs', None),
-        holdout_extra=int(getattr(cfg.data, 'holdout_extra', 0) or 0),
-        time_assignment_mode=_time_mode,
-        pattern_order=getattr(cfg.data, 'pattern_order', 'sequential'),
-    )
+    # ── 1. Generate or load data ──────────────────────────────
+    if measurements_path is not None:
+        if not isinstance(raw.get("dataset_spec"), dict):
+            raise ValueError(
+                "method-child config requires complete dataset_spec"
+            )
+        acquisition = load_acquisition_data(
+            measurements_path, expected_spec=raw["dataset_spec"]
+        )
+        data = acquisition
+        if truth_path is not None:
+            truth = load_evaluation_truth(
+                truth_path,
+                expected_dataset_identity_sha256=(
+                    acquisition.dataset_identity_sha256
+                ),
+            )
+            data = _compatibility_data(acquisition, truth)
+        H, W, T, K = acquisition.H, acquisition.W, acquisition.T, acquisition.K
+        _time_mode = acquisition.time_assignment_mode
+    else:
+        H, W = cfg.data.image_size
+        T, K = cfg.data.num_frames, cfg.data.num_patterns
+        _time_mode = getattr(cfg.data, 'time_assignment_mode', 'uniform')
+        data = generate_spi_data(
+            H=H, W=W, T=T, K=K,
+            pattern_type=cfg.data.pattern_type,
+            motion_type=cfg.data.motion_type,
+            speed_factor=cfg.data.speed_factor,
+            snr_db=cfg.data.snr_db,
+            seed=cfg.seed,
+            shape=cfg.data.shape,
+            motion_mode=cfg.data.motion_mode,
+            gt_velocity=list(cfg.data.gt_velocity) if hasattr(cfg.data, 'gt_velocity') else None,
+            gt_omega=cfg.data.gt_omega if hasattr(cfg.data, 'gt_omega') else None,
+            gt_accel=list(cfg.data.gt_accel) if getattr(cfg.data, 'gt_accel', None) else None,
+            gt_beta=getattr(cfg.data, 'gt_beta', None),
+            noise_sigma_abs=getattr(cfg.data, 'noise_sigma_abs', None),
+            holdout_extra=int(getattr(cfg.data, 'holdout_extra', 0) or 0),
+            time_assignment_mode=_time_mode,
+            pattern_order=getattr(cfg.data, 'pattern_order', 'sequential'),
+        )
 
     # Update T in case motion_mode=1 changed it
     T = data.T
 
-    print(f"Data: {H}x{W}, T={T}, K={K}, motion={data.motion_type}")
-    print(f"GT vel={data.gt_velocity}, omega={data.gt_omega:.4f}")
+    motion_label = (
+        acquisition.motion_model if measurements_path is not None
+        else data.motion_type
+    )
+    print(f"Data: {H}x{W}, T={T}, K={K}, motion={motion_label}")
+    if not blind_method_child:
+        print(f"GT vel={data.gt_velocity}, omega={data.gt_omega:.4f}")
     print(f"Meas range: [{data.measurements.min():.1f}, {data.measurements.max():.1f}]")
 
     # ── 2. DGI baseline ──────────────────────────────────────
     print("\nDGI reconstruction...")
     dgi_img = dgi_reconstruct(data.patterns, data.measurements)
-    dgi_psnr = psnr_fn(normalize_01(dgi_img), normalize_01(data.canonical))
-    print(f"  DGI PSNR (vs canonical): {dgi_psnr:.2f} dB  (motion-blurred)")
-
-    # Save DGI
-    plt.imsave(os.path.join(out_dir, "dgi_recon.png"),
-               normalize_01(dgi_img), cmap='gray')
-
-    # Save GT GIF
-    save_gif(data.gt_frames, os.path.join(out_dir, "gt_video.gif"), fps=5)
+    dgi_psnr = None
+    if not blind_method_child:
+        dgi_psnr = psnr_fn(normalize_01(dgi_img), normalize_01(data.canonical))
+        print(f"  DGI PSNR (vs canonical): {dgi_psnr:.2f} dB  (motion-blurred)")
+        plt.imsave(os.path.join(out_dir, "dgi_recon.png"),
+                   normalize_01(dgi_img), cmap='gray')
+        save_gif(data.gt_frames, os.path.join(out_dir, "gt_video.gif"), fps=5)
 
     # ── 3. Convert to torch ───────────────────────────────────
     pat = torch.tensor(data.patterns, device=dev)
@@ -411,8 +494,39 @@ def main():
             if int(m.sum()) >= 4:
                 pf.append(_zs_residual(y_pred_ev[m], y_ev[m]))
         eval_residual_pf = float(np.mean(pf)) if pf else None
+        eval_residual_pf_text = (
+            f"{eval_residual_pf:.6f}"
+            if eval_residual_pf is not None
+            else "n/a"
+        )
         print(f"  Eval residual (Ke={len(data.eval_measurements)}): "
-              f"global {eval_residual:.6f}  per-frame {eval_residual_pf:.6f}")
+              f"global {eval_residual:.6f}  per-frame {eval_residual_pf_text}")
+
+    if blind_method_child:
+        me = motion.get_params_dict()
+        output = ReconstructionOutput(
+            dataset_identity_sha256=acquisition.dataset_identity_sha256,
+            reconstruction=recon_np.astype(np.float32, copy=False),
+            dgi=np.asarray(dgi_img, dtype=np.float32),
+            estimated_motion_trajectory=_estimated_motion_trajectory(
+                me, acquisition.time_grid
+            ),
+            frame_indices=np.arange(T, dtype=np.int64),
+            time_grid=acquisition.time_grid,
+            method_name=f"gsdiff-{cfg.solver.type}",
+            method_metadata={
+                "scene_type": _scene_type,
+                "solver": cfg.solver.type,
+                "train_residual": train_residual,
+                "holdout_residual": holdout_residual,
+                "measurement_probe_residual": eval_residual,
+                "measurement_probe_residual_per_frame": eval_residual_pf,
+            },
+            execution_policy=execution_policy,
+        )
+        write_method_child_outputs(Path(out_dir), output, history=history)
+        print(f"\nRaw method-child outputs saved to: {out_dir}")
+        return None
 
     # ── 7. Evaluate ───────────────────────────────────────────
     print("\n=== Results ===")
@@ -476,6 +590,12 @@ def main():
         "eval_residual": eval_residual,
         "eval_residual_pf": eval_residual_pf,
     })
+    if truth_path is not None:
+        results.update({
+            "execution_class": execution_policy.execution_class,
+            "truth_access": execution_policy.truth_access,
+            "promotion_eligible": execution_policy.promotion_eligible,
+        })
     _write_results_json(os.path.join(out_dir, "results.json"), results, history)
 
     # Checkpoint
