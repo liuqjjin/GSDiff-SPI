@@ -83,7 +83,7 @@ def test_seed_11_changes_stochastic_arrays_but_not_deterministic_targets():
     seed_7 = _generate(seed=7, holdout_extra=16)
     seed_11 = _generate(seed=11, holdout_extra=16)
 
-    for name in ("canonical", "gt_frames", "frame_idx", "t_grid"):
+    for name in ("canonical", "gt_frames", "frame_idx", "t_grid", "eval_frame_idx"):
         assert np.array_equal(getattr(seed_7, name), getattr(seed_11, name)), name
 
     for name in ("patterns", "measurements", *HOLDOUT_ARRAYS[:2]):

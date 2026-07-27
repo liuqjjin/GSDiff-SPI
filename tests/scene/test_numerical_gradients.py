@@ -86,6 +86,26 @@ def test_no_rotation_identity_follows_double_motion_time():
     _assert_float64_cpu_creations(recorder, ["eye"])
 
 
+def test_double_motion_converts_registered_center_with_parameters():
+    motion = SE2Motion((1.5, 3.0), enable_rotation=True).double()
+
+    assert motion.center.dtype == torch.float64
+    assert motion.center.device == motion.velocity.device
+    assert motion.center.device == motion.omega.device
+
+
+def test_no_rotation_identity_follows_meta_participating_device():
+    motion = SE2Motion((1.5, 3.0), enable_rotation=False).double().to("meta")
+    centers = torch.empty((1, 2), dtype=torch.float64, device="meta")
+    t_grid = torch.empty(3, dtype=torch.float64, device="meta")
+
+    transformed = motion.transform_centers(centers, t_grid)
+
+    assert transformed.shape == (3, 1, 2)
+    assert transformed.dtype == torch.float64
+    assert transformed.device.type == "meta"
+
+
 def test_affine_identity_follows_double_motion_time():
     motion = SE2Motion(
         (1.5, 3.0), enable_rotation=True, enable_affine=True
@@ -99,6 +119,20 @@ def test_affine_identity_follows_double_motion_time():
 
     assert transformed.dtype == torch.float64
     _assert_float64_cpu_creations(recorder, ["eye"])
+
+
+def test_affine_identity_follows_meta_participating_device():
+    motion = SE2Motion(
+        (1.5, 3.0), enable_rotation=True, enable_affine=True
+    ).double().to("meta")
+    sigma = torch.empty((1, 2, 2), dtype=torch.float64, device="meta")
+    t_grid = torch.empty(3, dtype=torch.float64, device="meta")
+
+    transformed = motion.transform_covariances(sigma, t_grid)
+
+    assert transformed.shape == (3, 1, 2, 2)
+    assert transformed.dtype == torch.float64
+    assert transformed.device.type == "meta"
 
 
 def _central_difference(parameter, index, loss_fn):

@@ -888,3 +888,49 @@ This permanent append-only ledger is intentionally empty of implementation recor
   dtype/device. `SE2Motion.center` also follows `.double()`.
 - `git diff --check` → exit `0` with silent output. All test and verifier
   output was pristine, with no warnings or unexpected skips.
+
+## Task 7 Fix Round 1 — Strengthen forward contract coverage (2026-07-27)
+
+- Clean fix base:
+  `885bb3213fb7df32e7887a1808a88ca636c520de`; the original Task 7 commit
+  was not amended.
+- This round closed coverage gaps only. All requested assertions were added
+  before rerunning tests, and current fixed production passed immediately:
+  focused Task 7 → exit `0`, `17 passed in 1.56s`. This is recorded as honest
+  coverage-only GREEN; no production file was modified and no RED was
+  fabricated.
+- Measurement shape is now asserted before every numerical comparison:
+  direct `K=5` with frame one unassigned has exact shape `(5,)`;
+  interpolated `K=7`, including the exact final-frame boundary, has `(7,)`;
+  and `K=1` has `(1,)`. A broadcastable `[1,1]` regression can therefore no
+  longer satisfy the NumPy comparison or `.item()` assertion.
+- The registered `SE2Motion.center` buffer is asserted float64 after
+  `.double()` and on the same device as both `velocity` and `omega`.
+  Portable non-CPU tests move the real module and participating inputs to the
+  PyTorch `meta` device. No-rotation `transform_centers` returns meta
+  `[3,1,2]` float64, and affine `transform_covariances` returns meta
+  `[3,1,2,2]` float64. These real operations lock device inheritance for both
+  identity constructors without changing the CUDA marker count.
+- Reference inspection confirmed `eval_frame_idx[j] =
+  clip((j*T)//Ke, 0, T-1)`, independent of seed. The seed-sensitivity test now
+  explicitly asserts seed-7 and seed-11 `eval_frame_idx` equality in addition
+  to existing shape/dtype checks.
+
+### Verification
+
+- Focused Task 7 suite → exit `0`, `17 passed in 1.56s`.
+- Accumulated CPU suite → exit `0`,
+  `185 passed, 1 deselected in 14.28s`.
+- Real CUDA suite → exit `0`,
+  `1 passed, 185 deselected in 1.17s`; exactly one executed and zero skipped.
+- Full suite → exit `0`, `186 passed in 15.53s`.
+- Strict environment verification → exit `0`, fingerprint
+  `b5d6922a9f3a9638ee8826b9a74f00998cd3ac81aa25c03de016358e0e435a56`.
+- Strict implementation-provenance verification → exit `0`; four immutable
+  inputs verified at the clean fix base
+  `885bb3213fb7df32e7887a1808a88ca636c520de`.
+- `D:\conda\envs\spi\python.exe -m pip check` → exit `0`,
+  `No broken requirements found.`
+- `git diff --check` → exit `0` with silent output. The diff contained only
+  the three intended Task 7 test files plus this append-only ledger entry.
+  Output was pristine, with no warnings or unexpected skips.
