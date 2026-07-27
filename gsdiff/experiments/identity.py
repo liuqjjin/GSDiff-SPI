@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import hashlib
 from importlib import metadata as importlib_metadata
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -35,6 +36,10 @@ NUMERICAL_ENV_ALLOWLIST = (
 _ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]*$", flags=re.ASCII)
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$", flags=re.ASCII)
 _COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$", flags=re.ASCII)
+_REQUIREMENT_PATTERN = re.compile(
+    r"^(?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)==(?P<version>[^\s=]+)$",
+    flags=re.ASCII,
+)
 _GIT_BASELINE = "c03420784bc92b4e9b9eef8330cbd9571ebebc68"
 _SOURCE_TREE_MAGIC = b"source-tree-v1\0"
 _SOURCE_TREE_EXCLUDED_COMPONENTS = frozenset(
@@ -110,6 +115,144 @@ def sha256_file(path: Path) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def requirements_dependencies_sha256(path: Path | str) -> str:
+    """Hash canonical unique normalized name/version records in a lock file."""
+    records = _requirements_records(Path(path))
+    return sha256_bytes(canonical_json_bytes(records))
+
+
+def verify_environment_requirements(
+    requirements_lock: Path | str,
+    environment_lock: Path | str,
+    *,
+    live_fingerprint: Mapping[str, object] | None = None,
+) -> dict[str, str]:
+    """Fail closed unless requirements, stored lock, and live runtime agree."""
+    requirement_records = _requirements_records(Path(requirements_lock))
+    lock = _load_unique_json(Path(environment_lock))
+    if type(lock) is not dict or set(lock) != {
+        "schema_version",
+        "fingerprint",
+        "fingerprint_sha256",
+    }:
+        raise ValueError("environment lock has an invalid top-level shape")
+    if type(lock["schema_version"]) is not int or lock["schema_version"] != 1 or type(lock["fingerprint_sha256"]) is not str:
+        raise ValueError("environment lock has an invalid schema version or hash")
+    fingerprint = lock["fingerprint"]
+    _validate_exact_json(fingerprint)
+    stored_hash = sha256_bytes(canonical_json_bytes(fingerprint))
+    if lock["fingerprint_sha256"] != stored_hash:
+        raise ValueError("environment lock fingerprint hash mismatch")
+    stored_records = _distribution_projection(fingerprint)
+    if stored_records != requirement_records:
+        raise ValueError("requirements lock does not match environment lock distributions")
+    current = live_fingerprint if live_fingerprint is not None else collect_environment_fingerprint()
+    _validate_exact_json(current)
+    if current != fingerprint:
+        raise ValueError("live environment fingerprint does not exactly match environment lock")
+    if _distribution_projection(current) != requirement_records:
+        raise ValueError("live environment distributions do not match requirements lock")
+    return {
+        "dependencies_sha256": sha256_bytes(canonical_json_bytes(requirement_records)),
+        "environment_lock_sha256": stored_hash,
+    }
+
+
+def _requirements_records(path: Path) -> list[dict[str, str]]:
+    try:
+        lines = path.read_text(encoding="utf-8", errors="strict").splitlines()
+    except OSError as error:
+        raise ValueError(f"cannot read requirements lock: {path}") from error
+    records: list[dict[str, str]] = []
+    for number, line in enumerate(lines, start=1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        matched = _REQUIREMENT_PATTERN.fullmatch(stripped)
+        if matched is None:
+            raise ValueError(f"requirements lock line {number} is not name==version")
+        records.append(
+            {
+                "name": _normalize_distribution_name(matched.group("name")),
+                "version": matched.group("version"),
+            }
+        )
+    return _unique_distribution_records(records, "requirements lock")
+
+
+def _distribution_projection(fingerprint: object) -> list[dict[str, str]]:
+    if type(fingerprint) is not dict:
+        raise ValueError("environment fingerprint must be an exact object")
+    distributions = fingerprint.get("installed_distributions")
+    if type(distributions) is not list:
+        raise ValueError("environment fingerprint lacks installed_distributions")
+    records: list[dict[str, str]] = []
+    for record in distributions:
+        if type(record) is not dict or set(record) != {"name", "version"}:
+            raise ValueError("installed distribution record has an invalid shape")
+        name = record["name"]
+        version = record["version"]
+        if type(name) is not str or type(version) is not str or not name or not version:
+            raise ValueError("installed distribution record has invalid name or version")
+        records.append({"name": _normalize_distribution_name(name), "version": version})
+    return _unique_distribution_records(records, "installed distributions")
+
+
+def _unique_distribution_records(
+    records: list[dict[str, str]], source: str
+) -> list[dict[str, str]]:
+    versions: dict[str, str] = {}
+    for record in records:
+        previous = versions.get(record["name"])
+        if previous is not None and previous != record["version"]:
+            raise ValueError(f"{source} contains conflicting versions for {record['name']!r}")
+        versions[record["name"]] = record["version"]
+    return [
+        {"name": name, "version": versions[name]}
+        for name in sorted(versions)
+    ]
+
+
+def _load_unique_json(path: Path) -> object:
+    try:
+        text = path.read_text(encoding="utf-8", errors="strict")
+    except OSError as error:
+        raise ValueError(f"cannot read environment lock: {path}") from error
+    try:
+        return json.loads(text, object_pairs_hook=_unique_json_object)
+    except json.JSONDecodeError as error:
+        raise ValueError("environment lock is not valid JSON") from error
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, child in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON key: {key!r}")
+        value[key] = child
+    return value
+
+
+def _validate_exact_json(value: object, path: str = "$") -> None:
+    if value is None or type(value) in (str, bool, int):
+        return
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError(f"{path} contains a non-finite number")
+        return
+    if type(value) is list:
+        for index, child in enumerate(value):
+            _validate_exact_json(child, f"{path}[{index}]")
+        return
+    if type(value) is dict:
+        for key, child in value.items():
+            if type(key) is not str:
+                raise TypeError(f"{path} contains a non-string key")
+            _validate_exact_json(child, f"{path}.{key}")
+        return
+    raise TypeError(f"{path} contains unsupported JSON type {type(value).__name__}")
 
 
 def _normalize_json(value: object) -> object:
@@ -933,14 +1076,13 @@ def source_tree_sha256(repo: Path, source_roots: Sequence[Path]) -> str:
 
 
 def collect_runtime_metadata() -> dict[str, object]:
+    cuda_available = torch.cuda.is_available() and torch.cuda.device_count() > 0
     return {
         "python_executable": os.path.realpath(sys.executable),
         "python_version": platform.python_version(),
         "torch_version": str(torch.__version__),
         "cuda_version": torch.version.cuda,
-        "gpu_name": (
-            torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
-        ),
+        "gpu_name": torch.cuda.get_device_name(0) if cuda_available else None,
         "os": platform.platform(),
     }
 

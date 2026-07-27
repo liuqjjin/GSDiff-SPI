@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "experiment-aggregate-v1.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "document_kind", "campaign_id", "campaign_sha256", "protocol_sha256", "scientific_contract_id", "scientific_contract_sha256", "metric_version", "expected_identity_sha256s", "run_manifests"],
+  "properties": {
+    "schema_version": {"const": "experiment-aggregate-v1"},
+    "document_kind": {"const": "campaign-index"},
+    "campaign_id": {"type": "string", "minLength": 1},
+    "campaign_sha256": {"$ref": "#/$defs/sha"},
+    "protocol_sha256": {"$ref": "#/$defs/sha"},
+    "scientific_contract_id": {"type": "string", "minLength": 1},
+    "scientific_contract_sha256": {"$ref": "#/$defs/sha"},
+    "metric_version": {"type": "string", "minLength": 1},
+    "expected_identity_sha256s": {"type": "array", "items": {"$ref": "#/$defs/sha"}},
+    "run_manifests": {"type": "array", "items": {"$ref": "#/$defs/runManifest"}}
+  },
+  "$defs": {
+    "sha": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "runManifest": {"type": "object", "additionalProperties": false, "required": ["identity_sha256", "manifest_sha256"], "properties": {"identity_sha256": {"$ref": "#/$defs/sha"}, "manifest_sha256": {"$ref": "#/$defs/sha"}}}
+  }
+}

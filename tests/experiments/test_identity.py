@@ -1031,3 +1031,86 @@ def test_escaping_nested_link_is_rejected_before_traversal(
 
     with pytest.raises(ValueError, match="escape|outside|repository"):
         identity.source_tree_sha256(git_repo, [git_repo / "src"])
+
+
+def test_environment_requirements_verification_hashes_unique_dependency_records(
+    tmp_path: Path,
+):
+    requirements = tmp_path / "requirements-lock.txt"
+    requirements.write_text("Beta==2.0\nalpha_pkg==1.0\n", encoding="utf-8")
+    fingerprint = {
+        "installed_distributions": [
+            {"name": "alpha-pkg", "version": "1.0"},
+            {"name": "alpha_pkg", "version": "1.0"},
+            {"name": "beta", "version": "2.0"},
+        ]
+    }
+    lock = {
+        "schema_version": 1,
+        "fingerprint": fingerprint,
+        "fingerprint_sha256": identity.sha256_bytes(
+            identity.canonical_json_bytes(fingerprint)
+        ),
+    }
+    environment_lock = tmp_path / "environment-lock.json"
+    environment_lock.write_bytes(identity.canonical_json_bytes(lock))
+
+    hashes = identity.verify_environment_requirements(
+        requirements, environment_lock, live_fingerprint=fingerprint
+    )
+
+    assert hashes == {
+        "dependencies_sha256": hashlib.sha256(
+            b'[{"name":"alpha-pkg","version":"1.0"},{"name":"beta","version":"2.0"}]'
+        ).hexdigest(),
+        "environment_lock_sha256": lock["fingerprint_sha256"],
+    }
+
+
+def test_environment_requirements_rejects_conflicting_duplicate_distribution(
+    tmp_path: Path,
+):
+    requirements = tmp_path / "requirements-lock.txt"
+    requirements.write_text("alpha==1\n", encoding="utf-8")
+    fingerprint = {
+        "installed_distributions": [
+            {"name": "alpha", "version": "1"},
+            {"name": "alpha", "version": "2"},
+        ]
+    }
+    lock = {
+        "schema_version": 1,
+        "fingerprint": fingerprint,
+        "fingerprint_sha256": identity.sha256_bytes(
+            identity.canonical_json_bytes(fingerprint)
+        ),
+    }
+    environment_lock = tmp_path / "environment-lock.json"
+    environment_lock.write_bytes(identity.canonical_json_bytes(lock))
+
+    with pytest.raises(ValueError, match="conflicting versions"):
+        identity.verify_environment_requirements(
+            requirements, environment_lock, live_fingerprint=fingerprint
+        )
+
+
+def test_environment_requirements_rejects_live_full_fingerprint_mismatch(
+    tmp_path: Path,
+):
+    requirements = tmp_path / "requirements-lock.txt"
+    requirements.write_text("alpha==1\n", encoding="utf-8")
+    fingerprint = {"installed_distributions": [{"name": "alpha", "version": "1"}], "gpu": "locked"}
+    lock = {
+        "schema_version": 1,
+        "fingerprint": fingerprint,
+        "fingerprint_sha256": identity.sha256_bytes(identity.canonical_json_bytes(fingerprint)),
+    }
+    environment_lock = tmp_path / "environment-lock.json"
+    environment_lock.write_bytes(identity.canonical_json_bytes(lock))
+
+    with pytest.raises(ValueError, match="exactly"):
+        identity.verify_environment_requirements(
+            requirements,
+            environment_lock,
+            live_fingerprint={**fingerprint, "gpu": "different"},
+        )

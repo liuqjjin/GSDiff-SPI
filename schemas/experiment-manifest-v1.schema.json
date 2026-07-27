@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "experiment-manifest-v1.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "status", "execution_class", "metric_version", "run_id", "identity_sha256", "protocol", "code", "config", "inputs", "runtime", "execution", "measurement", "metrics", "artifacts"],
+  "properties": {
+    "schema_version": {"const": "experiment-manifest-v1"},
+    "status": {"enum": ["running", "failed", "complete"]},
+    "execution_class": {"const": "blind_method_child"},
+    "metric_version": {"type": "string", "minLength": 1},
+    "run_id": {"type": "string", "minLength": 1},
+    "identity_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "protocol": {"$ref": "#/$defs/protocol"},
+    "code": {"$ref": "#/$defs/code"},
+    "config": {"$ref": "#/$defs/config"},
+    "inputs": {"$ref": "#/$defs/inputs"},
+    "runtime": {"$ref": "#/$defs/runtime"},
+    "execution": {"$ref": "#/$defs/execution"},
+    "failure": {"$ref": "#/$defs/failure"},
+    "measurement": {"$ref": "#/$defs/measurement"},
+    "metrics": {"anyOf": [{"$ref": "#/$defs/metrics"}, {"type": "null"}]},
+    "artifacts": {"type": "array", "items": {"$ref": "#/$defs/artifact"}}
+  },
+  "$defs": {
+    "sha": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "namedHashes": {"type": "object", "additionalProperties": {"$ref": "#/$defs/sha"}},
+    "protocol": {"type": "object", "additionalProperties": false, "required": ["scientific_contract_id", "scientific_contract_sha256", "target", "motion", "seed", "method"], "properties": {"scientific_contract_id": {"type": "string", "minLength": 1}, "scientific_contract_sha256": {"$ref": "#/$defs/sha"}, "target": {"type": "string", "minLength": 1}, "motion": {"type": "string", "minLength": 1}, "seed": {"type": "integer"}, "method": {"type": "string", "minLength": 1}}},
+    "code": {"type": "object", "additionalProperties": false, "required": ["git_commit", "dirty_worktree", "source_tree_sha256"], "properties": {"git_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"}, "dirty_worktree": {"type": "boolean"}, "source_tree_sha256": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/sha"}]}}},
+    "config": {"type": "object", "additionalProperties": false, "required": ["resolved", "sha256"], "properties": {"resolved": {}, "sha256": {"$ref": "#/$defs/sha"}}},
+    "inputs": {"type": "object", "additionalProperties": false, "required": ["dataset_identity_sha256", "measurements_file_sha256", "evaluation_truth_file_sha256", "dataset_manifest_sha256", "assets", "checkpoints"], "properties": {"dataset_identity_sha256": {"$ref": "#/$defs/sha"}, "measurements_file_sha256": {"$ref": "#/$defs/sha"}, "evaluation_truth_file_sha256": {"$ref": "#/$defs/sha"}, "dataset_manifest_sha256": {"$ref": "#/$defs/sha"}, "assets": {"$ref": "#/$defs/namedHashes"}, "checkpoints": {"$ref": "#/$defs/namedHashes"}}},
+    "runtime": {"type": "object", "additionalProperties": false, "required": ["python", "pytorch", "cuda", "gpu", "os", "dependencies_sha256", "environment_lock_sha256"], "properties": {"python": {"type": "string"}, "pytorch": {"type": "string"}, "cuda": {"type": "string"}, "gpu": {"type": "string"}, "os": {"type": "string"}, "dependencies_sha256": {"$ref": "#/$defs/sha"}, "environment_lock_sha256": {"$ref": "#/$defs/sha"}}},
+    "execution": {"type": "object", "additionalProperties": false, "required": ["command", "started_at_utc", "ended_at_utc", "return_code", "runtime_seconds", "peak_vram_bytes"], "properties": {"command": {"type": "array", "items": {"type": "string"}}, "started_at_utc": {"type": "string"}, "ended_at_utc": {"anyOf": [{"type": "string"}, {"type": "null"}]}, "return_code": {"anyOf": [{"type": "integer"}, {"type": "null"}]}, "runtime_seconds": {"type": "number", "minimum": 0}, "peak_vram_bytes": {"type": "integer", "minimum": 0}}},
+    "failure": {"type": "object", "additionalProperties": false, "required": ["stderr_tail", "diagnostic_paths"], "properties": {"stderr_tail": {"type": "string"}, "diagnostic_paths": {"type": "array", "items": {"type": "string"}}}},
+    "measurement": {"type": "object", "additionalProperties": false, "required": ["train_count", "holdout_count", "pattern_family", "requested_snr_db", "noise_calibration_id", "noise_calibration_sha256", "noise_sigma_absolute", "realized_train_snr_db", "realized_holdout_snr_db"], "properties": {"train_count": {"type": "integer", "minimum": 0}, "holdout_count": {"type": "integer", "minimum": 0}, "pattern_family": {"type": "string"}, "requested_snr_db": {"type": "number"}, "noise_calibration_id": {"const": "detector-absolute-v1"}, "noise_calibration_sha256": {"$ref": "#/$defs/sha"}, "noise_sigma_absolute": {"type": "number", "minimum": 0}, "realized_train_snr_db": {"type": "number"}, "realized_holdout_snr_db": {"type": "number"}}},
+    "metrics": {"type": "object", "additionalProperties": false, "required": ["version", "path", "sha256"], "properties": {"version": {"type": "string", "minLength": 1}, "path": {"type": "string", "minLength": 1}, "sha256": {"$ref": "#/$defs/sha"}}},
+    "artifact": {"type": "object", "additionalProperties": false, "required": ["role", "path", "sha256", "size_bytes", "schema_version", "required"], "properties": {"role": {"type": "string", "minLength": 1}, "path": {"type": "string", "minLength": 1}, "sha256": {"$ref": "#/$defs/sha"}, "size_bytes": {"type": "integer", "minimum": 0}, "schema_version": {"type": "string", "minLength": 1}, "required": {"type": "boolean"}}}
+  }
+}
