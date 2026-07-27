@@ -22,6 +22,11 @@ from ..forward.spi import SPIForwardModel
 from ..utils import normalize_01
 
 
+def normalize_pixel_coordinates(coordinates, center, H, W):
+    half = coordinates.new_tensor([(H - 1) / 2.0, (W - 1) / 2.0])
+    return (coordinates - center) / half
+
+
 # ── SIREN canonical field ────────────────────────────────────
 class _SineLayer(nn.Module):
     def __init__(self, i, o, w0=30.0, first=False):
@@ -64,6 +69,7 @@ class GridCanonical(nn.Module):
     """Learnable canonical image + bilinear sample. ~Hc*Wc params."""
     def __init__(self, Hc=64, Wc=64, padding_mode="border"):
         super().__init__()
+        self.Hc, self.Wc = Hc, Wc
         self.grid = nn.Parameter(torch.zeros(1, 1, Hc, Wc))
         self.padding_mode = padding_mode
 
@@ -75,10 +81,14 @@ class GridCanonical(nn.Module):
         return torch.sigmoid(s.reshape(-1))
 
     def prefit(self, target01, x_norm_grid, steps=300, lr=1e-2):
-        H = W = int(math.sqrt(target01.size)) if hasattr(target01, "size") else 64
         with torch.no_grad():                       # invert sigmoid to seed the grid
-            t = torch.as_tensor(np.clip(target01, 1e-3, 1 - 1e-3), dtype=torch.float32,
-                                device=self.grid.device).reshape(1, 1, H, W)
+            t = torch.as_tensor(target01, dtype=torch.float32, device=self.grid.device)
+            expected = self.Hc * self.Wc
+            if t.numel() != expected:
+                raise ValueError(
+                    f"grid prefit target must contain exactly {expected} values, "
+                    f"got {t.numel()}")
+            t = t.clamp(1e-3, 1 - 1e-3).reshape(1, 1, self.Hc, self.Wc)
             self.grid.data.copy_(torch.logit(t))
 
 
@@ -112,11 +122,16 @@ class LowRankCanonical(nn.Module):
 def build_scene(kind="siren", **kw):
     if kind == "siren":       return SIREN(hidden=kw.get("hidden", 128), w0=kw.get("w0", 30.0))
     if kind == "siren_small": return SIREN(hidden=54, w0=kw.get("w0", 30.0))
-    if kind == "grid":        return GridCanonical(Hc=kw.get("Hc", 64), Wc=kw.get("Wc", 64))
-    if kind == "lowrank":     return LowRankCanonical(r=kw.get("r", 32))
+    if kind == "grid":
+        return GridCanonical(Hc=kw.get("Hc", kw.get("H", 64)),
+                             Wc=kw.get("Wc", kw.get("W", 64)))
+    if kind == "lowrank":
+        return LowRankCanonical(H=kw.get("H", 64), W=kw.get("W", 64),
+                                r=kw.get("r", 32))
     if kind == "recinr_se2":  # ReCINR's canonical + renderer, rigid SE(2) motion
-        # Tuned: a COARSE 16x16 canonical (bilinear-upsampled) stops the per-pixel
-        # feature grid from absorbing the motion (full-res → 9 dB, coarse → ~24 dB).
+        # Tuned: a COARSE canonical with short-side resolution 16 stops the
+        # per-pixel feature grid from absorbing motion (full-res → 9 dB,
+        # coarse → ~24 dB).
         from .recinr import ReCINRCanonicalScene
         return ReCINRCanonicalScene(kw.get("H", 64), kw.get("W", 64), C=kw.get("C", 32),
                                     grid_size=kw.get("grid_size", 16))
@@ -136,19 +151,20 @@ class INRForwardModel(SPIForwardModel):
     def render_video(self, t_grid):
         dev = t_grid.device
         c = self.motion.center                                       # [2]
-        half = (self.H - 1) / 2.0
         A_t = self.motion._A(t_grid)                                 # [T,2,2]
         d_t = self.motion._displacement(t_grid)                     # [T,2]
         A_inv = torch.linalg.inv(A_t)                                # [T,2,2]
         U = self._pixel_grid(dev)                                    # [N,2]
         rel = U.unsqueeze(0) - c - d_t.unsqueeze(1)                  # [T,N,2]
         mu = torch.einsum("tij,tnj->tni", A_inv, rel) + c            # [T,N,2]
-        x_norm = (mu - c) / half                                     # [-1,1], (y,x)
+        x_norm = normalize_pixel_coordinates(mu, c, self.H, self.W)  # [-1,1], (y,x)
         T = t_grid.shape[0]
-        inten = self.scene.query(x_norm.reshape(-1, 2)).view(T, self.H, self.W)
+        inside = (x_norm.abs() <= 1.0).all(dim=-1).view(T, self.H, self.W)
+        queried = self.scene.query(x_norm.reshape(-1, 2)).view(T, self.H, self.W)
+        inten = queried * inside.to(queried.dtype)
         return inten.unsqueeze(1)                                    # [T,1,H,W]
 
     def norm_grid(self, dev):
         """Identity-warp normalized grid for DGI pre-fit."""
-        half = (self.H - 1) / 2.0
-        return (self._pixel_grid(dev) - self.motion.center) / half
+        return normalize_pixel_coordinates(
+            self._pixel_grid(dev), self.motion.center, self.H, self.W)

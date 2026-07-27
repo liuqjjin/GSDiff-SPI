@@ -12,6 +12,8 @@ The representation, priors, and curriculum are ReCINR's, verbatim (recinr_model.
 is a copy of the ReCINR source). This is the fair "the user's own INR method vs
 Gaussian splatting" comparison. GT-free selection via held-out measurement residual.
 """
+from numbers import Integral
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -38,9 +40,22 @@ class ReCINRCanonicalScene(nn.Module):
         # grid_size < H makes the canonical coarse (bilinear-upsampled) → smooth,
         # so the rigid SE(2) motion cannot be absorbed by per-pixel flexibility
         # (the spatial analog of the continuous-warp fix that unlocked variant a).
-        gh = grid_size or H
-        self.gh = gh
-        self.features = nn.Parameter(0.1 * torch.randn(1, C, gh, gh))
+        if grid_size is None:
+            gh, gw = H, W
+        elif isinstance(grid_size, Integral) and not isinstance(grid_size, bool):
+            if grid_size <= 0:
+                raise ValueError("grid_size must be positive")
+            scale = grid_size / min(H, W)
+            gh, gw = round(H * scale), round(W * scale)
+        elif isinstance(grid_size, tuple) and len(grid_size) == 2:
+            gh, gw = grid_size
+            if (not all(isinstance(v, Integral) and not isinstance(v, bool)
+                        for v in (gh, gw)) or gh <= 0 or gw <= 0):
+                raise ValueError("grid_size dimensions must be positive integers")
+        else:
+            raise TypeError("grid_size must be a positive integer or a (gh, gw) tuple")
+        self.gh, self.gw = int(gh), int(gw)
+        self.features = nn.Parameter(0.1 * torch.randn(1, C, self.gh, self.gw))
         rl = [nn.Linear(C, C), nn.ReLU()]
         for _ in range(max(1, render_layers) - 1):
             rl += [nn.Linear(C, C), nn.ReLU()]
@@ -48,7 +63,7 @@ class ReCINRCanonicalScene(nn.Module):
         self.renderer = nn.Sequential(*rl)
 
     def _feat_grid(self):
-        if self.gh == self.H:
+        if (self.gh, self.gw) == (self.H, self.W):
             return self.features
         return F.interpolate(self.features, size=(self.H, self.W),
                              mode="bilinear", align_corners=True)

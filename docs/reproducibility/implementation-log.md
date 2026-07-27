@@ -651,3 +651,93 @@ This permanent append-only ledger is intentionally empty of implementation recor
   `sgd.py` and `admm.py` was empty, confirming no solver-flow or scheduler
   edit. `git diff --check` → exit `0` with silent output. All output was
   pristine, with no warnings or unexpected skips.
+
+## Task 6 — Align rectangular INR geometry and field-of-view boundaries (2026-07-27)
+
+- Prior approved commit and clean starting HEAD:
+  `38d49d639ee2961e7efe4b272c4f2a43afd1c85a` on
+  `debug/admm-vs-sgd`. Inspection confirmed that `recinr_se2` uses the
+  repository's vendored `gsdiff.baselines.recinr_model`; no external
+  `D:\SPI\ReCINR`, checkpoint, network, or process dependency was used.
+- Coordinate contract: coordinates and centers are ordered `(y,x)`, shapes are
+  `(H,W)`, and the `32x64` image center is `(15.5,31.5)`. The per-axis
+  denominators are therefore `(15.5,31.5)`, so `(0,0)` maps exactly to
+  `(-1,-1)` and `(31,63)` maps exactly to `(1,1)`. The helper constructs the
+  denominator through `coordinates.new_tensor`, preserving coordinate dtype,
+  device, and autograd.
+- Phase 1 corner-helper RED:
+  `D:\conda\envs\spi\python.exe -m pytest
+  tests\scene\test_rectangular_geometry.py -q` → exit `1` during collection
+  with `ImportError: cannot import name 'normalize_pixel_coordinates'`.
+  The normalization-only implementation added the per-axis helper and routed
+  both `INRForwardModel.render_video` and `norm_grid` through it. The identical
+  focused command → exit `0`, `1 passed in 0.27s`.
+- Phase 2 physical-boundary RED, before masking: the focused command → exit
+  `1`, `4 failed, 1 passed in 0.35s`. A constant-one scene translated by
+  `(0,128)` returned `2048/2048` ones instead of zeros. Translation `(0,63)`
+  returned ones everywhere rather than only the 32 exact-boundary samples in
+  the last raster column. The real SIREN extrapolated to nonzero values as
+  large as `0.7172287702560425`, and the grid border path returned `0.5` at
+  every sample.
+- The first minimal mask run exposed the intended ordering check: multiplying
+  queried `[T,H,W]` values by the still-flat `[T,H*W]` predicate failed with a
+  `64` versus `2048` dimension mismatch. Reshaping the predicate in the same
+  row-major order as the flattened `(y,x)` pixel grid and scene query fixed
+  the mismatch. The shared renderer now queries the canonical scene and then
+  multiplies by `(abs(x_norm) <= 1).all(-1)`; direct canonical-query
+  `padding_mode="border"` defaults were not changed. Phase 2 GREEN → exit `0`,
+  `5 passed in 0.33s`. The full-outside case has `0/2048` inside samples; the
+  `(0,63)` case has exactly `32/2048`, proving normalized `x=-1` is included.
+- Phase 3 rectangular-construction RED, before grid/low-rank/ReCINR production
+  changes: the focused command → exit `1`, `6 failed, 17 passed in 0.57s`.
+  `GridCanonical` lacked `Hc/Wc`, `build_scene("grid")` remained `64x64`, and
+  prefit inferred `sqrt(2048)=45` before an invalid reshape. ReCINR lacked
+  `gw`, scalar `grid_size=16` remained `16x16`, explicit `(12,20)` failed
+  construction, zero silently fell back to `H`, and negative sizes reached
+  tensor allocation instead of validation.
+- The minimal construction implementation stores grid dimensions, validates
+  prefit target numel exactly before reshaping to `(Hc,Wc)`, falls back from
+  absent `Hc/Wc` to requested `H/W`, and passes requested `H/W` into low-rank.
+  ReCINR stores `(gh,gw)`, validates positive scalar or explicit tuple sizes,
+  and uses both dimensions in feature allocation and interpolation checks. A
+  scalar is a short-side resolution: for `H=32,W=64,grid_size=16`, scale is
+  `16/min(32,64)=0.5`, hence `(gh,gw)=(16,32)`; `grid_size=8` similarly gives
+  `(8,16)`. Phase 3 focused GREEN → exit `0`, `23 passed in 0.46s`.
+- Real `build_scene` plus `INRForwardModel` rectangular tests exercised SIREN
+  (`hidden=8`), grid (`grid=[1,1,32,64]`, `Hc/Wc=32/64`), low-rank
+  (`U=[32,4]`, `V=[64,4]`), and ReCINR SE(2)
+  (`features=[1,4,8,16]`). Each produced finite `[3,1,32,64]` videos and
+  present finite gradients for every trainable scene and motion parameter.
+  Under the all-outside translation, all four produced exact-zero
+  `[1,1,32,64]` outputs with present finite masked-output gradients. The
+  Gaussian forward renderer also produced finite exact-zero
+  `[1,1,32,64]` output under the controlled all-outside fixture and finite
+  gradients for every trainable parameter.
+
+### Verification
+
+- Focused rectangular suite → exit `0`, `23 passed in 0.46s`.
+- Accumulated CPU suite:
+  `D:\conda\envs\spi\python.exe -m pytest -m "not cuda" -q` → exit `0`,
+  `157 passed, 1 deselected in 16.85s`.
+- Real CUDA suite:
+  `D:\conda\envs\spi\python.exe -m pytest -m cuda -q` → exit `0`,
+  `1 passed, 157 deselected in 1.21s`; exactly one CUDA test executed and
+  zero skipped.
+- Full suite:
+  `D:\conda\envs\spi\python.exe -m pytest -q` → exit `0`,
+  `158 passed in 16.29s`.
+- Strict environment verification → exit `0`, fingerprint
+  `b5d6922a9f3a9638ee8826b9a74f00998cd3ac81aa25c03de016358e0e435a56`.
+- Strict implementation-provenance verification → exit `0`; four immutable
+  inputs verified at prior commit
+  `38d49d639ee2961e7efe4b272c4f2a43afd1c85a`.
+- `D:\conda\envs\spi\python.exe -m pip check` → exit `0`,
+  `No broken requirements found.`
+- Targeted square-assumption and FOV searches found no remaining
+  max-dimension/scalar normalization, square `H=W`, `gh,gh`, or single-`gh`
+  interpolation path in the INR/ReCINR canonical implementation. The only
+  remaining `padding_mode="border"` paths are direct canonical queries; the
+  physical zero boundary is applied once in the shared forward renderer.
+  `git diff --check` → exit `0` with silent output. All verifier and test
+  output was pristine, with no warnings or unexpected skips.
