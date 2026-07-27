@@ -535,6 +535,7 @@ def git_state(
         cwd=resolved_repo,
         check=False,
         capture_output=True,
+        env=_git_read_environment(),
     )
     if branch_result.returncode not in (0, 1):
         branch_result.check_returncode()
@@ -548,6 +549,7 @@ def git_state(
         cwd=resolved_repo,
         check=True,
         capture_output=True,
+        env=_git_read_environment(),
     ).stdout
     actual_source_hash = _source_snapshot_sha256(
         resolved_repo,
@@ -575,12 +577,19 @@ def git_state(
     }
 
 
+def _git_read_environment() -> dict[str, str]:
+    environment = dict(os.environ)
+    environment["GIT_OPTIONAL_LOCKS"] = "0"
+    return environment
+
+
 def _git_bytes(repo: Path, *args: str) -> bytes:
     return subprocess.run(
         ["git", *args],
         cwd=repo,
         check=True,
         capture_output=True,
+        env=_git_read_environment(),
     ).stdout
 
 

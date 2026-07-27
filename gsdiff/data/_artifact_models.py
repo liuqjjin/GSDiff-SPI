@@ -10,13 +10,13 @@ from ._artifact_identity import (
     deep_freeze_json,
     optional_readonly_array,
     readonly_array,
+    validate_exact_json_native,
 )
 
 
 @dataclass(frozen=True)
 class SPIAcquisitionData:
     dataset_identity_sha256: str
-    dataset_identity_spec: Mapping[str, object]
     patterns: np.ndarray
     measurements: np.ndarray
     frame_indices: np.ndarray
@@ -28,17 +28,9 @@ class SPIAcquisitionData:
     W: int
     T: int
     K: int
-    resolved_generation_config: Mapping[str, object]
-    generator_code_version: str
-    target_asset_sha256: str
-    seed: int
-    pattern_family: str
-    pattern_order: str
-    time_assignment_mode: str
-    noise_convention: str
-    noise_parameters: Mapping[str, object]
-    motion_model: str
-    motion_parameters: Mapping[str, object]
+    holdout_K: int
+    acquisition: Mapping[str, object]
+    array_descriptors: Mapping[str, object]
 
     def __post_init__(self) -> None:
         for field in ("patterns", "measurements", "frame_indices", "time_grid"):
@@ -55,12 +47,8 @@ class SPIAcquisitionData:
                 field,
                 optional_readonly_array(getattr(self, field), field),
             )
-        for field in (
-            "dataset_identity_spec",
-            "resolved_generation_config",
-            "noise_parameters",
-            "motion_parameters",
-        ):
+        for field in ("acquisition", "array_descriptors"):
+            validate_exact_json_native(getattr(self, field), field)
             frozen = deep_freeze_json(getattr(self, field))
             if not isinstance(frozen, Mapping):
                 raise ArtifactValidationError(f"{field} must be a mapping")
@@ -85,6 +73,18 @@ class SPIAcquisitionData:
     @property
     def eval_frame_idx(self) -> np.ndarray | None:
         return self.holdout_frame_indices
+
+    @property
+    def pattern_family(self) -> str:
+        return self.acquisition["pattern_family"]  # type: ignore[return-value]
+
+    @property
+    def pattern_order(self) -> str:
+        return self.acquisition["pattern_order"]  # type: ignore[return-value]
+
+    @property
+    def time_assignment_mode(self) -> str:
+        return self.acquisition["time_assignment"]  # type: ignore[return-value]
 
 
 @dataclass(frozen=True)
@@ -118,6 +118,7 @@ class EvaluationTruth:
                 self, field, readonly_array(getattr(self, field), field)
             )
         for field in ("dataset_identity_spec", "evaluator_metadata"):
+            validate_exact_json_native(getattr(self, field), field)
             frozen = deep_freeze_json(getattr(self, field))
             if not isinstance(frozen, Mapping):
                 raise ArtifactValidationError(f"{field} must be a mapping")

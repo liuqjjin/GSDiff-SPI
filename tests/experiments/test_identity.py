@@ -613,6 +613,33 @@ def test_git_state_reports_full_commit_branch_cleanliness_and_baseline(
     assert identity.git_state(git_repo, [Path("src")])["dirty"] is True
 
 
+def test_git_state_disables_optional_locks_without_mutating_process_env(
+    git_repo: Path, monkeypatch
+):
+    original = os.environ.get("GIT_OPTIONAL_LOCKS")
+    observed: list[str | None] = []
+    real_run = identity.subprocess.run
+
+    def observing_run(*args, **kwargs):
+        command = args[0]
+        if command and command[0] == "git":
+            environment = kwargs.get("env")
+            observed.append(
+                None
+                if environment is None
+                else environment.get("GIT_OPTIONAL_LOCKS")
+            )
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(identity.subprocess, "run", observing_run)
+
+    identity.git_state(git_repo, [Path("src")])
+
+    assert observed
+    assert set(observed) == {"0"}
+    assert os.environ.get("GIT_OPTIONAL_LOCKS") == original
+
+
 def test_git_state_treats_ignored_untracked_input_inside_source_root_as_dirty(
     git_repo: Path,
 ):

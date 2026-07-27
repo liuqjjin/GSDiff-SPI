@@ -1,6 +1,8 @@
 """Acquisition/truth identity construction and schema codecs."""
 
+import math
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Mapping
 
 import numpy as np
@@ -28,13 +30,50 @@ from ._artifact_io import (
     METADATA_MEMBER,
     decode_metadata,
     load_array_member,
+    npz_bytes,
     read_npz_members,
+    read_npz_members_bytes,
     write_npz,
 )
 from ._artifact_models import EvaluationTruth, SPIAcquisitionData
 
 
-ACQUISITION_SCHEMA = "measurements-v1"
+ACQUISITION_SCHEMA = "measurements-blind-v1"
+_LEGACY_IDENTITY_SCHEMA = "measurements-v1"
+BLIND_ACQUISITION_SPEC_SCHEMA = "blind-acquisition-spec-v1"
+_ACQUISITION_KEYS = {
+    "pattern_family",
+    "pattern_values",
+    "pattern_order",
+    "time_assignment",
+    "holdout_pattern_family",
+    "noise_convention",
+    "noise_sigma_absolute",
+}
+_BLIND_PATTERN_FAMILIES = frozenset(
+    {
+        "bernoulli",
+        "gaussian",
+        "random",
+        "hadamard",
+        "hadamard_cc",
+        "hadamard_walsh",
+        "hadamard_natural",
+        "fourier",
+        "s_matrix",
+        "s_matrix_m",
+    }
+)
+_ACQUISITION_MEMBER_ALLOWLIST = {
+    METADATA_MEMBER,
+    "patterns.npy",
+    "measurements.npy",
+    "frame_indices.npy",
+    "time_grid.npy",
+    "holdout_patterns.npy",
+    "holdout_measurements.npy",
+    "holdout_frame_indices.npy",
+}
 
 
 def _acquisition_arrays(
@@ -54,6 +93,7 @@ def _acquisition_arrays(
 def _validate_acquisition_shapes(data: SPIAcquisitionData) -> None:
     for name in ("H", "W", "T", "K"):
         validate_exact_int(getattr(data, name), name, minimum=1)
+    validate_exact_int(data.holdout_K, "holdout_K", minimum=0)
     if min(data.H, data.W, data.T, data.K) <= 0:
         raise ArtifactValidationError("H, W, T, and K must be positive")
     expected_shapes = {
@@ -117,124 +157,134 @@ def _validate_acquisition_shapes(data: SPIAcquisitionData) -> None:
             shape=(count,),
             upper_bound=data.T,
         )
+    else:
+        count = 0
+    if data.holdout_K != count:
+        raise ArtifactValidationError(
+            "holdout_K disagrees with holdout array presence or count"
+        )
+
+
+def _validate_blind_acquisition(value: object) -> Mapping[str, object]:
+    if type(value) not in (dict, MappingProxyType) or any(
+        type(key) is not str for key in value
+    ):
+        raise ArtifactValidationError("acquisition must be an exact JSON object")
+    validate_exact_keys(value, _ACQUISITION_KEYS, "acquisition")
+    for name in (
+        "pattern_family",
+        "pattern_order",
+        "time_assignment",
+        "holdout_pattern_family",
+        "noise_convention",
+    ):
+        if type(value[name]) is not str or not value[name]:
+            raise ArtifactValidationError(
+                f"acquisition.{name} must be a nonempty exact string"
+            )
+    if value["pattern_family"] not in _BLIND_PATTERN_FAMILIES:
+        raise ArtifactValidationError(
+            "acquisition.pattern_family is unsupported"
+        )
+    if value["pattern_order"] not in {"sequential", "stratified", "random"}:
+        raise ArtifactValidationError(
+            "acquisition.pattern_order is unsupported"
+        )
+    if value["time_assignment"] not in {"uniform", "interpolation"}:
+        raise ArtifactValidationError(
+            "acquisition.time_assignment is unsupported"
+        )
+    if value["holdout_pattern_family"] != "uniform-random":
+        raise ArtifactValidationError(
+            "acquisition.holdout_pattern_family is unsupported"
+        )
+    if value["noise_convention"] not in {
+        "ac-variance-snr",
+        "detector-absolute",
+    }:
+        raise ArtifactValidationError(
+            "acquisition.noise_convention is unsupported"
+        )
+    pattern_values = value["pattern_values"]
+    if type(pattern_values) not in (list, tuple) or not pattern_values:
+        raise ArtifactValidationError(
+            "acquisition.pattern_values must be a nonempty sequence"
+        )
+    if value["pattern_family"] == "gaussian":
+        valid_pattern_values = (
+            len(pattern_values) == 1 and type(pattern_values[0]) is str
+        )
+    else:
+        valid_pattern_values = all(
+            type(item) in (int, float) and math.isfinite(item)
+            for item in pattern_values
+        )
+    if not valid_pattern_values:
+        raise ArtifactValidationError(
+            "acquisition.pattern_values contain invalid native values"
+        )
+    if list(pattern_values) != _pattern_values(value["pattern_family"]):
+        raise ArtifactValidationError(
+            "acquisition.pattern_values disagree with pattern_family"
+        )
+    sigma = value["noise_sigma_absolute"]
+    if (
+        type(sigma) not in (int, float)
+        or not math.isfinite(sigma)
+        or sigma < 0
+    ):
+        raise ArtifactValidationError(
+            "acquisition.noise_sigma_absolute must be a finite nonnegative number"
+        )
+    canonical_json_bytes(value)
+    return value
 
 
 def _validate_acquisition_identity(data: SPIAcquisitionData) -> None:
     validate_sha256(data.dataset_identity_sha256, "dataset identity")
-    validate_sha256(data.target_asset_sha256, "target asset hash")
-    validate_path_free_opaque_id(
-        data.generator_code_version, "generator_code_version"
-    )
-    validate_exact_int(data.seed, "seed")
-    for name in (
-        "pattern_family",
-        "pattern_order",
-        "time_assignment_mode",
-        "noise_convention",
-        "motion_model",
-    ):
-        value = getattr(data, name)
-        if type(value) is not str or not value.strip():
-            raise ArtifactValidationError(f"{name} must be a non-empty string")
     _validate_acquisition_shapes(data)
-    config = validate_generation_config(data.resolved_generation_config)
-    if canonical_json_bytes(config) != canonical_json_bytes(
-        data.resolved_generation_config
-    ):
-        raise ArtifactValidationError(
-            "resolved generation config is not canonical"
-        )
-    identity_config = validate_acquisition_identity_spec(
-        data.dataset_identity_spec
-    )
-    if canonical_json_bytes(identity_config) != canonical_json_bytes(config):
-        raise ArtifactValidationError(
-            "identity config disagrees with acquisition config"
-        )
-    redundant_fields = {
-        "H": data.H,
-        "W": data.W,
-        "T": data.T,
-        "K": data.K,
-        "seed": data.seed,
-        "pattern_family": data.pattern_family,
-        "pattern_order": data.pattern_order,
-        "time_assignment_mode": data.time_assignment_mode,
-        "noise_convention": data.noise_convention,
-        "motion_model": data.motion_model,
+    _validate_blind_acquisition(data.acquisition)
+    arrays = {
+        name: value
+        for name, value in _acquisition_arrays(data).items()
+        if value is not None
     }
-    expected_fields = {
-        "H": config["H"],
-        "W": config["W"],
-        "T": config["T"],
-        "K": config["K"],
-        "seed": config["seed"],
-        "pattern_family": config["pattern"]["family"],
-        "pattern_order": config["pattern"]["order"],
-        "time_assignment_mode": config["time_assignment"]["mode"],
-        "noise_convention": config["noise"]["convention"],
-        "motion_model": config["motion"]["model"],
+    if not isinstance(data.array_descriptors, Mapping):
+        raise ArtifactValidationError("array_descriptors must be an object")
+    validate_exact_keys(
+        data.array_descriptors,
+        set(arrays),
+        "acquisition array descriptors",
+    )
+    for name, array in arrays.items():
+        validate_array_descriptor(
+            name, array, data.array_descriptors[name]
+        )
+
+
+def blind_acquisition_spec(
+    data: SPIAcquisitionData,
+) -> Mapping[str, object]:
+    _validate_acquisition_identity(data)
+    return {
+        "schema_version": BLIND_ACQUISITION_SPEC_SCHEMA,
+        "dimensions": {
+            "H": data.H,
+            "W": data.W,
+            "T": data.T,
+            "K": data.K,
+            "holdout_K": data.holdout_K,
+        },
+        "acquisition": data.acquisition,
     }
-    if redundant_fields != expected_fields:
-        raise ArtifactValidationError(
-            "redundant acquisition fields disagree with resolved generation config"
-        )
-    if canonical_json_bytes(data.noise_parameters) != canonical_json_bytes(
-        config["noise"]["parameters"]
-    ):
-        raise ArtifactValidationError(
-            "noise parameters disagree with resolved generation config"
-        )
-    if canonical_json_bytes(data.motion_parameters) != canonical_json_bytes(
-        config["motion"]["parameters"]
-    ):
-        raise ArtifactValidationError(
-            "motion parameters disagree with resolved generation config"
-        )
-    holdout_arrays = (
-        data.holdout_patterns,
-        data.holdout_measurements,
-        data.holdout_frame_indices,
-    )
-    holdout_present = all(value is not None for value in holdout_arrays)
-    holdout_count = (
-        data.holdout_patterns.shape[0] if data.holdout_patterns is not None else 0
-    )
-    if (
-        config["holdout"]["present"] != holdout_present
-        or config["holdout"]["count"] != holdout_count
-    ):
-        raise ArtifactValidationError(
-            "holdout config disagrees with array presence or count"
-        )
-    expected_spec = acquisition_identity_spec(
-        arrays=_acquisition_arrays(data),
-        H=data.H,
-        W=data.W,
-        T=data.T,
-        K=data.K,
-        resolved_generation_config=data.resolved_generation_config,
-        generator_code_version=data.generator_code_version,
-        target_asset_sha256=data.target_asset_sha256,
-        seed=data.seed,
-        pattern_family=data.pattern_family,
-        pattern_order=data.pattern_order,
-        time_assignment_mode=data.time_assignment_mode,
-        noise_convention=data.noise_convention,
-        noise_parameters=data.noise_parameters,
-        motion_model=data.motion_model,
-        motion_parameters=data.motion_parameters,
-        schema=ACQUISITION_SCHEMA,
-    )
-    if canonical_json_bytes(data.dataset_identity_spec) != canonical_json_bytes(
-        expected_spec
-    ):
-        raise ArtifactValidationError(
-            "dataset identity spec does not match acquisition fields"
-        )
-    expected_identity = sha256_bytes(canonical_json_bytes(expected_spec))
-    if data.dataset_identity_sha256 != expected_identity:
-        raise ArtifactValidationError("dataset identity mismatch")
+
+
+def _pattern_values(pattern_family: str) -> list[object]:
+    if pattern_family.startswith("hadamard"):
+        return [-1, 1]
+    if pattern_family == "gaussian":
+        return ["real"]
+    return [0, 1]
 
 
 def split_spi_data(
@@ -357,28 +407,36 @@ def split_spi_data(
         noise_parameters=noise["parameters"],
         motion_model=motion["model"],
         motion_parameters=motion_parameters,
-        schema=ACQUISITION_SCHEMA,
+        schema=_LEGACY_IDENTITY_SCHEMA,
     )
     dataset_identity_sha256 = sha256_bytes(canonical_json_bytes(identity_spec))
+    sigma_absolute = noise["parameters"]["sigma_abs"]
+    if sigma_absolute is None:
+        raise ArtifactValidationError(
+            "blind acquisition artifacts require an absolute noise sigma"
+        )
     acquisition = SPIAcquisitionData(
         dataset_identity_sha256=dataset_identity_sha256,
-        dataset_identity_spec=identity_spec,
         **arrays,
         H=config["H"],
         W=config["W"],
         T=config["T"],
         K=config["K"],
-        resolved_generation_config=config,
-        generator_code_version=generator_code_version,
-        target_asset_sha256=target_asset_sha256,
-        seed=config["seed"],
-        pattern_family=pattern["family"],
-        pattern_order=pattern["order"],
-        time_assignment_mode=time_assignment["mode"],
-        noise_convention=noise["convention"],
-        noise_parameters=noise["parameters"],
-        motion_model=motion["model"],
-        motion_parameters=motion_parameters,
+        holdout_K=actual_holdout_count,
+        acquisition={
+            "pattern_family": pattern["family"],
+            "pattern_values": _pattern_values(pattern["family"]),
+            "pattern_order": pattern["order"],
+            "time_assignment": time_assignment["mode"],
+            "holdout_pattern_family": holdout["pattern_family"],
+            "noise_convention": noise["convention"],
+            "noise_sigma_absolute": sigma_absolute,
+        },
+        array_descriptors={
+            name: array_descriptor(value)
+            for name, value in arrays.items()
+            if value is not None
+        },
     )
     time_grid = np.asarray(data.t_grid, dtype=np.float64)
     omega = float(motion_parameters["omega"])
@@ -414,26 +472,17 @@ def split_spi_data(
 
 _ACQUISITION_METADATA_KEYS = {
     "array_descriptors",
+    "acquisition",
     "dataset_identity_sha256",
-    "dataset_identity_spec",
     "dimensions",
-    "generator_code_version",
-    "motion_model",
-    "motion_parameters",
-    "noise_convention",
-    "noise_parameters",
     "optional_arrays",
-    "pattern_family",
-    "pattern_order",
-    "resolved_generation_config",
-    "schema",
-    "seed",
-    "target_asset_sha256",
-    "time_assignment_mode",
+    "schema_version",
 }
 
 
-def save_acquisition_data(data: SPIAcquisitionData, path: Path) -> str:
+def _acquisition_metadata(
+    data: SPIAcquisitionData,
+) -> tuple[Mapping[str, np.ndarray], Mapping[str, object]]:
     _validate_acquisition_identity(data)
     all_arrays = _acquisition_arrays(data)
     arrays = {name: value for name, value in all_arrays.items() if value is not None}
@@ -446,41 +495,91 @@ def save_acquisition_data(data: SPIAcquisitionData, path: Path) -> str:
         )
     }
     metadata = {
-        "schema": ACQUISITION_SCHEMA,
+        "schema_version": ACQUISITION_SCHEMA,
         "dataset_identity_sha256": data.dataset_identity_sha256,
-        "dataset_identity_spec": data.dataset_identity_spec,
-        "dimensions": {"H": data.H, "W": data.W, "T": data.T, "K": data.K},
-        "resolved_generation_config": data.resolved_generation_config,
-        "generator_code_version": data.generator_code_version,
-        "target_asset_sha256": data.target_asset_sha256,
-        "seed": data.seed,
-        "pattern_family": data.pattern_family,
-        "pattern_order": data.pattern_order,
-        "time_assignment_mode": data.time_assignment_mode,
-        "noise_convention": data.noise_convention,
-        "noise_parameters": data.noise_parameters,
-        "motion_model": data.motion_model,
-        "motion_parameters": data.motion_parameters,
+        "dimensions": {
+            "H": data.H,
+            "W": data.W,
+            "T": data.T,
+            "K": data.K,
+            "holdout_K": data.holdout_K,
+        },
+        "acquisition": data.acquisition,
         "optional_arrays": optional_arrays,
         "array_descriptors": {
             name: array_descriptor(value) for name, value in arrays.items()
         },
     }
+    return arrays, metadata
+
+
+def acquisition_npz_bytes(data: SPIAcquisitionData) -> bytes:
+    arrays, metadata = _acquisition_metadata(data)
+    return npz_bytes(arrays=arrays, metadata=metadata)
+
+
+def save_acquisition_data(data: SPIAcquisitionData, path: Path) -> str:
+    arrays, metadata = _acquisition_metadata(data)
     return write_npz(Path(path), arrays=arrays, metadata=metadata)
 
 
 def load_acquisition_data(
     path: Path,
     *,
-    expected_spec: Mapping[str, object] | None = None,
+    expected_dataset_identity_sha256: str,
+    expected_acquisition_spec: Mapping[str, object] | None = None,
 ) -> SPIAcquisitionData:
-    members = read_npz_members(Path(path))
+    return _load_acquisition_members(
+        read_npz_members(
+            Path(path),
+            allowed_members=_ACQUISITION_MEMBER_ALLOWLIST,
+        ),
+        expected_dataset_identity_sha256=(
+            expected_dataset_identity_sha256
+        ),
+        expected_acquisition_spec=expected_acquisition_spec,
+    )
+
+
+def load_acquisition_data_bytes(
+    payload: bytes,
+    *,
+    expected_dataset_identity_sha256: str,
+    expected_acquisition_spec: Mapping[str, object] | None = None,
+) -> SPIAcquisitionData:
+    return _load_acquisition_members(
+        read_npz_members_bytes(
+            payload,
+            allowed_members=_ACQUISITION_MEMBER_ALLOWLIST,
+        ),
+        expected_dataset_identity_sha256=(
+            expected_dataset_identity_sha256
+        ),
+        expected_acquisition_spec=expected_acquisition_spec,
+    )
+
+
+def _load_acquisition_members(
+    members: Mapping[str, bytes],
+    *,
+    expected_dataset_identity_sha256: str,
+    expected_acquisition_spec: Mapping[str, object] | None,
+) -> SPIAcquisitionData:
+    validate_sha256(
+        expected_dataset_identity_sha256, "expected dataset identity"
+    )
     metadata = decode_metadata(members)
     validate_exact_keys(
         metadata, _ACQUISITION_METADATA_KEYS, "acquisition metadata"
     )
-    if metadata["schema"] != ACQUISITION_SCHEMA:
+    if metadata["schema_version"] != ACQUISITION_SCHEMA:
         raise ArtifactValidationError("acquisition schema mismatch")
+    validate_sha256(metadata["dataset_identity_sha256"], "dataset identity")
+    if (
+        metadata["dataset_identity_sha256"]
+        != expected_dataset_identity_sha256
+    ):
+        raise ArtifactValidationError("acquisition dataset identity mismatch")
     optional = metadata["optional_arrays"]
     if not isinstance(optional, Mapping):
         raise ArtifactValidationError("optional_arrays must be an object")
@@ -521,26 +620,45 @@ def load_acquisition_data(
     dimensions = metadata["dimensions"]
     if not isinstance(dimensions, Mapping):
         raise ArtifactValidationError("dimensions must be an object")
-    validate_exact_keys(dimensions, {"H", "W", "T", "K"}, "dimensions")
+    validate_exact_keys(
+        dimensions, {"H", "W", "T", "K", "holdout_K"}, "dimensions"
+    )
     for name in ("H", "W", "T", "K"):
         validate_exact_int(dimensions[name], f"dimensions.{name}", minimum=1)
-    config = validate_generation_config(metadata["resolved_generation_config"])
-    if expected_spec is not None:
-        try:
-            validated_expected_spec = validate_generation_config(expected_spec)
-        except ArtifactValidationError as exc:
+    validate_exact_int(
+        dimensions["holdout_K"], "dimensions.holdout_K", minimum=0
+    )
+    acquisition = _validate_blind_acquisition(metadata["acquisition"])
+    if expected_acquisition_spec is not None:
+        if not isinstance(expected_acquisition_spec, Mapping):
             raise ArtifactValidationError(
-                f"expected spec is invalid: {exc}"
-            ) from exc
-        if canonical_json_bytes(config) != canonical_json_bytes(
-            validated_expected_spec
+                "expected acquisition spec must be an object"
+            )
+        validate_exact_keys(
+            expected_acquisition_spec,
+            {"schema_version", "dimensions", "acquisition"},
+            "expected acquisition spec",
+        )
+        if (
+            expected_acquisition_spec["schema_version"]
+            != BLIND_ACQUISITION_SPEC_SCHEMA
         ):
             raise ArtifactValidationError(
-                "stored acquisition does not match expected spec"
+                "expected acquisition spec schema mismatch"
+            )
+        stored_spec = {
+            "schema_version": BLIND_ACQUISITION_SPEC_SCHEMA,
+            "dimensions": dimensions,
+            "acquisition": acquisition,
+        }
+        if canonical_json_bytes(stored_spec) != canonical_json_bytes(
+            expected_acquisition_spec
+        ):
+            raise ArtifactValidationError(
+                "stored acquisition does not match expected acquisition spec"
             )
     data = SPIAcquisitionData(
         dataset_identity_sha256=metadata["dataset_identity_sha256"],
-        dataset_identity_spec=metadata["dataset_identity_spec"],
         patterns=arrays["patterns"],
         measurements=arrays["measurements"],
         frame_indices=arrays["frame_indices"],
@@ -552,17 +670,9 @@ def load_acquisition_data(
         W=dimensions["W"],
         T=dimensions["T"],
         K=dimensions["K"],
-        resolved_generation_config=config,
-        generator_code_version=metadata["generator_code_version"],
-        target_asset_sha256=metadata["target_asset_sha256"],
-        seed=metadata["seed"],
-        pattern_family=metadata["pattern_family"],
-        pattern_order=metadata["pattern_order"],
-        time_assignment_mode=metadata["time_assignment_mode"],
-        noise_convention=metadata["noise_convention"],
-        noise_parameters=metadata["noise_parameters"],
-        motion_model=metadata["motion_model"],
-        motion_parameters=metadata["motion_parameters"],
+        holdout_K=dimensions["holdout_K"],
+        acquisition=acquisition,
+        array_descriptors=descriptors,
     )
     _validate_acquisition_identity(data)
     return data

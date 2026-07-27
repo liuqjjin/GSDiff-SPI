@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from pathlib import Path
 import subprocess
 import sys
+import time
 import zipfile
 
 import numpy as np
@@ -21,6 +22,7 @@ from gsdiff.data.artifacts import (
     ReconstructionOutput,
     SPIAcquisitionData,
     artifact_sha256,
+    blind_acquisition_spec,
     load_acquisition_data,
     load_evaluation_truth,
     load_reconstruction_output,
@@ -43,6 +45,13 @@ SEMANTIC_STRING_FIELDS = (
     "motion_model",
     "holdout_pattern_family",
     "generator_code_version",
+)
+BLIND_SEMANTIC_STRING_FIELDS = (
+    "pattern_family",
+    "pattern_order",
+    "time_assignment",
+    "holdout_pattern_family",
+    "noise_convention",
 )
 FORBIDDEN_SEMANTIC_STRINGS = (
     r"C:\private\payload.npz",
@@ -199,6 +208,8 @@ def _npy_bytes(array):
 
 
 def _rewrite_npz(source, destination, transform):
+    import gsdiff.data._artifact_io as artifact_io
+
     with zipfile.ZipFile(source, "r") as archive:
         members = {name: archive.read(name) for name in archive.namelist()}
     transformed = transform(members)
@@ -206,7 +217,12 @@ def _rewrite_npz(source, destination, transform):
         destination, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9
     ) as archive:
         for name in sorted(transformed):
-            archive.writestr(name, transformed[name])
+            archive.writestr(
+                artifact_io._zip_info(name),
+                transformed[name],
+                compress_type=zipfile.ZIP_DEFLATED,
+                compresslevel=9,
+            )
 
 
 def _replace_metadata(members, mutator):
@@ -275,37 +291,13 @@ def _set_identity_semantic(spec, field, value):
 
 
 def _coherent_semantic_acquisition(acquisition, field, value):
-    config = _mutable_json(acquisition.resolved_generation_config)
-    identity_spec = _mutable_json(acquisition.dataset_identity_spec)
-    _set_config_semantic(config, field, value)
-    _set_config_semantic(
-        identity_spec["resolved_generation_config"], field, value
-    )
-    _set_identity_semantic(identity_spec, field, value)
-    replacements = {
-        "dataset_identity_spec": identity_spec,
-        "dataset_identity_sha256": hashlib.sha256(
-            _canonical_json_bytes(identity_spec)
-        ).hexdigest(),
-        "resolved_generation_config": config,
-    }
-    if field != "holdout_pattern_family":
-        replacements[field] = value
-    return dataclasses.replace(acquisition, **replacements)
+    acquisition_spec = _mutable_json(acquisition.acquisition)
+    acquisition_spec[field] = value
+    return dataclasses.replace(acquisition, acquisition=acquisition_spec)
 
 
 def _set_metadata_semantic(metadata, field, value):
-    _set_config_semantic(
-        metadata["resolved_generation_config"], field, value
-    )
-    identity_spec = metadata["dataset_identity_spec"]
-    _set_config_semantic(
-        identity_spec["resolved_generation_config"], field, value
-    )
-    _set_identity_semantic(identity_spec, field, value)
-    if field != "holdout_pattern_family":
-        metadata[field] = value
-    _refresh_metadata_identity(metadata)
+    metadata["acquisition"][field] = value
 
 
 def _raw_output(acquisition):
@@ -346,7 +338,9 @@ def t300_pair():
 def _write_entry_config(path, acquisition, output_dir):
     config = {
         "seed": 7,
-        "dataset_spec": _mutable_json(acquisition.resolved_generation_config),
+        "acquisition_spec": _mutable_json(
+            blind_acquisition_spec(acquisition)
+        ),
         "scene": {
             "type": "gaussian",
             "num_gaussians": 4,
@@ -362,7 +356,7 @@ def _write_entry_config(path, acquisition, output_dir):
             "pattern_order": acquisition.pattern_order,
             "time_assignment_mode": acquisition.time_assignment_mode,
             "shape": "must-not-be-generated",
-            "motion_type": acquisition.motion_model,
+            "motion_type": "blind",
             "holdout_mod": 0,
         },
         "solver": {
@@ -438,7 +432,8 @@ def test_round_trip_restores_every_field_and_returns_direct_file_hash(tmp_path):
 
     loaded_acquisition = load_acquisition_data(
         acquisition_path,
-        expected_spec=acquisition.resolved_generation_config,
+        expected_dataset_identity_sha256=acquisition.dataset_identity_sha256,
+        expected_acquisition_spec=blind_acquisition_spec(acquisition),
     )
     loaded_truth = load_evaluation_truth(
         truth_path,
@@ -478,13 +473,12 @@ def test_repeated_saves_are_byte_identical_for_both_artifacts(tmp_path):
 def test_dataset_identity_is_canonical_spec_hash_shared_by_pair():
     acquisition, truth = _tiny_pair()
     expected = hashlib.sha256(
-        _canonical_json_bytes(acquisition.dataset_identity_spec)
+        _canonical_json_bytes(truth.dataset_identity_spec)
     ).hexdigest()
 
     assert acquisition.dataset_identity_sha256 == expected
     assert truth.dataset_identity_sha256 == expected
-    assert acquisition.dataset_identity_spec == truth.dataset_identity_spec
-    assert set(acquisition.dataset_identity_spec) == {
+    assert set(truth.dataset_identity_spec) == {
         "arrays",
         "dimensions",
         "generator_code_version",
@@ -498,10 +492,10 @@ def test_dataset_identity_is_canonical_spec_hash_shared_by_pair():
         "target_asset_sha256",
         "time_assignment_mode",
     }
-    assert acquisition.dataset_identity_spec["schema"] == "measurements-v1"
-    identity_motion = acquisition.dataset_identity_spec["motion"]["parameters"]
+    assert truth.dataset_identity_spec["schema"] == "measurements-v1"
+    identity_motion = truth.dataset_identity_spec["motion"]["parameters"]
     assert identity_motion["acceleration"] == (0.2, 0.1)
-    assert acquisition.dataset_identity_spec["motion"]["parameters"]["beta"] == 0.03
+    assert truth.dataset_identity_spec["motion"]["parameters"]["beta"] == 0.03
 
 
 def test_acquisition_archive_has_only_measurement_side_members_and_metadata(tmp_path):
@@ -546,7 +540,9 @@ def test_absent_holdout_is_explicit_and_restored_as_none(tmp_path):
     save_acquisition_data(acquisition, path)
 
     loaded = load_acquisition_data(
-        path, expected_spec=acquisition.resolved_generation_config
+        path,
+        expected_dataset_identity_sha256=acquisition.dataset_identity_sha256,
+        expected_acquisition_spec=blind_acquisition_spec(acquisition),
     )
 
     assert loaded.holdout_patterns is None
@@ -572,47 +568,71 @@ def test_artifact_hash_is_direct_lowercase_sha256(tmp_path):
 @pytest.mark.parametrize(
     ("path", "changed"),
     [
-        (("time_assignment", "mode"), "interpolation"),
-        (("pattern", "family"), "gaussian"),
-        (("pattern", "order"), "random"),
-        (("noise", "convention"), "ac-variance-snr"),
-        (("motion", "model"), "translation"),
+        (("acquisition", "time_assignment"), "interpolation"),
+        (("acquisition", "pattern_family"), "gaussian"),
+        (("acquisition", "pattern_order"), "random"),
+        (("acquisition", "noise_convention"), "ac-variance-snr"),
+        (("acquisition", "holdout_pattern_family"), "other"),
     ],
     ids=[
         "time-assignment",
         "pattern-family",
         "pattern-order",
         "noise-convention",
-        "motion-model",
+        "holdout-pattern-family",
     ],
 )
 def test_expected_spec_rejects_every_physics_mismatch(tmp_path, path, changed):
     acquisition, _ = _tiny_pair()
     artifact_path = tmp_path / "measurements.npz"
     save_acquisition_data(acquisition, artifact_path)
-    mismatched = _mutable_json(acquisition.resolved_generation_config)
+    mismatched = _mutable_json(blind_acquisition_spec(acquisition))
     cursor = mismatched
     for key in path[:-1]:
         cursor = cursor[key]
     cursor[path[-1]] = changed
 
-    with pytest.raises(ArtifactValidationError, match="expected spec"):
-        load_acquisition_data(artifact_path, expected_spec=mismatched)
+    with pytest.raises(
+        ArtifactValidationError, match="expected acquisition spec"
+    ):
+        load_acquisition_data(
+            artifact_path,
+            expected_dataset_identity_sha256=(
+                acquisition.dataset_identity_sha256
+            ),
+            expected_acquisition_spec=mismatched,
+        )
 
 
 def test_expected_spec_is_fail_closed_for_missing_or_extra_fields(tmp_path):
     acquisition, _ = _tiny_pair()
     artifact_path = tmp_path / "measurements.npz"
     save_acquisition_data(acquisition, artifact_path)
-    missing = _mutable_json(acquisition.resolved_generation_config)
-    del missing["noise"]["parameters"]["snr_db"]
-    extra = _mutable_json(acquisition.resolved_generation_config)
-    extra["motion"]["parameters"]["untrusted_yaml_only"] = 1
+    missing = _mutable_json(blind_acquisition_spec(acquisition))
+    del missing["acquisition"]["noise_sigma_absolute"]
+    extra = _mutable_json(blind_acquisition_spec(acquisition))
+    extra["untrusted_yaml_only"] = 1
 
-    with pytest.raises(ArtifactValidationError, match="expected spec"):
-        load_acquisition_data(artifact_path, expected_spec=missing)
-    with pytest.raises(ArtifactValidationError, match="expected spec"):
-        load_acquisition_data(artifact_path, expected_spec=extra)
+    with pytest.raises(
+        ArtifactValidationError, match="expected acquisition spec"
+    ):
+        load_acquisition_data(
+            artifact_path,
+            expected_dataset_identity_sha256=(
+                acquisition.dataset_identity_sha256
+            ),
+            expected_acquisition_spec=missing,
+        )
+    with pytest.raises(
+        ArtifactValidationError, match="expected acquisition spec"
+    ):
+        load_acquisition_data(
+            artifact_path,
+            expected_dataset_identity_sha256=(
+                acquisition.dataset_identity_sha256
+            ),
+            expected_acquisition_spec=extra,
+        )
 
 
 @pytest.mark.parametrize(
@@ -758,7 +778,7 @@ def test_target_descriptor_accepts_opaque_logical_ids(descriptor):
     data, config, target_hash = _tiny_source()
     config["target"]["descriptor"] = descriptor
 
-    acquisition, _ = split_spi_data(
+    _, truth = split_spi_data(
         data,
         resolved_generation_config=config,
         generator_code_version="gsdiff-simulation-test-v1",
@@ -766,7 +786,9 @@ def test_target_descriptor_accepts_opaque_logical_ids(descriptor):
     )
 
     assert (
-        acquisition.resolved_generation_config["target"]["descriptor"]
+        truth.dataset_identity_spec["resolved_generation_config"]["target"][
+            "descriptor"
+        ]
         == descriptor
     )
 
@@ -788,7 +810,9 @@ def test_builtin_char_target_round_trips_complete_artifact_pair(
     save_evaluation_truth(truth, truth_path)
 
     loaded_acquisition = load_acquisition_data(
-        acquisition_path, expected_spec=config
+        acquisition_path,
+        expected_dataset_identity_sha256=acquisition.dataset_identity_sha256,
+        expected_acquisition_spec=blind_acquisition_spec(acquisition),
     )
     loaded_truth = load_evaluation_truth(
         truth_path,
@@ -797,7 +821,9 @@ def test_builtin_char_target_round_trips_complete_artifact_pair(
         ),
     )
 
-    assert loaded_acquisition.resolved_generation_config["target"] == {
+    assert loaded_truth.dataset_identity_spec["resolved_generation_config"][
+        "target"
+    ] == {
         "kind": "builtin",
         "descriptor": descriptor,
     }
@@ -898,7 +924,7 @@ def test_semantic_strings_reject_coercible_non_exact_string_types(
 
 @pytest.mark.parametrize(
     "field",
-    SEMANTIC_STRING_FIELDS,
+    BLIND_SEMANTIC_STRING_FIELDS,
 )
 @pytest.mark.parametrize(
     "forbidden",
@@ -922,7 +948,7 @@ def test_save_rejects_coherent_forbidden_semantics_before_writing(
 
 @pytest.mark.parametrize(
     "field",
-    SEMANTIC_STRING_FIELDS,
+    BLIND_SEMANTIC_STRING_FIELDS,
 )
 @pytest.mark.parametrize(
     "forbidden",
@@ -950,7 +976,12 @@ def test_loader_rejects_identity_coherent_forbidden_semantics(
     )
 
     with pytest.raises(ArtifactValidationError):
-        load_acquisition_data(forged)
+        load_acquisition_data(
+            forged,
+            expected_dataset_identity_sha256=(
+                acquisition.dataset_identity_sha256
+            ),
+        )
 
 
 @pytest.mark.parametrize(
@@ -1018,14 +1049,17 @@ def test_generator_code_version_accepts_path_free_opaque_ids(
 ):
     data, config, target_hash = _tiny_source()
 
-    acquisition, _ = split_spi_data(
+    _, truth = split_spi_data(
         data,
         resolved_generation_config=config,
         generator_code_version=generator_code_version,
         target_asset_sha256=target_hash,
     )
 
-    assert acquisition.generator_code_version == generator_code_version
+    assert (
+        truth.dataset_identity_spec["generator_code_version"]
+        == generator_code_version
+    )
 
 
 @pytest.mark.parametrize(
@@ -1042,14 +1076,17 @@ def test_generator_code_version_accepts_opaque_id_boundaries(
 ):
     data, config, target_hash = _tiny_source()
 
-    acquisition, _ = split_spi_data(
+    _, truth = split_spi_data(
         data,
         resolved_generation_config=config,
         generator_code_version=generator_code_version,
         target_asset_sha256=target_hash,
     )
 
-    assert acquisition.generator_code_version == generator_code_version
+    assert (
+        truth.dataset_identity_spec["generator_code_version"]
+        == generator_code_version
+    )
 
 
 @pytest.mark.parametrize(
@@ -1108,13 +1145,6 @@ def test_loader_rejects_split_brain_redundant_physics(
 
     def mutate(metadata):
         metadata[metadata_field] = changed
-        if identity_field == "noise":
-            metadata["dataset_identity_spec"]["noise"]["convention"] = changed
-        elif identity_field == "motion":
-            metadata["dataset_identity_spec"]["motion"]["model"] = changed
-        else:
-            metadata["dataset_identity_spec"][identity_field] = changed
-        _refresh_metadata_identity(metadata)
 
     _rewrite_npz(
         source,
@@ -1123,7 +1153,12 @@ def test_loader_rejects_split_brain_redundant_physics(
     )
 
     with pytest.raises(ArtifactValidationError):
-        load_acquisition_data(forged)
+        load_acquisition_data(
+            forged,
+            expected_dataset_identity_sha256=(
+                acquisition.dataset_identity_sha256
+            ),
+        )
 
 
 def test_loader_rejects_coercible_redundant_seed_type(tmp_path):
@@ -1140,7 +1175,12 @@ def test_loader_rejects_coercible_redundant_seed_type(tmp_path):
     )
 
     with pytest.raises(ArtifactValidationError):
-        load_acquisition_data(forged)
+        load_acquisition_data(
+            forged,
+            expected_dataset_identity_sha256=(
+                acquisition.dataset_identity_sha256
+            ),
+        )
 
 
 def test_loader_rejects_capability_injected_inside_identity_bound_config(
@@ -1153,13 +1193,7 @@ def test_loader_rejects_capability_injected_inside_identity_bound_config(
 
     def mutate(metadata):
         injected = {"metric": "psnr", "path": "evaluation-truth.npz"}
-        metadata["resolved_generation_config"]["noise"]["parameters"][
-            "evaluator"
-        ] = injected
-        metadata["dataset_identity_spec"]["resolved_generation_config"][
-            "noise"
-        ]["parameters"]["evaluator"] = injected
-        _refresh_metadata_identity(metadata)
+        metadata["acquisition"]["evaluator"] = injected
 
     _rewrite_npz(
         source,
@@ -1168,7 +1202,12 @@ def test_loader_rejects_capability_injected_inside_identity_bound_config(
     )
 
     with pytest.raises(ArtifactValidationError):
-        load_acquisition_data(forged)
+        load_acquisition_data(
+            forged,
+            expected_dataset_identity_sha256=(
+                acquisition.dataset_identity_sha256
+            ),
+        )
 
 
 @pytest.mark.parametrize(
@@ -1289,7 +1328,7 @@ def test_split_compares_motion_at_source_float_precision():
     np.testing.assert_array_equal(
         truth.gt_velocity, np.array([0.2, -0.1], dtype=np.float32)
     )
-    assert acquisition.motion_parameters["omega"] == 0.2
+    assert truth.dataset_identity_spec["motion"]["parameters"]["omega"] == 0.2
 
 
 @pytest.mark.parametrize("field", ["gt_velocity", "gt_omega"])
@@ -1444,7 +1483,12 @@ def test_loader_rejects_nan_even_with_matching_local_array_descriptor(
     with pytest.raises(
         ArtifactValidationError, match="patterns.*real numeric finite"
     ):
-        load_acquisition_data(forged)
+        load_acquisition_data(
+            forged,
+            expected_dataset_identity_sha256=(
+                acquisition.dataset_identity_sha256
+            ),
+        )
 
 
 @pytest.mark.parametrize(
@@ -1802,7 +1846,9 @@ def test_raw_target_asset_hash_does_not_equal_decoded_canonical_hash(
     save_acquisition_data(acquisition, acquisition_path)
     save_evaluation_truth(truth, truth_path)
     loaded_acquisition = load_acquisition_data(
-        acquisition_path, expected_spec=config
+        acquisition_path,
+        expected_dataset_identity_sha256=acquisition.dataset_identity_sha256,
+        expected_acquisition_spec=blind_acquisition_spec(acquisition),
     )
     loaded_truth = load_evaluation_truth(
         truth_path,
@@ -1811,7 +1857,10 @@ def test_raw_target_asset_hash_does_not_equal_decoded_canonical_hash(
         ),
     )
 
-    assert loaded_acquisition.target_asset_sha256 == raw_target_hash
+    assert (
+        loaded_truth.dataset_identity_spec["target_asset_sha256"]
+        == raw_target_hash
+    )
     np.testing.assert_array_equal(loaded_truth.canonical_image, data.canonical)
 
 
@@ -1827,13 +1876,7 @@ def test_artifact_metadata_is_recursively_immutable():
     )
 
     with pytest.raises(TypeError):
-        acquisition.resolved_generation_config["motion"]["parameters"][
-            "velocity"
-        ][0] = 999.0
-    with pytest.raises((TypeError, AttributeError)):
-        acquisition.dataset_identity_spec["arrays"]["patterns"]["shape"].append(
-            999
-        )
+        acquisition.acquisition["pattern_values"][0] = 999.0
     with pytest.raises(TypeError):
         truth.evaluator_metadata["report"]["metrics"][0] = "ssim"
     with pytest.raises(TypeError):
@@ -1933,7 +1976,12 @@ def test_loader_rejects_duplicate_zip_members(tmp_path):
             archive.writestr("patterns.npy", _npy_bytes(acquisition.patterns))
 
     with pytest.raises(ArtifactValidationError, match="duplicate"):
-        load_acquisition_data(path)
+        load_acquisition_data(
+            path,
+            expected_dataset_identity_sha256=(
+                acquisition.dataset_identity_sha256
+            ),
+        )
 
 
 def test_deterministic_zip_uses_fixed_member_metadata(tmp_path):
@@ -2038,7 +2086,10 @@ def test_loader_rejects_malformed_or_corrupted_acquisition(tmp_path, mutation):
             source,
             damaged,
             lambda members: _replace_metadata(
-                members, lambda metadata: metadata.update(schema="measurements-v2")
+                members,
+                lambda metadata: metadata.update(
+                    schema_version="measurements-blind-v2"
+                ),
             ),
         )
     elif mutation == "content-hash-mismatch":
@@ -2065,7 +2116,12 @@ def test_loader_rejects_malformed_or_corrupted_acquisition(tmp_path, mutation):
         )
 
     with pytest.raises(ArtifactValidationError):
-        load_acquisition_data(damaged)
+        load_acquisition_data(
+            damaged,
+            expected_dataset_identity_sha256=(
+                acquisition.dataset_identity_sha256
+            ),
+        )
 
 
 def test_loader_does_not_infer_or_open_a_sibling_truth_path(tmp_path):
@@ -2074,7 +2130,12 @@ def test_loader_does_not_infer_or_open_a_sibling_truth_path(tmp_path):
     save_acquisition_data(acquisition, path)
     assert [entry.name for entry in tmp_path.iterdir()] == ["measurements.npz"]
 
-    loaded = load_acquisition_data(path)
+    loaded = load_acquisition_data(
+        path,
+        expected_dataset_identity_sha256=(
+            acquisition.dataset_identity_sha256
+        ),
+    )
 
     assert loaded.dataset_identity_sha256 == acquisition.dataset_identity_sha256
     assert [entry.name for entry in tmp_path.iterdir()] == ["measurements.npz"]
@@ -2201,12 +2262,19 @@ def test_both_real_entrypoints_load_measurements_without_generation(
     train_output = tmp_path / "train-output"
     train_config = tmp_path / "train.yaml"
     _write_entry_config(train_config, acquisition, train_output)
+    blind_config = yaml.safe_load(train_config.read_text(encoding="utf-8"))
+    assert "dataset_spec" not in blind_config
+    assert blind_config["acquisition_spec"] == _mutable_json(
+        blind_acquisition_spec(acquisition)
+    )
     train.main(
         [
             "--config",
             str(train_config),
             "--measurements-path",
             str(measurements_path),
+            "--dataset-identity-sha256",
+            acquisition.dataset_identity_sha256,
             "--output-dir",
             str(train_output),
             "--device",
@@ -2233,6 +2301,8 @@ def test_both_real_entrypoints_load_measurements_without_generation(
             "cpu",
             "--measurements-path",
             str(measurements_path),
+            "--dataset-identity-sha256",
+            acquisition.dataset_identity_sha256,
             "--output-dir",
             str(baseline_output),
         ]
@@ -2267,6 +2337,8 @@ def test_explicit_truth_compatibility_paths_are_unblinded_and_not_promotable(
             str(config_path),
             "--measurements-path",
             str(measurements_path),
+            "--dataset-identity-sha256",
+            acquisition.dataset_identity_sha256,
             "--truth-path",
             str(truth_path),
             "--output-dir",
@@ -2304,6 +2376,8 @@ def test_explicit_truth_compatibility_paths_are_unblinded_and_not_promotable(
             "cpu",
             "--measurements-path",
             str(measurements_path),
+            "--dataset-identity-sha256",
+            acquisition.dataset_identity_sha256,
             "--truth-path",
             str(truth_path),
             "--output-dir",
@@ -2446,6 +2520,8 @@ def test_fresh_blind_entry_processes_keep_evaluator_import_graph_closed(
                     str(config_path),
                     "--measurements-path",
                     "measurements.npz",
+                    "--dataset-identity-sha256",
+                    acquisition.dataset_identity_sha256,
                     "--output-dir",
                     str(output_dir),
                     "--device",
@@ -2473,6 +2549,8 @@ def test_fresh_blind_entry_processes_keep_evaluator_import_graph_closed(
                 "cpu",
                 "--measurements-path",
                 "measurements.npz",
+                "--dataset-identity-sha256",
+                acquisition.dataset_identity_sha256,
                 "--output-dir",
                 str(baseline_output),
             ],
@@ -2539,6 +2617,8 @@ def test_real_method_child_subprocess_has_no_truth_capability(tmp_path):
         "cpu",
         "--measurements-path",
         "measurements.npz",
+        "--dataset-identity-sha256",
+        acquisition.dataset_identity_sha256,
         "--output-dir",
         str(output_dir),
     ]
@@ -2588,3 +2668,3457 @@ def test_real_method_child_subprocess_has_no_truth_capability(tmp_path):
     )
     assert truth_seeker.returncode != 0
     assert "FileNotFoundError" in truth_seeker.stderr
+
+
+# Task 3 publication datasets deliberately use a new incompatible blind
+# schema. These tests bind the child-visible capability boundary.
+def test_task3_blind_measurement_schema_uses_exact_member_and_metadata_allowlists(
+    tmp_path,
+):
+    acquisition, _ = _tiny_pair(seed=314159, shape="char:5")
+    destination = tmp_path / "measurements.npz"
+    save_acquisition_data(acquisition, destination)
+
+    with zipfile.ZipFile(destination) as archive:
+        assert set(archive.namelist()) == {
+            "__metadata_json__.npy",
+            "patterns.npy",
+            "measurements.npy",
+            "frame_indices.npy",
+            "time_grid.npy",
+            "holdout_patterns.npy",
+            "holdout_measurements.npy",
+            "holdout_frame_indices.npy",
+        }
+    metadata = _read_metadata(destination)
+    assert set(metadata) == {
+        "schema_version",
+        "dataset_identity_sha256",
+        "dimensions",
+        "acquisition",
+        "optional_arrays",
+        "array_descriptors",
+    }
+    assert set(metadata["dimensions"]) == {"H", "W", "T", "K", "holdout_K"}
+    assert set(metadata["acquisition"]) == {
+        "pattern_family",
+        "pattern_values",
+        "pattern_order",
+        "time_assignment",
+        "holdout_pattern_family",
+        "noise_convention",
+        "noise_sigma_absolute",
+    }
+    assert metadata["schema_version"] == "measurements-blind-v1"
+    serialized = json.dumps(metadata, sort_keys=True)
+    for sentinel in (
+        "char:5",
+        "314159",
+        "-0.5",
+        '"velocity"',
+        '"acceleration"',
+        '"omega"',
+        '"beta"',
+        "gsdiff-simulation-test-v1",
+    ):
+        assert sentinel not in serialized
+
+
+def test_task3_blind_object_has_no_truth_or_identity_spec_attributes():
+    acquisition, _ = _tiny_pair(seed=314159, shape="char:5")
+    forbidden = {
+        "dataset_identity_spec",
+        "resolved_generation_config",
+        "generator_code_version",
+        "target_asset_sha256",
+        "target_id",
+        "target",
+        "assets_sha256",
+        "seed",
+        "acquisition_seed",
+        "motion_id",
+        "motion_model",
+        "motion_parameters",
+        "velocity",
+        "acceleration",
+        "omega",
+        "beta",
+        "scientific_contract",
+        "campaign_id",
+        "method",
+        "truth_path",
+        "canonical_image",
+        "gt_frames",
+        "translation_trajectory",
+        "rotation_trajectory",
+    }
+    assert forbidden.isdisjoint(vars(acquisition))
+    assert "314159" not in json.dumps(
+        _read_metadata_from_acquisition(acquisition), sort_keys=True
+    )
+
+
+def _read_metadata_from_acquisition(acquisition):
+    destination = io.BytesIO()
+    from gsdiff.data._artifact_dataset import acquisition_npz_bytes
+
+    destination.write(acquisition_npz_bytes(acquisition))
+    destination.seek(0)
+    with zipfile.ZipFile(destination) as archive:
+        array = np.load(
+            io.BytesIO(archive.read("__metadata_json__.npy")),
+            allow_pickle=False,
+        )
+    return json.loads(array.tobytes().decode("utf-8"))
+
+
+def test_task3_blind_loader_requires_opaque_identity_and_blind_spec(tmp_path):
+    from gsdiff.data.artifacts import blind_acquisition_spec
+
+    acquisition, _ = _tiny_pair(seed=314159, shape="char:5")
+    path = tmp_path / "measurements.npz"
+    save_acquisition_data(acquisition, path)
+    with pytest.raises(TypeError):
+        load_acquisition_data(path)
+    loaded = load_acquisition_data(
+        path,
+        expected_dataset_identity_sha256=acquisition.dataset_identity_sha256,
+        expected_acquisition_spec=blind_acquisition_spec(acquisition),
+    )
+    assert loaded.dataset_identity_sha256 == acquisition.dataset_identity_sha256
+    with pytest.raises(ArtifactValidationError, match="identity"):
+        load_acquisition_data(
+            path,
+            expected_dataset_identity_sha256="f" * 64,
+            expected_acquisition_spec=blind_acquisition_spec(acquisition),
+        )
+
+
+def test_task3_dummy_child_receives_only_copied_blind_measurements(tmp_path):
+    acquisition, _ = _tiny_pair(seed=8675309, shape="char:5")
+    source = tmp_path / "source.npz"
+    save_acquisition_data(acquisition, source)
+    child_cwd = tmp_path / "isolated"
+    child_cwd.mkdir()
+    copied = child_cwd / "measurements.npz"
+    copied.write_bytes(source.read_bytes())
+    probe = (
+        "import json,os,sys,zipfile;"
+        "p=sys.argv[1];"
+        "z=zipfile.ZipFile(p);"
+        "raw=' '.join(z.namelist());"
+        "print(json.dumps({'argv':sys.argv[1:],'cwd':os.listdir('.'),'members':raw},sort_keys=True))"
+    )
+    env = {
+        "PATH": os.environ["PATH"],
+        "PYTHONIOENCODING": "utf-8",
+        "SYSTEMROOT": os.environ["SYSTEMROOT"],
+    }
+    completed = subprocess.run(
+        [str(AUTHORITATIVE_PYTHON), "-c", probe, "measurements.npz"],
+        cwd=child_cwd,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    observed = json.loads(completed.stdout)
+    assert observed["argv"] == ["measurements.npz"]
+    assert observed["cwd"] == ["measurements.npz"]
+    assert "truth" not in json.dumps(observed).lower()
+
+
+def _phase3b_generation_inputs(*, holdout_K=5, pattern_family="bernoulli"):
+    from gsdiff.data.artifacts import TargetSnapshot
+
+    canonical = np.arange(64, dtype=np.float32).reshape(8, 8) / 63.0
+    target = TargetSnapshot(
+        target_id="digit5",
+        descriptor="char:5",
+        assets_sha256={
+            "descriptor": hashlib.sha256(b"char:5").hexdigest(),
+            "font": "1" * 64,
+            "renderer": "2" * 64,
+        },
+        canonical_image=canonical,
+        renderer={
+            "font_family": "DejaVu Sans",
+            "fill_fraction": 0.8,
+            "resample": "lanczos",
+            "supersample": 4,
+        },
+    )
+    return {
+        "scientific_contract": {
+            "id": "gsdiff-test-v1",
+            "sha256": "3" * 64,
+        },
+        "target_snapshot": target,
+        "motion": {
+            "id": "transrot",
+            "velocity": [1.0, -0.5],
+            "acceleration": [0.2, 0.1],
+            "omega": 0.15,
+            "beta": 0.03,
+        },
+        "seed": 7,
+        "acquisition_config": {
+            "image_size": [8, 8],
+            "num_frames": 3,
+            "train_measurements": 12,
+            "holdout_measurements": holdout_K,
+            "pattern_family": pattern_family,
+            "pattern_values": (
+                [0, 1] if pattern_family != "gaussian" else ["real"]
+            ),
+            "pattern_order": "stratified",
+            "time_assignment": "uniform",
+            "holdout_pattern_family": "uniform-random",
+            "snr_db": 25.0,
+            "noise_calibration_id": "detector-absolute-v1",
+        },
+        "noise_calibration_entry": {
+            "id": "detector-absolute-v1",
+            "mode": "detector-absolute",
+            "reference": "corresponding-bernoulli-reference-cell",
+            "variance_ddof": 0,
+            "sigma_formula": (
+                "sqrt(var(y_reference,ddof=0))*10**(-snr_db/20)"
+            ),
+            "reuse": ["train", "holdout", "alternate-pattern"],
+        },
+        "generator": {
+            "id": "gsdiff-corrected-sim",
+            "version": "generator-v1",
+            "git_commit": "a" * 40,
+        },
+        "runtime": {
+            "dependencies_sha256": "4" * 64,
+            "environment_lock_sha256": "5" * 64,
+        },
+    }
+
+
+def _phase3b_generate(**overrides):
+    from gsdiff.data.artifacts import generate_corrected_dataset
+
+    inputs = _phase3b_generation_inputs()
+    inputs.update(overrides)
+    return generate_corrected_dataset(**inputs)
+
+
+def test_task3_c3a_request_resolver_is_rng_free_and_matches_generation(
+    monkeypatch,
+):
+    import gsdiff.data._corrected_generation as corrected
+    from gsdiff.data.artifacts import resolve_corrected_dataset_request
+
+    inputs = _phase3b_generation_inputs()
+
+    def forbidden_rng(*args, **kwargs):
+        raise AssertionError("request resolution entered RNG generation")
+
+    monkeypatch.setattr(corrected, "acquisition_rng", forbidden_rng)
+    request = resolve_corrected_dataset_request(**inputs)
+    monkeypatch.undo()
+    generated = _phase3b_generate()
+
+    assert set(request) == {
+        "schema_version",
+        "scientific_contract",
+        "target",
+        "motion",
+        "seed",
+        "acquisition_config",
+        "noise_calibration",
+        "generator",
+        "runtime",
+        "resolved_generator_config",
+    }
+    assert request["schema_version"] == "corrected-dataset-request-v1"
+    assert request["resolved_generator_config"] == (
+        generated.resolved_generator_config
+    )
+    assert request["scientific_contract"] == {
+        "id": "gsdiff-test-v1",
+        "sha256": "3" * 64,
+    }
+    assert request["target"] == {
+        "id": "digit5",
+        "descriptor": "char:5",
+        "assets_sha256": {
+            "descriptor": hashlib.sha256(b"char:5").hexdigest(),
+            "font": "1" * 64,
+            "renderer": "2" * 64,
+        },
+        "renderer": {
+            "font_family": "DejaVu Sans",
+            "fill_fraction": 0.8,
+            "resample": "lanczos",
+            "supersample": 4,
+        },
+    }
+    assert request["noise_calibration"] == {
+        "id": "detector-absolute-v1",
+        "registry_entry_sha256": hashlib.sha256(
+            _canonical_json_bytes(inputs["noise_calibration_entry"])
+        ).hexdigest(),
+        "entry": inputs["noise_calibration_entry"],
+    }
+
+
+def test_task3_dataset_identity_v1_is_exact_semantic_payload_without_outputs():
+    generated = _phase3b_generate()
+    spec = generated.dataset_identity_spec
+    assert set(spec) == {
+        "schema_version",
+        "scientific_contract",
+        "target",
+        "motion",
+        "seed",
+        "generator_config_sha256",
+        "noise_calibration",
+        "generator",
+        "runtime",
+    }
+    assert spec["schema_version"] == "dataset-identity-v1"
+    assert generated.dataset_identity_sha256 == hashlib.sha256(
+        _canonical_json_bytes(spec)
+    ).hexdigest()
+    serialized = json.dumps(spec, sort_keys=True)
+    for forbidden in (
+        "arrays",
+        "measurements_file",
+        "evaluation_truth_file",
+        "preview_file",
+        "manifest",
+        "path",
+        "timestamp",
+        "pid",
+        "hostname",
+        "campaign",
+        "method",
+        "optimizer",
+        "acquisition_config_id",
+        "method_config_id",
+    ):
+        assert forbidden not in serialized
+
+
+def test_task3_corrected_dataset_metadata_views_are_defensive_native_copies():
+    generated = _phase3b_generate()
+
+    identity = generated.dataset_identity_spec
+    config = generated.resolved_generator_config
+    calibration = generated.noise_calibration_record
+    assert type(identity) is dict
+    assert type(identity["target"]) is dict
+    assert type(config) is dict
+    assert type(calibration) is dict
+
+    identity["seed"] = 999
+    config["dimensions"]["K"] = 999
+    calibration["sigma_absolute"] = 999.0
+    assert generated.dataset_identity_spec["seed"] == 7
+    assert generated.resolved_generator_config["dimensions"]["K"] == 12
+    assert (
+        generated.noise_calibration_record["sigma_absolute"]
+        != 999.0
+    )
+    assert generated.truth.dataset_identity_spec["seed"] == 7
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "contract-id",
+        "contract-sha",
+        "target-id",
+        "asset-bytes",
+        "motion-id",
+        "seed",
+        "train-k",
+        "holdout-k",
+        "snr",
+        "pattern-family",
+        "calibration-entry",
+        "generator-id",
+        "generator-version",
+        "generator-commit",
+        "dependencies",
+        "environment",
+    ],
+)
+def test_task3_dataset_identity_changes_for_every_semantic_input(mutation):
+    import dataclasses as _dataclasses
+
+    baseline_inputs = _phase3b_generation_inputs()
+    changed = _phase3b_generation_inputs()
+    if mutation == "contract-id":
+        changed["scientific_contract"]["id"] = "other-contract"
+    elif mutation == "contract-sha":
+        changed["scientific_contract"]["sha256"] = "6" * 64
+    elif mutation == "target-id":
+        changed["target_snapshot"] = _dataclasses.replace(
+            changed["target_snapshot"], target_id="digit6"
+        )
+    elif mutation == "asset-bytes":
+        changed["target_snapshot"] = _dataclasses.replace(
+            changed["target_snapshot"],
+            assets_sha256={
+                **changed["target_snapshot"].assets_sha256,
+                "font": "6" * 64,
+            },
+        )
+    elif mutation == "motion-id":
+        changed["motion"]["id"] = "rot"
+    elif mutation == "seed":
+        changed["seed"] = 8
+    elif mutation == "train-k":
+        changed["acquisition_config"]["train_measurements"] = 13
+    elif mutation == "holdout-k":
+        changed["acquisition_config"]["holdout_measurements"] = 4
+    elif mutation == "snr":
+        changed["acquisition_config"]["snr_db"] = 20.0
+    elif mutation == "pattern-family":
+        changed["acquisition_config"]["pattern_family"] = "random"
+    elif mutation == "calibration-entry":
+        changed["noise_calibration_entry"]["sigma_formula"] += "+0"
+    elif mutation == "generator-id":
+        changed["generator"]["id"] = "other-generator"
+    elif mutation == "generator-version":
+        changed["generator"]["version"] = "generator-v2"
+    elif mutation == "generator-commit":
+        changed["generator"]["git_commit"] = "b" * 40
+    elif mutation == "dependencies":
+        changed["runtime"]["dependencies_sha256"] = "6" * 64
+    elif mutation == "environment":
+        changed["runtime"]["environment_lock_sha256"] = "6" * 64
+    baseline = _phase3b_generate(**baseline_inputs)
+    mutated = _phase3b_generate(**changed)
+    assert mutated.dataset_identity_sha256 != baseline.dataset_identity_sha256
+
+
+@pytest.mark.parametrize(
+    ("stream_id", "expected"),
+    [
+        (0, [1, 1, 0, 0, 1, 0, 0, 1]),
+        (1, [1, 1, 0, 1, 0, 0, 0, 0]),
+        (2, [0, 1, 1, 0, 1, 1, 1, 1]),
+        (3, [0, 1, 1, 0, 1, 1, 0, 1]),
+    ],
+)
+def test_task3_pcg64_seedsequence_stream_known_answers(stream_id, expected):
+    from gsdiff.data.artifacts import acquisition_rng
+
+    actual = acquisition_rng(7, stream_id).integers(0, 2, 8, dtype=np.int8)
+    assert actual.tolist() == expected
+
+
+def test_task3_holdout_presence_cannot_change_any_training_array():
+    without = _phase3b_generate(
+        **_phase3b_generation_inputs(holdout_K=0)
+    )
+    with_holdout = _phase3b_generate(
+        **_phase3b_generation_inputs(holdout_K=5)
+    )
+    for name in ("patterns", "measurements", "frame_indices", "time_grid"):
+        np.testing.assert_array_equal(
+            getattr(without.acquisition, name),
+            getattr(with_holdout.acquisition, name),
+        )
+
+
+def test_task3_detector_sigma_uses_ddof_zero_and_is_reused_everywhere():
+    generated = _phase3b_generate()
+    record = generated.noise_calibration_record
+    expected = (
+        np.sqrt(record["reference_variance"])
+        * 10 ** (-record["requested_snr_db"] / 20.0)
+    )
+    assert record["ddof"] == 0
+    assert record["sigma_absolute"] == pytest.approx(expected, abs=1e-15)
+    assert (
+        generated.acquisition.acquisition["noise_sigma_absolute"]
+        == record["sigma_absolute"]
+    )
+
+
+def test_task3_cross_pattern_cell_reuses_bernoulli_reference_sigma():
+    bernoulli = _phase3b_generate()
+    random_inputs = _phase3b_generation_inputs(pattern_family="random")
+    random_cell = _phase3b_generate(**random_inputs)
+    assert (
+        bernoulli.noise_calibration_record["reference_cell_sha256"]
+        == random_cell.noise_calibration_record["reference_cell_sha256"]
+    )
+    assert (
+        bernoulli.noise_calibration_record["sigma_absolute"]
+        == random_cell.noise_calibration_record["sigma_absolute"]
+    )
+
+
+def test_task3_zero_reference_variance_means_exactly_zero_added_noise():
+    inputs = _phase3b_generation_inputs()
+    inputs["target_snapshot"] = dataclasses.replace(
+        inputs["target_snapshot"],
+        canonical_image=np.zeros((8, 8), dtype=np.float32),
+    )
+    generated = _phase3b_generate(**inputs)
+    assert generated.noise_calibration_record["sigma_absolute"] == 0.0
+    assert np.count_nonzero(generated.acquisition.measurements) == 0
+    assert np.count_nonzero(generated.acquisition.holdout_measurements) == 0
+
+
+def test_task3_motion_uses_normalized_time_without_hidden_half_factor():
+    inputs = _phase3b_generation_inputs()
+    inputs["motion"] = {
+        "id": "accel",
+        "velocity": [6, 6],
+        "acceleration": [3, 3],
+        "omega": 0.2,
+        "beta": 0.1,
+    }
+    generated = _phase3b_generate(**inputs)
+    np.testing.assert_array_equal(
+        generated.acquisition.time_grid,
+        np.array([0.0, 0.5, 1.0], dtype=np.float32),
+    )
+    np.testing.assert_allclose(
+        generated.truth.translation_trajectory[-1],
+        np.array([9.0, 9.0], dtype=np.float32),
+        rtol=0,
+        atol=1e-6,
+    )
+    assert generated.truth.rotation_trajectory[-1] == pytest.approx(0.3)
+
+
+def test_task3_corrected_generation_is_bit_repeatable():
+    first = _phase3b_generate()
+    second = _phase3b_generate()
+    assert first.dataset_identity_sha256 == second.dataset_identity_sha256
+    assert first.noise_calibration_sha256 == second.noise_calibration_sha256
+    for name in (
+        "patterns",
+        "measurements",
+        "frame_indices",
+        "time_grid",
+        "holdout_patterns",
+        "holdout_measurements",
+        "holdout_frame_indices",
+    ):
+        np.testing.assert_array_equal(
+            getattr(first.acquisition, name),
+            getattr(second.acquisition, name),
+        )
+    np.testing.assert_array_equal(first.truth.gt_frames, second.truth.gt_frames)
+
+
+def test_task3_noise_calibration_sha_hashes_complete_per_cell_record():
+    generated = _phase3b_generate()
+    record = generated.noise_calibration_record
+    assert set(record) == {
+        "schema_version",
+        "calibration",
+        "scientific_contract",
+        "target_id",
+        "motion_id",
+        "seed",
+        "reference_cell_sha256",
+        "reference_measurements",
+        "requested_snr_db",
+        "ddof",
+        "reference_variance",
+        "sigma_absolute",
+        "realized_snr_db",
+        "generator",
+        "generator_config_sha256",
+        "runtime",
+    }
+    assert record["schema_version"] == "noise-calibration-record-v1"
+    assert generated.noise_calibration_sha256 == hashlib.sha256(
+        _canonical_json_bytes(record)
+    ).hexdigest()
+    assert (
+        generated.noise_calibration_sha256
+        != record["calibration"]["registry_entry_sha256"]
+    )
+    assert set(record["reference_measurements"]) == {
+        "dtype",
+        "shape",
+        "sha256",
+    }
+    assert set(record["realized_snr_db"]) == {"train", "holdout"}
+
+
+def test_task3_file_target_hashes_and_decodes_one_raw_snapshot(tmp_path):
+    from gsdiff.data.artifacts import resolve_target_snapshot
+
+    repo = tmp_path / "repo"
+    asset = repo / "assets" / "target.png"
+    asset.parent.mkdir(parents=True)
+    pixels = np.arange(64, dtype=np.uint8).reshape(8, 8)
+    Image.fromarray(pixels).save(asset, compress_level=1)
+    first_raw = asset.read_bytes()
+    first = resolve_target_snapshot(
+        repo_root=repo,
+        target_id="tank",
+        descriptor="assets/target.png",
+        H=8,
+        W=8,
+    )
+    Image.fromarray(pixels).save(asset, compress_level=9)
+    second_raw = asset.read_bytes()
+    second = resolve_target_snapshot(
+        repo_root=repo,
+        target_id="tank",
+        descriptor="assets/target.png",
+        H=8,
+        W=8,
+    )
+    assert first_raw != second_raw
+    np.testing.assert_array_equal(first.canonical_image, second.canonical_image)
+    assert first.assets_sha256 != second.assets_sha256
+    assert first.assets_sha256 == {
+        "assets/target.png": hashlib.sha256(first_raw).hexdigest()
+    }
+
+
+def test_task3_file_target_rejects_symlinked_repository_root(tmp_path):
+    from gsdiff.data.artifacts import resolve_target_snapshot
+
+    real_repo = tmp_path / "real-repo"
+    asset = real_repo / "assets" / "target.png"
+    asset.parent.mkdir(parents=True)
+    Image.fromarray(np.zeros((8, 8), dtype=np.uint8)).save(asset)
+    linked_repo = tmp_path / "linked-repo"
+    try:
+        linked_repo.symlink_to(real_repo, target_is_directory=True)
+    except (NotImplementedError, OSError) as error:
+        pytest.skip(f"directory symlinks unavailable: {error}")
+
+    with pytest.raises(ArtifactValidationError, match="linked|reparse"):
+        resolve_target_snapshot(
+            repo_root=linked_repo,
+            target_id="tank",
+            descriptor="assets/target.png",
+            H=8,
+            W=8,
+        )
+
+
+def test_task3_file_target_rejects_broken_symlink_leaf(tmp_path):
+    from gsdiff.data.artifacts import resolve_target_snapshot
+
+    repo = tmp_path / "repo"
+    asset = repo / "assets" / "target.png"
+    asset.parent.mkdir(parents=True)
+    try:
+        asset.symlink_to(repo / "missing.png")
+    except (NotImplementedError, OSError) as error:
+        pytest.skip(f"file symlinks unavailable: {error}")
+
+    with pytest.raises(ArtifactValidationError, match="linked|reparse"):
+        resolve_target_snapshot(
+            repo_root=repo,
+            target_id="tank",
+            descriptor="assets/target.png",
+            H=8,
+            W=8,
+        )
+
+
+def test_task3_file_target_guard_detects_lexists_only_link(
+    tmp_path, monkeypatch
+):
+    import stat as _stat
+    from types import SimpleNamespace
+    import gsdiff.data._corrected_generation as corrected
+
+    missing_link = (tmp_path / "broken-link").absolute()
+    real_lexists = corrected.os.path.lexists
+    real_lstat = corrected.os.lstat
+
+    def fake_lexists(path):
+        return Path(path) == missing_link or real_lexists(path)
+
+    def fake_lstat(path):
+        if Path(path) == missing_link:
+            return SimpleNamespace(
+                st_mode=_stat.S_IFLNK,
+                st_file_attributes=0,
+            )
+        return real_lstat(path)
+
+    monkeypatch.setattr(corrected.os.path, "lexists", fake_lexists)
+    monkeypatch.setattr(corrected.os, "lstat", fake_lstat)
+    with pytest.raises(ArtifactValidationError, match="linked|reparse"):
+        corrected._validate_existing_ancestors(missing_link)
+
+
+def test_task3_builtin_glyph_binds_actual_font_bytes_without_cache_writes(
+    tmp_path, monkeypatch
+):
+    import importlib.util
+    from gsdiff.data.artifacts import resolve_target_snapshot
+
+    cache = tmp_path / "matplotlib-cache"
+    monkeypatch.setenv("MPLCONFIGDIR", str(cache))
+    snapshot = resolve_target_snapshot(
+        repo_root=REPO_ROOT,
+        target_id="digit5",
+        descriptor="char:5",
+        H=8,
+        W=8,
+    )
+    spec = importlib.util.find_spec("matplotlib")
+    assert spec is not None and spec.origin is not None
+    font = (
+        Path(spec.origin).parent
+        / "mpl-data"
+        / "fonts"
+        / "ttf"
+        / "DejaVuSans.ttf"
+    )
+    assert snapshot.assets_sha256["font"] == hashlib.sha256(
+        font.read_bytes()
+    ).hexdigest()
+    assert set(snapshot.assets_sha256) == {
+        "descriptor",
+        "font",
+        "renderer",
+    }
+    assert not cache.exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    [
+        ("scientific_contract", type("DictSubclass", (dict,), {})({"id": "x", "sha256": "3" * 64})),
+        ("motion", type("DictSubclass", (dict,), {})({"id": "x"})),
+        ("seed", True),
+        ("seed", 7.0),
+        ("generator-id", type("StringSubclass", (str,), {})("gsdiff-corrected-sim")),
+        ("image-size", type("ListSubclass", (list,), {})([8, 8])),
+        ("snr", float("nan")),
+        ("snr", True),
+    ],
+)
+def test_task3_public_generation_rejects_type_spoofs_and_nonfinite(
+    field, invalid
+):
+    inputs = _phase3b_generation_inputs()
+    if field in {"scientific_contract", "motion", "seed"}:
+        inputs[field] = invalid
+    elif field == "generator-id":
+        inputs["generator"]["id"] = invalid
+    elif field == "image-size":
+        inputs["acquisition_config"]["image_size"] = invalid
+    else:
+        inputs["acquisition_config"]["snr_db"] = invalid
+    with pytest.raises((TypeError, ArtifactValidationError, ValueError)):
+        _phase3b_generate(**inputs)
+
+
+def test_task3_blind_model_rejects_direct_mapping_and_string_subclasses():
+    acquisition, _ = _tiny_pair()
+    mapping_subclass = type("DictSubclass", (dict,), {})
+    string_subclass = type("StringSubclass", (str,), {})
+    with pytest.raises((TypeError, ArtifactValidationError)):
+        dataclasses.replace(
+            acquisition,
+            acquisition=mapping_subclass(acquisition.acquisition),
+        )
+    spoofed = _mutable_json(acquisition.acquisition)
+    spoofed["pattern_family"] = string_subclass("bernoulli")
+    with pytest.raises((TypeError, ArtifactValidationError)):
+        dataclasses.replace(acquisition, acquisition=spoofed)
+
+
+def _phase3c_build_bundle():
+    from gsdiff.data.artifacts import (
+        build_dataset_manifest,
+        build_dataset_payloads,
+        dataset_manifest_bytes,
+    )
+
+    generated = _phase3b_generate()
+    payloads = build_dataset_payloads(generated)
+    manifest = build_dataset_manifest(generated, payloads)
+    return (
+        generated,
+        payloads,
+        manifest,
+        dataset_manifest_bytes(manifest),
+    )
+
+
+def _phase3c_zip_metadata(payload):
+    with zipfile.ZipFile(io.BytesIO(payload), "r") as archive:
+        return archive.comment, archive.infolist()
+
+
+def test_task3_c1a_three_payloads_are_repeatable_and_round_trip_exact():
+    from gsdiff.data.artifacts import verify_dataset_payload_bytes
+
+    generated, first, manifest, _ = _phase3c_build_bundle()
+    _, second, _, _ = _phase3c_build_bundle()
+    assert set(first) == {
+        "measurements.npz",
+        "evaluation-truth.npz",
+        "preview.png",
+    }
+    assert all(type(payload) is bytes for payload in first.values())
+    assert first == second
+
+    acquisition, truth, preview = verify_dataset_payload_bytes(
+        first, manifest
+    )
+    for name in (
+        "patterns",
+        "measurements",
+        "frame_indices",
+        "time_grid",
+        "holdout_patterns",
+        "holdout_measurements",
+        "holdout_frame_indices",
+    ):
+        expected = getattr(generated.acquisition, name)
+        actual = getattr(acquisition, name)
+        assert actual.dtype == expected.dtype
+        assert actual.shape == expected.shape
+        assert actual.flags.c_contiguous
+        assert actual.tobytes(order="C") == expected.tobytes(order="C")
+    for name in (
+        "canonical_image",
+        "gt_frames",
+        "translation_trajectory",
+        "rotation_trajectory",
+        "gt_velocity",
+        "gt_acceleration",
+    ):
+        expected = getattr(generated.truth, name)
+        actual = getattr(truth, name)
+        assert actual.dtype == expected.dtype
+        assert actual.shape == expected.shape
+        assert actual.flags.c_contiguous
+        assert actual.tobytes(order="C") == expected.tobytes(order="C")
+
+    expected_preview = np.rint(
+        np.clip(generated.truth.canonical_image, 0.0, 1.0) * 255.0
+    ).astype(np.uint8)
+    assert preview.dtype == np.uint8
+    assert preview.shape == (generated.truth.H, generated.truth.W)
+    assert preview.flags.c_contiguous
+    np.testing.assert_array_equal(preview, expected_preview)
+
+
+def test_task3_c1a_npz_and_png_codecs_bind_canonical_container_metadata():
+    _, payloads, _, _ = _phase3c_build_bundle()
+    for name in ("measurements.npz", "evaluation-truth.npz"):
+        comment, infos = _phase3c_zip_metadata(payloads[name])
+        assert comment == b""
+        assert [info.filename for info in infos] == sorted(
+            info.filename for info in infos
+        )
+        for info in infos:
+            assert info.date_time == (1980, 1, 1, 0, 0, 0)
+            assert info.compress_type == zipfile.ZIP_DEFLATED
+            assert info.create_system == 3
+            assert info.external_attr == 0x81800000
+            assert info.comment == b""
+            assert info.extra == b""
+            assert info.flag_bits == 0
+            assert info.create_version == 20
+            assert info.extract_version == 20
+            assert info.volume == 0
+            assert info.internal_attr == 0
+
+    with Image.open(io.BytesIO(payloads["preview.png"])) as preview:
+        assert preview.format == "PNG"
+        assert preview.mode == "L"
+        assert preview.size == (8, 8)
+        assert not preview.info
+
+    with zipfile.ZipFile(
+        io.BytesIO(payloads["evaluation-truth.npz"]), "r"
+    ) as archive:
+        metadata_array = np.load(
+            io.BytesIO(archive.read("__metadata_json__.npy")),
+            allow_pickle=False,
+        )
+    metadata = json.loads(metadata_array.tobytes().decode("utf-8"))
+    assert metadata["schema"] == "evaluation-truth-v2"
+
+
+def test_task3_c1a_manifest_is_exact_canonical_semantic_payload():
+    generated, payloads, manifest, manifest_bytes = _phase3c_build_bundle()
+    assert set(manifest) == {
+        "schema_version",
+        "status",
+        "dataset_identity_sha256",
+        "dataset_identity_spec",
+        "resolved_generator_config",
+        "noise_calibration_record",
+        "files",
+    }
+    assert manifest["schema_version"] == "dataset-manifest-v1"
+    assert manifest["status"] == "complete"
+    assert (
+        manifest["dataset_identity_sha256"]
+        == generated.dataset_identity_sha256
+    )
+    assert manifest["dataset_identity_spec"] == (
+        generated.dataset_identity_spec
+    )
+    assert manifest["resolved_generator_config"] == (
+        generated.resolved_generator_config
+    )
+    assert manifest["noise_calibration_record"] == (
+        generated.noise_calibration_record
+    )
+    assert set(manifest["files"]) == set(payloads)
+    expected_descriptors = {
+        "measurements.npz": (
+            "blind-measurements",
+            "measurements-blind-v1",
+        ),
+        "evaluation-truth.npz": (
+            "evaluation-truth",
+            "evaluation-truth-v2",
+        ),
+        "preview.png": ("preview", "dataset-preview-v1"),
+    }
+    for name, (role, schema) in expected_descriptors.items():
+        entry = manifest["files"][name]
+        assert set(entry) == {
+            "role",
+            "schema_version",
+            "sha256",
+            "size_bytes",
+        }
+        assert entry == {
+            "role": role,
+            "schema_version": schema,
+            "sha256": hashlib.sha256(payloads[name]).hexdigest(),
+            "size_bytes": len(payloads[name]),
+        }
+    assert manifest_bytes == _canonical_json_bytes(manifest)
+    serialized = manifest_bytes.decode("utf-8")
+    for forbidden in (
+        "dataset_manifest_sha256",
+        "timestamp",
+        "created_at",
+        "path",
+        "pid",
+        "hostname",
+        "staging",
+    ):
+        assert forbidden not in serialized
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["duplicate-key", "nan", "whitespace", "invalid-utf8"],
+)
+def test_task3_c1a_manifest_parser_rejects_noncanonical_json(mutation):
+    from gsdiff.data.artifacts import parse_dataset_manifest_bytes
+
+    _, _, _, canonical = _phase3c_build_bundle()
+    if mutation == "duplicate-key":
+        payload = canonical.replace(
+            b"{",
+            b'{"status":"complete",',
+            1,
+        )
+    elif mutation == "nan":
+        payload = canonical.replace(
+            b'"status":"complete"',
+            b'"status":NaN',
+            1,
+        )
+    elif mutation == "whitespace":
+        payload = b" " + canonical
+    else:
+        payload = b"\xff" + canonical
+    with pytest.raises((TypeError, ValueError, ArtifactValidationError)):
+        parse_dataset_manifest_bytes(payload)
+
+
+def test_task3_c1a_manifest_public_boundary_rejects_type_spoofs():
+    from gsdiff.data.artifacts import (
+        build_dataset_manifest,
+        dataset_manifest_bytes,
+    )
+
+    generated, payloads, manifest, _ = _phase3c_build_bundle()
+    dict_subclass = type("DictSubclass", (dict,), {})
+    with pytest.raises((TypeError, ValueError, ArtifactValidationError)):
+        build_dataset_manifest(generated, dict_subclass(payloads))
+    with pytest.raises((TypeError, ValueError, ArtifactValidationError)):
+        dataset_manifest_bytes(dict_subclass(manifest))
+
+
+def test_task3_c1a_payloads_are_fresh_process_and_directory_invariant(
+    tmp_path,
+):
+    script = "\n".join(
+        [
+            "import runpy",
+            "from pathlib import Path",
+            "from gsdiff.data.artifacts import (",
+            "    build_dataset_manifest,",
+            "    build_dataset_payloads,",
+            "    dataset_manifest_bytes,",
+            ")",
+            f"ns = runpy.run_path({str(Path(__file__).resolve())!r})",
+            "generated = ns['_phase3b_generate']()",
+            "payloads = build_dataset_payloads(generated)",
+            "manifest = build_dataset_manifest(generated, payloads)",
+            "payloads['dataset-manifest.json'] = (",
+            "    dataset_manifest_bytes(manifest)",
+            ")",
+            "for name, payload in payloads.items():",
+            "    Path(name).write_bytes(payload)",
+        ]
+    )
+    directories = [tmp_path / "first", tmp_path / "second"]
+    for directory in directories:
+        directory.mkdir()
+        subprocess.run(
+            [str(AUTHORITATIVE_PYTHON), "-c", script],
+            cwd=directory,
+            env={
+                "PATH": os.environ["PATH"],
+                "PYTHONIOENCODING": "utf-8",
+                "PYTHONPATH": str(REPO_ROOT),
+                "SYSTEMROOT": os.environ["SYSTEMROOT"],
+            },
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=60,
+        )
+    assert {
+        path.name: path.read_bytes() for path in directories[0].iterdir()
+    } == {
+        path.name: path.read_bytes() for path in directories[1].iterdir()
+    }
+
+
+def test_task3_c1a_blind_payload_must_match_manifest_generator_config():
+    from gsdiff.data._artifact_dataset import acquisition_npz_bytes
+    from gsdiff.data.artifacts import verify_dataset_payload_bytes
+
+    generated, payloads, manifest, _ = _phase3c_build_bundle()
+    changed_acquisition = {
+        **generated.acquisition.acquisition,
+        "pattern_family": "random",
+    }
+    changed = dataclasses.replace(
+        generated.acquisition,
+        acquisition=changed_acquisition,
+    )
+    changed_payload = acquisition_npz_bytes(changed)
+    payloads["measurements.npz"] = changed_payload
+    manifest["files"]["measurements.npz"]["sha256"] = hashlib.sha256(
+        changed_payload
+    ).hexdigest()
+    manifest["files"]["measurements.npz"]["size_bytes"] = len(
+        changed_payload
+    )
+
+    with pytest.raises(ArtifactValidationError, match="acquisition|config"):
+        verify_dataset_payload_bytes(payloads, manifest)
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    [
+        ("reference_cell_sha256", "not-a-sha"),
+        ("reference_dtype", "<f4"),
+        ("reference_shape", [11]),
+    ],
+)
+def test_task3_c1a_calibration_reference_descriptor_is_semantically_bound(
+    field, invalid
+):
+    from gsdiff.data.artifacts import dataset_manifest_bytes
+
+    _, _, manifest, _ = _phase3c_build_bundle()
+    record = manifest["noise_calibration_record"]
+    if field == "reference_cell_sha256":
+        record[field] = invalid
+    elif field == "reference_dtype":
+        record["reference_measurements"]["dtype"] = invalid
+    else:
+        record["reference_measurements"]["shape"] = invalid
+    record_sha = hashlib.sha256(
+        _canonical_json_bytes(record)
+    ).hexdigest()
+    manifest["dataset_identity_spec"]["noise_calibration"]["sha256"] = (
+        record_sha
+    )
+    manifest["dataset_identity_sha256"] = hashlib.sha256(
+        _canonical_json_bytes(manifest["dataset_identity_spec"])
+    ).hexdigest()
+
+    with pytest.raises(ArtifactValidationError):
+        dataset_manifest_bytes(manifest)
+
+
+def _phase3c_rezip(
+    payload,
+    transform,
+    *,
+    canonical,
+    compresslevel=9,
+):
+    import gsdiff.data._artifact_io as artifact_io
+
+    with zipfile.ZipFile(io.BytesIO(payload), "r") as source:
+        members = {
+            name: source.read(name) for name in source.namelist()
+        }
+    members = transform(members)
+    destination = io.BytesIO()
+    with zipfile.ZipFile(
+        destination,
+        "w",
+        compression=zipfile.ZIP_DEFLATED,
+        compresslevel=compresslevel,
+        allowZip64=False,
+    ) as archive:
+        for name in sorted(members):
+            if canonical:
+                archive.writestr(
+                    artifact_io._zip_info(name),
+                    members[name],
+                    compress_type=zipfile.ZIP_DEFLATED,
+                    compresslevel=compresslevel,
+                )
+            else:
+                archive.writestr(name, members[name])
+    return destination.getvalue()
+
+
+def test_task3_c1b_safe_snapshot_detects_same_size_path_replacement(
+    tmp_path,
+):
+    from gsdiff.data._artifact_io import (
+        read_safe_file_snapshot,
+        verify_safe_file_snapshot,
+    )
+
+    path = tmp_path / "payload.bin"
+    path.write_bytes(b"original")
+    snapshot = read_safe_file_snapshot(path, max_bytes=8)
+    assert snapshot.raw == b"original"
+    assert snapshot.sha256 == hashlib.sha256(b"original").hexdigest()
+    assert snapshot.size_bytes == 8
+
+    replacement = tmp_path / "replacement.bin"
+    replacement.write_bytes(b"modified")
+    os.replace(replacement, path)
+    with pytest.raises(ArtifactValidationError, match="changed|snapshot"):
+        verify_safe_file_snapshot(snapshot)
+
+
+@pytest.mark.parametrize("substitution", ["directory", "hardlink", "oversize"])
+def test_task3_c1b_safe_snapshot_rejects_unsafe_file_types_and_bounds(
+    tmp_path, substitution
+):
+    from gsdiff.data._artifact_io import read_safe_file_snapshot
+
+    path = tmp_path / "payload.bin"
+    max_bytes = 8
+    if substitution == "directory":
+        path.mkdir()
+    elif substitution == "hardlink":
+        source = tmp_path / "source.bin"
+        source.write_bytes(b"payload")
+        try:
+            os.link(source, path)
+        except OSError as error:
+            pytest.skip(f"hardlinks unavailable: {error}")
+    else:
+        path.write_bytes(b"123456789")
+    with pytest.raises(ArtifactValidationError):
+        read_safe_file_snapshot(path, max_bytes=max_bytes)
+
+
+def test_task3_c1b_safe_snapshot_rejects_fifo(tmp_path):
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("FIFO creation is unavailable on this platform")
+    from gsdiff.data._artifact_io import read_safe_file_snapshot
+
+    path = tmp_path / "payload.fifo"
+    os.mkfifo(path)
+    with pytest.raises(ArtifactValidationError):
+        read_safe_file_snapshot(path, max_bytes=8)
+
+
+def test_task3_c1b_directory_inventory_detects_post_snapshot_race(tmp_path):
+    from gsdiff.data._artifact_io import (
+        capture_directory_inventory,
+        verify_directory_inventory,
+    )
+
+    (tmp_path / "a.bin").write_bytes(b"a")
+    inventory = capture_directory_inventory(tmp_path)
+    (tmp_path / "b.bin").write_bytes(b"b")
+    with pytest.raises(ArtifactValidationError, match="inventory|changed"):
+        verify_directory_inventory(inventory)
+
+
+@pytest.mark.parametrize("mutation", ["unknown", "oversize", "noncanonical"])
+def test_task3_c1b_bounded_zip_rejects_before_bulk_decode(mutation):
+    from gsdiff.data._artifact_io import read_npz_members_bytes
+
+    _, payloads, _, _ = _phase3c_build_bundle()
+    payload = payloads["measurements.npz"]
+    with zipfile.ZipFile(io.BytesIO(payload), "r") as archive:
+        allowed = set(archive.namelist())
+        largest = max(info.file_size for info in archive.infolist())
+    if mutation == "unknown":
+        payload = _phase3c_rezip(
+            payload,
+            lambda members: {**members, "unknown.npy": b"not-an-array"},
+            canonical=True,
+        )
+        with pytest.raises(ArtifactValidationError, match="unknown"):
+            read_npz_members_bytes(
+                payload,
+                allowed_members=allowed,
+            )
+    elif mutation == "oversize":
+        with pytest.raises(ArtifactValidationError, match="size|large|bound"):
+            read_npz_members_bytes(
+                payload,
+                allowed_members=allowed,
+                max_member_bytes=largest - 1,
+            )
+    else:
+        payload = _phase3c_rezip(
+            payload, lambda members: members, canonical=False
+        )
+        with pytest.raises(ArtifactValidationError, match="canonical"):
+            read_npz_members_bytes(
+                payload,
+                allowed_members=allowed,
+            )
+
+
+@pytest.mark.parametrize("mutation", ["trailing-junk", "compresslevel"])
+def test_task3_c1b_zip_requires_exact_fixed_codec_bytes(mutation):
+    from gsdiff.data._artifact_io import read_npz_members_bytes
+    from gsdiff.data.artifacts import verify_dataset_payload_bytes
+
+    _, payloads, manifest, _ = _phase3c_build_bundle()
+    payload = payloads["measurements.npz"]
+    if mutation == "trailing-junk":
+        changed = payload + b"TRAILING-JUNK"
+    else:
+        changed = _phase3c_rezip(
+            payload,
+            lambda members: members,
+            canonical=True,
+            compresslevel=1,
+        )
+        assert changed != payload
+    payloads["measurements.npz"] = changed
+    manifest["files"]["measurements.npz"]["sha256"] = hashlib.sha256(
+        changed
+    ).hexdigest()
+    manifest["files"]["measurements.npz"]["size_bytes"] = len(changed)
+
+    with pytest.raises(ArtifactValidationError, match="canonical"):
+        read_npz_members_bytes(changed)
+    with pytest.raises(ArtifactValidationError, match="canonical"):
+        verify_dataset_payload_bytes(payloads, manifest)
+
+
+@pytest.mark.parametrize("mutation", ["whitespace", "duplicate-key"])
+def test_task3_c1b_npz_metadata_json_must_be_canonical_and_unique(mutation):
+    from gsdiff.data._artifact_dataset import load_acquisition_data_bytes
+
+    generated, payloads, _, _ = _phase3c_build_bundle()
+    payload = payloads["measurements.npz"]
+
+    def mutate(members):
+        metadata = np.load(
+            io.BytesIO(members["__metadata_json__.npy"]),
+            allow_pickle=False,
+        ).tobytes()
+        if mutation == "whitespace":
+            metadata = b" " + metadata
+        else:
+            metadata = metadata.replace(
+                b"{",
+                b'{"schema_version":"measurements-blind-v1",',
+                1,
+            )
+        changed = dict(members)
+        changed["__metadata_json__.npy"] = _npy_bytes(
+            np.frombuffer(metadata, dtype=np.uint8)
+        )
+        return changed
+
+    payload = _phase3c_rezip(payload, mutate, canonical=True)
+    with pytest.raises(ArtifactValidationError, match="metadata|canonical"):
+        load_acquisition_data_bytes(
+            payload,
+            expected_dataset_identity_sha256=(
+                generated.dataset_identity_sha256
+            ),
+        )
+
+
+@pytest.mark.parametrize("mutation", ["array-subclass", "nonfinite", "object"])
+def test_task3_c1b_npz_writer_rejects_unsafe_array_values(mutation):
+    from gsdiff.data._artifact_io import npz_bytes
+
+    if mutation == "array-subclass":
+        subclass = type("ArraySubclass", (np.ndarray,), {})
+        array = np.array([1.0], dtype=np.float32).view(subclass)
+    elif mutation == "nonfinite":
+        array = np.array([np.nan], dtype=np.float32)
+    else:
+        array = np.array([object()], dtype=object)
+    with pytest.raises((TypeError, ValueError, ArtifactValidationError)):
+        npz_bytes(arrays={"unsafe": array}, metadata={"schema": "test"})
+
+
+def test_task3_c1qa_manifest_bytes_bound_precedes_json_parse(monkeypatch):
+    import gsdiff.data._artifact_bundle as bundle
+
+    _, _, _, manifest_bytes = _phase3c_build_bundle()
+    monkeypatch.setattr(
+        bundle,
+        "MAX_DATASET_MANIFEST_BYTES",
+        len(manifest_bytes) - 1,
+    )
+
+    def forbidden_parse(*args, **kwargs):
+        raise AssertionError("oversize manifest reached JSON parser")
+
+    monkeypatch.setattr(bundle.json, "loads", forbidden_parse)
+    with pytest.raises(ArtifactValidationError, match="manifest.*bound"):
+        bundle.parse_dataset_manifest_bytes(manifest_bytes)
+
+
+def test_task3_c1qa_preview_bytes_bound_precedes_png_decode(monkeypatch):
+    import gsdiff.data._artifact_bundle as bundle
+
+    _, payloads, manifest, _ = _phase3c_build_bundle()
+    monkeypatch.setattr(
+        bundle,
+        "MAX_DATASET_PREVIEW_BYTES",
+        len(payloads["preview.png"]) - 1,
+    )
+
+    def forbidden_decode(*args, **kwargs):
+        raise AssertionError("oversize preview reached PNG decoder")
+
+    monkeypatch.setattr(bundle, "_decode_preview", forbidden_decode)
+    with pytest.raises(ArtifactValidationError, match="preview.*bound"):
+        bundle.verify_dataset_payload_bytes(payloads, manifest)
+
+
+def test_task3_c1qa_manifest_declared_role_size_is_bounded():
+    from gsdiff.data.artifacts import dataset_manifest_bytes
+    import gsdiff.data._artifact_bundle as bundle
+
+    _, _, manifest, _ = _phase3c_build_bundle()
+    manifest["files"]["preview.png"]["size_bytes"] = (
+        bundle.MAX_DATASET_PREVIEW_BYTES + 1
+    )
+    with pytest.raises(ArtifactValidationError, match="preview.*bound"):
+        dataset_manifest_bytes(manifest)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "config-nested-extra",
+        "renderer-extra",
+        "reference-sha",
+        "reference-dtype",
+        "reference-shape",
+        "calibration-nested-extra",
+    ],
+)
+def test_task3_c1qa_schema_and_runtime_reject_same_nested_mutations(
+    mutation,
+):
+    from jsonschema import Draft202012Validator
+    from gsdiff.data.artifacts import dataset_manifest_bytes
+
+    schema = json.loads(
+        (
+            REPO_ROOT / "schemas" / "dataset-manifest-v1.schema.json"
+        ).read_text(encoding="utf-8")
+    )
+    validator = Draft202012Validator(schema)
+    _, _, manifest, _ = _phase3c_build_bundle()
+    if mutation == "config-nested-extra":
+        manifest["resolved_generator_config"]["rng"]["extra"] = 1
+    elif mutation == "renderer-extra":
+        manifest["resolved_generator_config"]["target"]["renderer"][
+            "extra"
+        ] = 1
+    elif mutation == "reference-sha":
+        manifest["noise_calibration_record"][
+            "reference_cell_sha256"
+        ] = "not-a-sha"
+    elif mutation == "reference-dtype":
+        manifest["noise_calibration_record"]["reference_measurements"][
+            "dtype"
+        ] = "<f4"
+    elif mutation == "reference-shape":
+        manifest["noise_calibration_record"]["reference_measurements"][
+            "shape"
+        ] = [12, 1]
+    else:
+        manifest["noise_calibration_record"]["calibration"]["extra"] = 1
+
+    assert list(validator.iter_errors(manifest)), mutation
+    with pytest.raises((TypeError, ValueError, ArtifactValidationError)):
+        dataset_manifest_bytes(manifest)
+
+
+def test_task3_c1qa_schema_accepts_runtime_valid_manifest():
+    from jsonschema import Draft202012Validator
+
+    schema = json.loads(
+        (
+            REPO_ROOT / "schemas" / "dataset-manifest-v1.schema.json"
+        ).read_text(encoding="utf-8")
+    )
+    Draft202012Validator.check_schema(schema)
+    _, _, manifest, _ = _phase3c_build_bundle()
+    Draft202012Validator(schema).validate(manifest)
+
+
+def _phase3c_write_dataset_directory(tmp_path):
+    generated, payloads, manifest, manifest_bytes = _phase3c_build_bundle()
+    dataset_dir = tmp_path / generated.dataset_identity_sha256
+    dataset_dir.mkdir()
+    for name, payload in payloads.items():
+        (dataset_dir / name).write_bytes(payload)
+    (dataset_dir / "dataset-manifest.json").write_bytes(manifest_bytes)
+    return generated, payloads, manifest, manifest_bytes, dataset_dir
+
+
+def test_task3_c2a1_final_directory_round_trip_returns_isolated_evidence(
+    tmp_path,
+):
+    from gsdiff.data import (
+        VerifiedDatasetDirectory as DataVerifiedDirectory,
+        verify_dataset_directory as verify_from_data,
+    )
+    from gsdiff.data.artifacts import (
+        VerifiedDatasetDirectory,
+        verify_dataset_directory,
+    )
+
+    generated, payloads, manifest, manifest_bytes, dataset_dir = (
+        _phase3c_write_dataset_directory(tmp_path)
+    )
+    manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+    verified = verify_dataset_directory(
+        dataset_dir,
+        expected_dataset_identity_sha256=(
+            generated.dataset_identity_sha256
+        ),
+        expected_dataset_manifest_sha256=manifest_sha256,
+    )
+
+    assert DataVerifiedDirectory is VerifiedDatasetDirectory
+    assert verify_from_data is verify_dataset_directory
+    assert type(verified) is VerifiedDatasetDirectory
+    assert verified.dataset_dir == dataset_dir.absolute()
+    assert (
+        verified.dataset_identity_sha256
+        == generated.dataset_identity_sha256
+    )
+    assert verified.dataset_manifest_sha256 == manifest_sha256
+    assert verified.manifest_externally_anchored is True
+    assert verified.manifest == manifest
+    assert set(verified.payload_evidence) == set(payloads)
+    for name, payload in payloads.items():
+        evidence = verified.payload_evidence[name]
+        assert evidence.sha256 == hashlib.sha256(payload).hexdigest()
+        assert evidence.size_bytes == len(payload)
+    assert (
+        verified.acquisition.dataset_identity_sha256
+        == generated.dataset_identity_sha256
+    )
+    assert (
+        verified.truth.dataset_identity_sha256
+        == generated.dataset_identity_sha256
+    )
+    assert verified.preview.flags.c_contiguous
+    assert not verified.preview.flags.writeable
+
+    returned_manifest = verified.manifest
+    returned_manifest["status"] = "tampered"
+    assert verified.manifest["status"] == "complete"
+    with pytest.raises(TypeError):
+        verified.payload_evidence["preview.png"] = object()
+    with pytest.raises(ValueError):
+        verified.preview[0, 0] = 0
+
+    self_consistent = verify_dataset_directory(dataset_dir)
+    assert self_consistent.manifest_externally_anchored is False
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "wrong-name",
+        "extra-file",
+        "nested-directory",
+        "leaf-directory",
+        "hardlink",
+        "root-file",
+    ],
+)
+def test_task3_c2a1_final_directory_requires_exact_safe_inventory(
+    tmp_path, mutation
+):
+    from gsdiff.data.artifacts import verify_dataset_directory
+
+    generated, _, _, _, dataset_dir = _phase3c_write_dataset_directory(
+        tmp_path
+    )
+    if mutation == "wrong-name":
+        changed = tmp_path / ("0" * 64)
+        dataset_dir.rename(changed)
+        dataset_dir = changed
+    elif mutation == "extra-file":
+        (dataset_dir / "extra.bin").write_bytes(b"extra")
+    elif mutation == "nested-directory":
+        nested = dataset_dir / "nested"
+        nested.mkdir()
+        (nested / "payload.bin").write_bytes(b"nested")
+    elif mutation == "leaf-directory":
+        leaf = dataset_dir / "preview.png"
+        leaf.unlink()
+        leaf.mkdir()
+    elif mutation == "hardlink":
+        leaf = dataset_dir / "preview.png"
+        source = tmp_path / "preview-source.png"
+        source.write_bytes(leaf.read_bytes())
+        leaf.unlink()
+        try:
+            os.link(source, leaf)
+        except OSError as error:
+            pytest.skip(f"hardlinks unavailable: {error}")
+    else:
+        dataset_dir = tmp_path / ("f" * 64)
+        dataset_dir.write_bytes(b"not-a-directory")
+
+    with pytest.raises(ArtifactValidationError):
+        verify_dataset_directory(
+            dataset_dir,
+            expected_dataset_identity_sha256=(
+                generated.dataset_identity_sha256
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    ("anchor", "value"),
+    [
+        ("identity", "0" * 64),
+        ("manifest", "0" * 64),
+        ("identity", "not-a-sha"),
+        ("manifest", "not-a-sha"),
+    ],
+)
+def test_task3_c2a1_external_anchors_are_strict(tmp_path, anchor, value):
+    from gsdiff.data.artifacts import verify_dataset_directory
+
+    generated, _, _, _, dataset_dir = _phase3c_write_dataset_directory(
+        tmp_path
+    )
+    kwargs = {
+        "expected_dataset_identity_sha256": (
+            generated.dataset_identity_sha256
+        )
+    }
+    if anchor == "identity":
+        kwargs["expected_dataset_identity_sha256"] = value
+    else:
+        kwargs["expected_dataset_manifest_sha256"] = value
+    with pytest.raises(ArtifactValidationError, match=anchor):
+        verify_dataset_directory(dataset_dir, **kwargs)
+
+
+@pytest.mark.parametrize(
+    ("name", "constant"),
+    [
+        ("dataset-manifest.json", "MAX_DATASET_MANIFEST_BYTES"),
+        ("preview.png", "MAX_DATASET_PREVIEW_BYTES"),
+        ("measurements.npz", "MAX_DATASET_NPZ_BYTES"),
+        ("evaluation-truth.npz", "MAX_DATASET_NPZ_BYTES"),
+    ],
+)
+def test_task3_c2a1_role_bounds_precede_snapshot_hash_and_decode(
+    tmp_path, monkeypatch, name, constant
+):
+    import gsdiff.data._artifact_persistence as persistence
+
+    _, _, _, _, dataset_dir = _phase3c_write_dataset_directory(tmp_path)
+    monkeypatch.setattr(
+        persistence,
+        constant,
+        (dataset_dir / name).stat().st_size - 1,
+    )
+
+    def forbidden_snapshot(*args, **kwargs):
+        raise AssertionError("oversize role reached snapshot hashing")
+
+    monkeypatch.setattr(
+        persistence, "read_safe_file_snapshot", forbidden_snapshot
+    )
+    with pytest.raises(ArtifactValidationError, match="bound"):
+        persistence.verify_dataset_directory(dataset_dir)
+
+
+@pytest.mark.parametrize("mutation", ["payload", "manifest-entry"])
+def test_task3_c2a1_manifest_file_evidence_must_match_safe_snapshots(
+    tmp_path, mutation
+):
+    from gsdiff.data.artifacts import (
+        dataset_manifest_bytes,
+        verify_dataset_directory,
+    )
+
+    _, _, manifest, _, dataset_dir = _phase3c_write_dataset_directory(
+        tmp_path
+    )
+    if mutation == "payload":
+        with (dataset_dir / "preview.png").open("ab") as stream:
+            stream.write(b"x")
+    else:
+        manifest["files"]["preview.png"]["sha256"] = "0" * 64
+        (dataset_dir / "dataset-manifest.json").write_bytes(
+            dataset_manifest_bytes(manifest)
+        )
+
+    with pytest.raises(ArtifactValidationError, match="hash|size|snapshot"):
+        verify_dataset_directory(dataset_dir)
+
+
+def test_task3_c2a2_expected_generated_accepts_bit_exact_directory(
+    tmp_path,
+):
+    from gsdiff.data.artifacts import verify_dataset_directory
+
+    generated, _, _, _, dataset_dir = _phase3c_write_dataset_directory(
+        tmp_path
+    )
+    verified = verify_dataset_directory(
+        dataset_dir, expected_generated=generated
+    )
+    assert verified.expected_generated_verified is True
+
+
+def test_task3_c2a2_expected_generated_rejects_coordinated_array_rewrite(
+    tmp_path,
+):
+    from gsdiff.data._artifact_dataset import acquisition_npz_bytes
+    from gsdiff.data._artifact_identity import array_descriptor
+    from gsdiff.data.artifacts import (
+        dataset_manifest_bytes,
+        verify_dataset_directory,
+    )
+
+    generated, payloads, manifest, _, dataset_dir = (
+        _phase3c_write_dataset_directory(tmp_path)
+    )
+    changed_measurements = generated.acquisition.measurements.copy()
+    changed_measurements[0] = np.nextafter(
+        changed_measurements[0], np.float32(np.inf)
+    )
+    changed_descriptors = _mutable_json(
+        generated.acquisition.array_descriptors
+    )
+    changed_descriptors["measurements"] = array_descriptor(
+        changed_measurements
+    )
+    changed_acquisition = dataclasses.replace(
+        generated.acquisition,
+        measurements=changed_measurements,
+        array_descriptors=changed_descriptors,
+    )
+    changed_payload = acquisition_npz_bytes(changed_acquisition)
+    payloads["measurements.npz"] = changed_payload
+    manifest["files"]["measurements.npz"]["sha256"] = hashlib.sha256(
+        changed_payload
+    ).hexdigest()
+    manifest["files"]["measurements.npz"]["size_bytes"] = len(
+        changed_payload
+    )
+    (dataset_dir / "measurements.npz").write_bytes(changed_payload)
+    (dataset_dir / "dataset-manifest.json").write_bytes(
+        dataset_manifest_bytes(manifest)
+    )
+
+    self_consistent = verify_dataset_directory(dataset_dir)
+    assert self_consistent.manifest_externally_anchored is False
+    assert (
+        self_consistent.acquisition.measurements.tobytes(order="C")
+        == changed_measurements.tobytes(order="C")
+    )
+    with pytest.raises(
+        ArtifactValidationError, match="expected.generated|measurements"
+    ):
+        verify_dataset_directory(
+            dataset_dir, expected_generated=generated
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["same-size-replacement", "inventory-addition", "leaf-substitution"],
+)
+def test_task3_c2a2_deterministic_post_snapshot_races_are_rejected(
+    tmp_path, monkeypatch, mutation
+):
+    import gsdiff.data._artifact_persistence as persistence
+
+    _, _, _, _, dataset_dir = _phase3c_write_dataset_directory(tmp_path)
+    if mutation == "leaf-substitution":
+        real_capture = persistence.capture_directory_inventory
+
+        def capture_then_substitute(root):
+            inventory = real_capture(root)
+            leaf = dataset_dir / "preview.png"
+            leaf.unlink()
+            leaf.mkdir()
+            return inventory
+
+        monkeypatch.setattr(
+            persistence,
+            "capture_directory_inventory",
+            capture_then_substitute,
+        )
+    else:
+        real_verify = persistence.verify_dataset_payload_bytes
+
+        def decode_then_mutate(payloads, manifest):
+            decoded = real_verify(payloads, manifest)
+            if mutation == "inventory-addition":
+                (dataset_dir / "late.bin").write_bytes(b"late")
+            else:
+                leaf = dataset_dir / "measurements.npz"
+                replacement = tmp_path / "replacement.npz"
+                replacement.write_bytes(leaf.read_bytes())
+                os.replace(replacement, leaf)
+            return decoded
+
+        monkeypatch.setattr(
+            persistence,
+            "verify_dataset_payload_bytes",
+            decode_then_mutate,
+        )
+
+    with pytest.raises(
+        ArtifactValidationError,
+        match="changed|snapshot|inventory|regular|directory",
+    ):
+        persistence.verify_dataset_directory(dataset_dir)
+
+
+def test_task3_c2a2_partial_snapshot_failure_reverifies_prior_reads(
+    tmp_path, monkeypatch
+):
+    import gsdiff.data._artifact_persistence as persistence
+
+    _, _, _, _, dataset_dir = _phase3c_write_dataset_directory(tmp_path)
+    real_read = persistence.read_safe_file_snapshot
+    real_postverify = persistence.verify_safe_file_snapshot
+    postverified = []
+
+    def read_then_fail(path, **kwargs):
+        if path.name == "measurements.npz":
+            raise ArtifactValidationError("injected second-file failure")
+        snapshot = real_read(path, **kwargs)
+        if path.name == "dataset-manifest.json":
+            replacement = tmp_path / "replacement-manifest.json"
+            replacement.write_bytes(path.read_bytes())
+            os.replace(replacement, path)
+        return snapshot
+
+    def record_postverify(snapshot):
+        postverified.append(snapshot.path.name)
+        return real_postverify(snapshot)
+
+    monkeypatch.setattr(
+        persistence, "read_safe_file_snapshot", read_then_fail
+    )
+    monkeypatch.setattr(
+        persistence, "verify_safe_file_snapshot", record_postverify
+    )
+    with pytest.raises(
+        ArtifactValidationError, match="injected second-file failure"
+    ) as error:
+        persistence.verify_dataset_directory(dataset_dir)
+    assert "dataset-manifest.json" in postverified
+    assert any(
+        "snapshot path changed" in note
+        for note in getattr(error.value, "__notes__", ())
+    )
+
+
+@pytest.mark.parametrize("stage", ["capture", "postverify"])
+def test_task3_c2a2_native_os_errors_are_normalized(
+    tmp_path, monkeypatch, stage
+):
+    import gsdiff.data._artifact_persistence as persistence
+
+    _, _, _, _, dataset_dir = _phase3c_write_dataset_directory(tmp_path)
+
+    def vanished(*args, **kwargs):
+        raise FileNotFoundError("injected disappearance")
+
+    monkeypatch.setattr(
+        persistence,
+        (
+            "capture_directory_inventory"
+            if stage == "capture"
+            else "verify_directory_inventory"
+        ),
+        vanished,
+    )
+    with pytest.raises(
+        ArtifactValidationError, match="operating-system"
+    ) as error:
+        persistence.verify_dataset_directory(dataset_dir)
+    assert isinstance(error.value.__cause__, FileNotFoundError)
+
+
+def test_task3_c2a2_inventory_root_disappearance_is_normalized(
+    tmp_path, monkeypatch
+):
+    import gsdiff.data._artifact_io as artifact_io
+
+    root = tmp_path / "inventory"
+    root.mkdir()
+    (root / "payload.bin").write_bytes(b"payload")
+    real_capture = artifact_io._capture_directory_entries
+    real_lstat = artifact_io.os.lstat
+    scan_complete = False
+
+    def capture_then_arm(path):
+        nonlocal scan_complete
+        entries = real_capture(path)
+        scan_complete = True
+        return entries
+
+    def disappear_after_scan(path):
+        if scan_complete and Path(path) == root.absolute():
+            raise FileNotFoundError("injected root disappearance")
+        return real_lstat(path)
+
+    monkeypatch.setattr(
+        artifact_io, "_capture_directory_entries", capture_then_arm
+    )
+    monkeypatch.setattr(artifact_io.os, "lstat", disappear_after_scan)
+    with pytest.raises(ArtifactValidationError, match="inventory root"):
+        artifact_io.capture_directory_inventory(root)
+
+
+def test_task3_c2b1a_created_publication_is_manifest_last_and_atomic(
+    tmp_path, monkeypatch
+):
+    import gsdiff.data._artifact_persistence as persistence
+    from gsdiff.data import (
+        DatasetPublication as DataDatasetPublication,
+        publish_dataset as publish_from_data,
+    )
+    from gsdiff.data.artifacts import (
+        DatasetPublication,
+        publish_dataset,
+    )
+
+    generated = _phase3b_generate()
+    artifact_root = tmp_path / "artifacts"
+    final_dir = (
+        artifact_root
+        / "datasets"
+        / generated.dataset_identity_sha256
+    )
+    events = []
+    stages = []
+    real_fsync = persistence.os.fsync
+    file_fsync_count = 0
+    real_fsync_directory = persistence._fsync_directory
+    directory_fsyncs = []
+
+    def record_fsync(descriptor):
+        nonlocal file_fsync_count
+        file_fsync_count += 1
+        return real_fsync(descriptor)
+
+    def record_directory_fsync(path):
+        directory_fsyncs.append(Path(path))
+        return real_fsync_directory(path)
+
+    def observe(name, *, staging_dir, final_dir):
+        events.append(name)
+        stages.append(staging_dir)
+        current = {path.name for path in staging_dir.iterdir()}
+        if name == "physical-roundtrip":
+            assert current == {
+                "measurements.npz",
+                "evaluation-truth.npz",
+                "preview.png",
+            }
+            assert "dataset-manifest.json" not in current
+        elif name in {"manifest", "stage-fsync", "before-promotion"}:
+            assert current == {
+                "dataset-manifest.json",
+                "measurements.npz",
+                "evaluation-truth.npz",
+                "preview.png",
+            }
+        if name == "before-promotion":
+            assert not final_dir.exists()
+
+    monkeypatch.setattr(persistence.os, "fsync", record_fsync)
+    monkeypatch.setattr(
+        persistence, "_fsync_directory", record_directory_fsync
+    )
+    monkeypatch.setattr(persistence, "_publication_barrier", observe)
+    publication = publish_dataset(artifact_root, generated)
+
+    assert DataDatasetPublication is DatasetPublication
+    assert publish_from_data is publish_dataset
+    assert type(publication) is DatasetPublication
+    assert publication.status == "created"
+    assert publication.dataset_dir == final_dir.absolute()
+    assert publication.verified.dataset_manifest_sha256 == (
+        publication.dataset_manifest_sha256
+    )
+    assert publication.verified.expected_generated_verified is True
+    assert set(path.name for path in final_dir.iterdir()) == {
+        "dataset-manifest.json",
+        "measurements.npz",
+        "evaluation-truth.npz",
+        "preview.png",
+    }
+    assert events.index("physical-roundtrip") < events.index("manifest")
+    assert events.index("manifest") < events.index("stage-fsync")
+    assert events.index("stage-fsync") < events.index("before-promotion")
+    assert file_fsync_count >= 4
+    assert any(path in stages for path in directory_fsyncs)
+    assert all(not stage.exists() for stage in stages)
+
+
+@pytest.mark.parametrize(
+    "barrier",
+    [
+        "measurements",
+        "truth",
+        "preview",
+        "physical-roundtrip",
+        "manifest",
+        "file-fsync",
+        "stage-fsync",
+        "before-promotion",
+    ],
+)
+def test_task3_c2b1a_pre_promotion_barrier_failure_cleans_owned_stage(
+    tmp_path, monkeypatch, barrier
+):
+    import gsdiff.data._artifact_persistence as persistence
+
+    generated = _phase3b_generate()
+    artifact_root = tmp_path / "artifacts"
+    final_dir = (
+        artifact_root
+        / "datasets"
+        / generated.dataset_identity_sha256
+    )
+
+    def fail_at(name, **kwargs):
+        if name == barrier:
+            raise RuntimeError(f"injected {barrier} failure")
+
+    monkeypatch.setattr(persistence, "_publication_barrier", fail_at)
+    with pytest.raises(RuntimeError, match=f"injected {barrier}"):
+        persistence.publish_dataset(artifact_root, generated)
+
+    assert not final_dir.exists()
+    datasets_dir = artifact_root / "datasets"
+    assert not datasets_dir.exists() or not list(datasets_dir.iterdir())
+
+
+def test_task3_c2b1b_valid_existing_reuses_before_serialization_or_write(
+    tmp_path, monkeypatch
+):
+    import gsdiff.data._artifact_persistence as persistence
+
+    generated = _phase3b_generate()
+    artifact_root = tmp_path / "artifacts"
+    created = persistence.publish_dataset(artifact_root, generated)
+    before = {
+        path.name: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in created.dataset_dir.iterdir()
+    }
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("valid reuse reached serialization or staging")
+
+    monkeypatch.setattr(
+        persistence, "build_dataset_payloads", forbidden
+    )
+    monkeypatch.setattr(persistence, "_create_owned_stage", forbidden)
+    reused = persistence.publish_dataset(artifact_root, generated)
+    after = {
+        path.name: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in reused.dataset_dir.iterdir()
+    }
+
+    assert reused.status == "reused"
+    assert reused.dataset_dir == created.dataset_dir
+    assert reused.dataset_manifest_sha256 == (
+        created.dataset_manifest_sha256
+    )
+    assert before == after
+
+
+@pytest.mark.parametrize("mutation", ["missing", "extra", "corrupt"])
+def test_task3_c2b1b_invalid_existing_fails_closed_without_repair(
+    tmp_path, monkeypatch, mutation
+):
+    import gsdiff.data._artifact_persistence as persistence
+
+    generated = _phase3b_generate()
+    artifact_root = tmp_path / "artifacts"
+    created = persistence.publish_dataset(artifact_root, generated)
+    if mutation == "missing":
+        preview = created.dataset_dir / "preview.png"
+        preview.chmod(0o600)
+        preview.unlink()
+    elif mutation == "extra":
+        (created.dataset_dir / "extra.bin").write_bytes(b"extra")
+    else:
+        path = created.dataset_dir / "preview.png"
+        path.chmod(0o600)
+        path.write_bytes(b"x" * path.stat().st_size)
+    before = {
+        path.name: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in created.dataset_dir.iterdir()
+        if path.is_file()
+    }
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("invalid existing reached serialization")
+
+    monkeypatch.setattr(
+        persistence, "build_dataset_payloads", forbidden
+    )
+    with pytest.raises(ArtifactValidationError):
+        persistence.publish_dataset(artifact_root, generated)
+    after = {
+        path.name: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in created.dataset_dir.iterdir()
+        if path.is_file()
+    }
+    assert before == after
+
+
+@pytest.mark.parametrize(
+    "injection", ["extra-file", "directory", "hardlink", "symlink"]
+)
+def test_task3_c2b1b_hostile_stage_cleanup_refuses_recursive_deletion(
+    tmp_path, monkeypatch, injection
+):
+    import gsdiff.data._artifact_persistence as persistence
+
+    generated = _phase3b_generate()
+    artifact_root = tmp_path / "artifacts"
+    outside = tmp_path / "outside-sentinel.bin"
+    outside.write_bytes(b"outside-sentinel")
+    if injection == "symlink":
+        probe = tmp_path / "symlink-probe"
+        try:
+            probe.symlink_to(outside)
+        except OSError as error:
+            pytest.skip(f"symlinks unavailable: {error}")
+        probe.unlink()
+    captured_stage = None
+
+    def inject_and_fail(name, *, staging_dir, final_dir):
+        nonlocal captured_stage
+        captured_stage = staging_dir
+        if name != "before-promotion":
+            return
+        injected = staging_dir / "injected"
+        if injection == "extra-file":
+            injected.write_bytes(b"unowned")
+        elif injection == "directory":
+            injected.mkdir()
+        elif injection == "hardlink":
+            try:
+                os.link(outside, injected)
+            except OSError as error:
+                pytest.skip(f"hardlinks unavailable: {error}")
+        else:
+            injected.symlink_to(outside)
+        raise RuntimeError("injected hostile cleanup failure")
+
+    monkeypatch.setattr(
+        persistence, "_publication_barrier", inject_and_fail
+    )
+    with pytest.raises(
+        RuntimeError, match="hostile cleanup"
+    ) as error:
+        persistence.publish_dataset(artifact_root, generated)
+
+    assert outside.read_bytes() == b"outside-sentinel"
+    assert captured_stage is not None and captured_stage.exists()
+    assert any(
+        "cleanup refused" in note.lower()
+        for note in getattr(error.value, "__notes__", ())
+    )
+    final_dir = (
+        artifact_root
+        / "datasets"
+        / generated.dataset_identity_sha256
+    )
+    assert not final_dir.exists()
+
+
+def test_task3_c2b1b_exclusive_leaf_collision_is_never_overwritten(
+    tmp_path, monkeypatch
+):
+    import gsdiff.data._artifact_persistence as persistence
+
+    generated = _phase3b_generate()
+    artifact_root = tmp_path / "artifacts"
+    real_create = persistence._create_owned_stage
+    captured_stage = None
+
+    def create_with_collision(datasets_dir, identity):
+        nonlocal captured_stage
+        stage = real_create(datasets_dir, identity)
+        captured_stage = stage.path
+        (stage.path / "measurements.npz").write_bytes(b"unowned")
+        return stage
+
+    monkeypatch.setattr(
+        persistence, "_create_owned_stage", create_with_collision
+    )
+    with pytest.raises(ArtifactValidationError):
+        persistence.publish_dataset(artifact_root, generated)
+    assert captured_stage is not None and captured_stage.exists()
+    assert (captured_stage / "measurements.npz").read_bytes() == b"unowned"
+
+
+@pytest.mark.parametrize("mutation", ["same-size-rewrite", "extra-entry"])
+def test_task3_c2b1b_stage_mutation_at_final_barrier_is_not_promoted(
+    tmp_path, monkeypatch, mutation
+):
+    import gsdiff.data._artifact_persistence as persistence
+
+    generated = _phase3b_generate()
+    artifact_root = tmp_path / "artifacts"
+    captured_stage = None
+
+    def mutate_without_raising(name, *, staging_dir, final_dir):
+        nonlocal captured_stage
+        captured_stage = staging_dir
+        if name != "before-promotion":
+            return
+        if mutation == "same-size-rewrite":
+            leaf = staging_dir / "preview.png"
+            leaf.write_bytes(b"x" * leaf.stat().st_size)
+        else:
+            (staging_dir / "late.bin").write_bytes(b"late")
+
+    monkeypatch.setattr(
+        persistence, "_publication_barrier", mutate_without_raising
+    )
+    with pytest.raises(ArtifactValidationError):
+        persistence.publish_dataset(artifact_root, generated)
+
+    final_dir = (
+        artifact_root
+        / "datasets"
+        / generated.dataset_identity_sha256
+    )
+    assert not final_dir.exists()
+    assert captured_stage is not None and captured_stage.exists()
+
+
+def test_task3_c2b1b_stage_replacement_inside_promotion_is_not_promoted(
+    tmp_path, monkeypatch
+):
+    import gsdiff.data._artifact_persistence as persistence
+
+    generated = _phase3b_generate()
+    artifact_root = tmp_path / "artifacts"
+    real_promote = persistence._promote_directory_no_clobber
+    captured_stage = None
+    displaced_stage = None
+
+    def replace_source_then_promote(stage, final_dir, **kwargs):
+        nonlocal captured_stage, displaced_stage
+        staging_dir = stage.path if hasattr(stage, "path") else Path(stage)
+        captured_stage = staging_dir
+        displaced_stage = staging_dir.with_name(
+            f"{staging_dir.name}.displaced"
+        )
+        staging_dir.rename(displaced_stage)
+        staging_dir.mkdir()
+        (staging_dir / "attacker.bin").write_bytes(b"attacker")
+        return real_promote(stage, final_dir, **kwargs)
+
+    monkeypatch.setattr(
+        persistence,
+        "_promote_directory_no_clobber",
+        replace_source_then_promote,
+    )
+    with pytest.raises(ArtifactValidationError):
+        persistence.publish_dataset(artifact_root, generated)
+
+    final_dir = (
+        artifact_root
+        / "datasets"
+        / generated.dataset_identity_sha256
+    )
+    assert not final_dir.exists()
+    assert captured_stage is not None and captured_stage.exists()
+    assert (captured_stage / "attacker.bin").read_bytes() == b"attacker"
+    assert displaced_stage is not None and displaced_stage.exists()
+    assert {
+        path.name for path in displaced_stage.iterdir()
+    } == {
+        "dataset-manifest.json",
+        "measurements.npz",
+        "evaluation-truth.npz",
+        "preview.png",
+    }
+
+
+def test_task3_c2b1b_post_promotion_identity_mismatch_is_quarantined(
+    tmp_path, monkeypatch
+):
+    import gsdiff.data._artifact_persistence as persistence
+
+    generated = _phase3b_generate()
+    artifact_root = tmp_path / "artifacts"
+    final_dir = (
+        artifact_root
+        / "datasets"
+        / generated.dataset_identity_sha256
+    ).absolute()
+    real_lstat = persistence.os.lstat
+    captured_stage = None
+    displaced_final = final_dir.with_name(f".{final_dir.name}.displaced")
+    swapped = False
+
+    def capture_stage(name, *, staging_dir, final_dir):
+        nonlocal captured_stage
+        if name == "before-promotion":
+            captured_stage = staging_dir
+
+    def replace_final_before_identity_check(path, *args, **kwargs):
+        nonlocal swapped
+        candidate = Path(path).absolute()
+        if candidate == final_dir and captured_stage is not None and not swapped:
+            try:
+                real_lstat(captured_stage)
+            except FileNotFoundError:
+                try:
+                    real_lstat(final_dir)
+                except FileNotFoundError:
+                    pass
+                else:
+                    final_dir.rename(displaced_final)
+                    final_dir.mkdir()
+                    (final_dir / "attacker.bin").write_bytes(b"attacker")
+                    swapped = True
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        persistence, "_publication_barrier", capture_stage
+    )
+    monkeypatch.setattr(
+        persistence.os, "lstat", replace_final_before_identity_check
+    )
+    with pytest.raises(
+        ArtifactValidationError, match="identity mismatch"
+    ):
+        persistence.publish_dataset(artifact_root, generated)
+
+    assert swapped is True
+    assert not final_dir.exists()
+    assert displaced_final.exists()
+    assert {
+        path.name for path in displaced_final.iterdir()
+    } == {
+        "dataset-manifest.json",
+        "measurements.npz",
+        "evaluation-truth.npz",
+        "preview.png",
+    }
+    diagnostics = list(
+        final_dir.parent.glob(f".{final_dir.name}.rejected-*")
+    )
+    assert len(diagnostics) == 1
+    assert (diagnostics[0] / "attacker.bin").read_bytes() == b"attacker"
+
+
+def test_task3_c2b1b_parent_fsync_failure_keeps_complete_final_for_reuse(
+    tmp_path, monkeypatch
+):
+    import gsdiff.data._artifact_persistence as persistence
+
+    generated = _phase3b_generate()
+    artifact_root = tmp_path / "artifacts"
+    real_sync_parent = persistence._sync_publication_parent
+    calls = 0
+
+    def fail_after_promotion(path):
+        nonlocal calls
+        calls += 1
+        raise ArtifactValidationError(
+            "injected parent durability failure"
+        )
+
+    monkeypatch.setattr(
+        persistence, "_sync_publication_parent", fail_after_promotion
+    )
+    with pytest.raises(
+        ArtifactValidationError, match="durability"
+    ):
+        persistence.publish_dataset(artifact_root, generated)
+    final_dir = (
+        artifact_root
+        / "datasets"
+        / generated.dataset_identity_sha256
+    )
+    assert calls == 1
+    assert final_dir.exists()
+    persistence.verify_dataset_directory(
+        final_dir, expected_generated=generated
+    )
+
+    monkeypatch.setattr(
+        persistence, "_sync_publication_parent", real_sync_parent
+    )
+    reused = persistence.publish_dataset(artifact_root, generated)
+    assert reused.status == "reused"
+
+
+def test_task3_c2b1b_promotion_uses_only_platform_no_clobber_primitives():
+    import inspect
+    import gsdiff.data._artifact_persistence as persistence
+
+    promotion_source = inspect.getsource(
+        persistence._promote_directory_no_clobber
+    )
+    path_rename_source = inspect.getsource(
+        persistence._rename_directory_path_no_clobber
+    )
+    deletion_source = inspect.getsource(
+        persistence._delete_windows_owned_path
+    )
+    assert "os.replace" not in promotion_source
+    assert "os.replace" not in path_rename_source
+    assert "SetFileInformationByHandle" in promotion_source
+    assert "MoveFileExW" not in promotion_source
+    assert "MoveFileExW" in path_rename_source
+    assert "renameat2" in path_rename_source
+    assert "SetFileInformationByHandle" in deletion_source
+    assert "os.unlink" not in deletion_source
+    assert persistence._FILE_BASIC_INFO_CLASS == 0
+    assert persistence._FILE_RENAME_INFO_CLASS == 3
+    assert persistence._FILE_ID_INFO_CLASS == 18
+    assert persistence._FILE_DISPOSITION_INFO_EX_CLASS == 21
+    assert persistence._FILE_DISPOSITION_FLAG_DELETE == 0x1
+    assert (
+        persistence._FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE
+        == 0x10
+    )
+    assert persistence._MOVEFILE_WRITE_THROUGH == 0x8
+    assert persistence._RENAME_NOREPLACE == 1
+
+
+@pytest.mark.parametrize(
+    "mutation", ["artifact-root-file", "datasets-file"]
+)
+def test_task3_c2b1b_publication_roots_must_be_real_directories(
+    tmp_path, monkeypatch, mutation
+):
+    import gsdiff.data._artifact_persistence as persistence
+
+    generated = _phase3b_generate()
+    artifact_root = tmp_path / "artifacts"
+    if mutation == "artifact-root-file":
+        artifact_root.write_bytes(b"not-a-directory")
+    else:
+        artifact_root.mkdir()
+        (artifact_root / "datasets").write_bytes(b"not-a-directory")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("unsafe root reached serialization")
+
+    monkeypatch.setattr(
+        persistence, "build_dataset_payloads", forbidden
+    )
+    with pytest.raises(ArtifactValidationError, match="directory"):
+        persistence.publish_dataset(artifact_root, generated)
+
+
+@pytest.mark.parametrize(
+    "raced_component", ["artifact-root", "datasets"]
+)
+def test_task3_c2b2a_concurrent_real_directory_mkdir_winner_is_accepted(
+    tmp_path, monkeypatch, raced_component
+):
+    import gsdiff.data._artifact_persistence as persistence
+
+    generated = _phase3b_generate()
+    artifact_root = (tmp_path / "artifacts").absolute()
+    target = (
+        artifact_root
+        if raced_component == "artifact-root"
+        else artifact_root / "datasets"
+    )
+    if raced_component == "datasets":
+        artifact_root.mkdir()
+    real_mkdir = persistence.os.mkdir
+    injected = False
+
+    def race_mkdir(path, mode=0o777, *, dir_fd=None):
+        nonlocal injected
+        candidate = Path(path).absolute()
+        if candidate == target and not injected:
+            injected = True
+            real_mkdir(path, mode, dir_fd=dir_fd)
+            raise FileExistsError("injected concurrent directory winner")
+        return real_mkdir(path, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(persistence.os, "mkdir", race_mkdir)
+    publication = persistence.publish_dataset(artifact_root, generated)
+
+    assert injected is True
+    assert publication.status == "created"
+    assert publication.dataset_dir.parent == artifact_root / "datasets"
+    persistence.verify_dataset_directory(
+        publication.dataset_dir,
+        expected_dataset_manifest_sha256=(
+            publication.dataset_manifest_sha256
+        ),
+        expected_generated=generated,
+    )
+
+
+@pytest.mark.parametrize(
+    "raced_component", ["artifact-root", "datasets"]
+)
+def test_task3_c2b2a_concurrent_mkdir_file_winner_fails_closed(
+    tmp_path, monkeypatch, raced_component
+):
+    import gsdiff.data._artifact_persistence as persistence
+
+    generated = _phase3b_generate()
+    artifact_root = (tmp_path / "artifacts").absolute()
+    target = (
+        artifact_root
+        if raced_component == "artifact-root"
+        else artifact_root / "datasets"
+    )
+    if raced_component == "datasets":
+        artifact_root.mkdir()
+    real_mkdir = persistence.os.mkdir
+    injected = False
+
+    def race_mkdir(path, mode=0o777, *, dir_fd=None):
+        nonlocal injected
+        candidate = Path(path).absolute()
+        if candidate == target and not injected:
+            injected = True
+            Path(path).write_bytes(b"not-a-directory")
+            raise FileExistsError("injected concurrent file winner")
+        return real_mkdir(path, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(persistence.os, "mkdir", race_mkdir)
+    with pytest.raises(ArtifactValidationError, match="real directory"):
+        persistence.publish_dataset(artifact_root, generated)
+
+    assert injected is True
+    assert target.read_bytes() == b"not-a-directory"
+
+
+@pytest.mark.parametrize(
+    "appearance", ["precheck-window", "promotion-primitive"]
+)
+@pytest.mark.parametrize("winner_kind", ["identical", "different-payload"])
+def test_task3_c2b2a_target_appears_is_verified_without_clobber(
+    tmp_path, monkeypatch, appearance, winner_kind
+):
+    import gsdiff.data._artifact_persistence as persistence
+
+    generated = _phase3b_generate()
+    artifact_root = tmp_path / "artifacts"
+    captured_stage = None
+    winner_snapshot = None
+    installed = False
+
+    def install_winner(staging_dir, final_dir):
+        nonlocal captured_stage, winner_snapshot, installed
+        if installed:
+            raise AssertionError("winner installed more than once")
+        installed = True
+        captured_stage = staging_dir
+        final_dir.mkdir()
+        for source in staging_dir.iterdir():
+            (final_dir / source.name).write_bytes(source.read_bytes())
+        if winner_kind == "different-payload":
+            preview = final_dir / "preview.png"
+            changed = bytearray(preview.read_bytes())
+            changed[-1] ^= 1
+            preview.write_bytes(bytes(changed))
+        winner_snapshot = {
+            path.name: (path.read_bytes(), path.stat().st_mtime_ns)
+            for path in final_dir.iterdir()
+        }
+
+    if appearance == "precheck-window":
+        def inject_at_barrier(name, *, staging_dir, final_dir):
+            if name == "before-promotion":
+                install_winner(staging_dir, final_dir)
+
+        monkeypatch.setattr(
+            persistence, "_publication_barrier", inject_at_barrier
+        )
+    else:
+        def lose_atomic_promotion(stage, final_dir, **kwargs):
+            install_winner(stage.path, final_dir)
+            raise FileExistsError("injected atomic promotion loser")
+
+        monkeypatch.setattr(
+            persistence,
+            "_promote_directory_no_clobber",
+            lose_atomic_promotion,
+        )
+
+    if winner_kind == "identical":
+        publication = persistence.publish_dataset(
+            artifact_root, generated
+        )
+        assert publication.status == "reused"
+        assert publication.verified.expected_generated_verified is True
+    else:
+        with pytest.raises(
+            ArtifactValidationError,
+            match="nondeterministic dataset collision",
+        ):
+            persistence.publish_dataset(artifact_root, generated)
+
+    final_dir = (
+        artifact_root
+        / "datasets"
+        / generated.dataset_identity_sha256
+    )
+    after = {
+        path.name: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in final_dir.iterdir()
+    }
+    assert installed is True
+    assert winner_snapshot == after
+    assert captured_stage is not None
+    assert not captured_stage.exists()
+
+
+def test_task3_c2b2a_collision_handler_uses_physical_staging_evidence(
+    tmp_path
+):
+    import gsdiff.data._artifact_persistence as persistence
+
+    generated = _phase3b_generate()
+    created = persistence.publish_dataset(
+        tmp_path / "artifacts", generated
+    )
+    manifest_payload = (
+        created.dataset_dir / "dataset-manifest.json"
+    ).read_bytes()
+    physical_payloads = {
+        name: (created.dataset_dir / name).read_bytes()
+        for name in (
+            "measurements.npz",
+            "evaluation-truth.npz",
+            "preview.png",
+        )
+    }
+    changed_preview = bytearray(physical_payloads["preview.png"])
+    changed_preview[-1] ^= 1
+    physical_payloads["preview.png"] = bytes(changed_preview)
+
+    with pytest.raises(
+        ArtifactValidationError,
+        match="nondeterministic dataset collision",
+    ):
+        persistence._verify_concurrent_publication_winner(
+            created.dataset_dir,
+            identity=generated.dataset_identity_sha256,
+            generated=generated,
+            staged_manifest_payload=manifest_payload,
+            staged_physical_payloads=physical_payloads,
+        )
+
+
+def test_task3_c2b2b_two_fresh_processes_publish_one_created_one_reused(
+    tmp_path
+):
+    import gsdiff.data._artifact_persistence as persistence
+
+    artifact_root = (tmp_path / "artifacts").absolute()
+    barrier_dir = tmp_path / "publication-barrier"
+    barrier_dir.mkdir()
+    release_path = barrier_dir / "release"
+    script = "\n".join(
+        [
+            "import json",
+            "from pathlib import Path",
+            "import runpy",
+            "import sys",
+            "import time",
+            "import gsdiff.data._artifact_persistence as persistence",
+            f"ns = runpy.run_path({str(Path(__file__).resolve())!r})",
+            "generated = ns['_phase3b_generate']()",
+            "artifact_root = Path(sys.argv[1])",
+            "barrier_dir = Path(sys.argv[2])",
+            "participant = sys.argv[3]",
+            "ready = barrier_dir / f'{participant}.ready'",
+            "release = barrier_dir / 'release'",
+            "real_promote = persistence._promote_directory_no_clobber",
+            "def synchronized_promote(stage, final_dir, **kwargs):",
+            "    ready.write_text('ready', encoding='utf-8')",
+            "    deadline = time.monotonic() + 30.0",
+            "    while not release.exists():",
+            "        if time.monotonic() >= deadline:",
+            "            raise TimeoutError('publication barrier timed out')",
+            "        time.sleep(0.01)",
+            "    return real_promote(stage, final_dir, **kwargs)",
+            "persistence._promote_directory_no_clobber = (",
+            "    synchronized_promote",
+            ")",
+            "publication = persistence.publish_dataset(",
+            "    artifact_root, generated",
+            ")",
+            "print(json.dumps({",
+            "    'status': publication.status,",
+            "    'manifest_sha256': publication.dataset_manifest_sha256,",
+            "    'dataset_dir': str(publication.dataset_dir),",
+            "}, sort_keys=True))",
+        ]
+    )
+    child_env = {
+        "PATH": os.environ["PATH"],
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONPATH": str(REPO_ROOT),
+        "SYSTEMROOT": os.environ["SYSTEMROOT"],
+    }
+    processes = [
+        subprocess.Popen(
+            [
+                str(AUTHORITATIVE_PYTHON),
+                "-c",
+                script,
+                str(artifact_root),
+                str(barrier_dir),
+                participant,
+            ],
+            cwd=REPO_ROOT,
+            env=child_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+        )
+        for participant in ("first", "second")
+    ]
+    completed = []
+    try:
+        deadline = time.monotonic() + 30.0
+        while len(list(barrier_dir.glob("*.ready"))) != 2:
+            if any(process.poll() is not None for process in processes):
+                break
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.02)
+        assert {
+            path.name for path in barrier_dir.glob("*.ready")
+        } == {"first.ready", "second.ready"}, [
+            process.poll() for process in processes
+        ]
+        release_path.write_text("release", encoding="utf-8")
+        for process in processes:
+            stdout, stderr = process.communicate(timeout=60)
+            completed.append(
+                (process.returncode, stdout, stderr)
+            )
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+                process.communicate(timeout=10)
+
+    assert all(returncode == 0 for returncode, _, _ in completed), completed
+    results = [
+        json.loads(stdout)
+        for _, stdout, _ in completed
+    ]
+    assert sorted(result["status"] for result in results) == [
+        "created",
+        "reused",
+    ]
+    assert len(
+        {result["manifest_sha256"] for result in results}
+    ) == 1
+    generated = _phase3b_generate()
+    final_dir = (
+        artifact_root
+        / "datasets"
+        / generated.dataset_identity_sha256
+    )
+    verified = persistence.verify_dataset_directory(
+        final_dir,
+        expected_dataset_manifest_sha256=(
+            results[0]["manifest_sha256"]
+        ),
+        expected_generated=generated,
+    )
+    assert verified.expected_generated_verified is True
+    assert {
+        path.name for path in final_dir.iterdir()
+    } == {
+        "dataset-manifest.json",
+        "measurements.npz",
+        "evaluation-truth.npz",
+        "preview.png",
+    }
+    assert {
+        path.name for path in final_dir.parent.iterdir()
+    } == {generated.dataset_identity_sha256}
+    if os.name != "nt":
+        assert os.lstat(final_dir).st_mode & 0o222 == 0
+        assert all(
+            os.lstat(path).st_mode & 0o222 == 0
+            for path in final_dir.iterdir()
+        )
+
+
+def test_task3_c2b2b_crash_left_staging_is_preserved_and_ignored(
+    tmp_path
+):
+    import gsdiff.data._artifact_persistence as persistence
+
+    generated = _phase3b_generate()
+    artifact_root = tmp_path / "artifacts"
+    datasets_dir = artifact_root / "datasets"
+    datasets_dir.mkdir(parents=True)
+    stale = datasets_dir / (
+        f".{generated.dataset_identity_sha256}.staging-crashed"
+    )
+    stale.mkdir()
+    (stale / "partial.bin").write_bytes(b"crash-evidence")
+    nested = stale / "nested"
+    nested.mkdir()
+    (nested / "sentinel.bin").write_bytes(b"nested-evidence")
+    before = {
+        str(path.relative_to(stale)): (
+            path.read_bytes() if path.is_file() else None,
+            path.stat().st_mtime_ns,
+        )
+        for path in (stale, *stale.rglob("*"))
+    }
+
+    created = persistence.publish_dataset(artifact_root, generated)
+    reused = persistence.publish_dataset(artifact_root, generated)
+
+    after = {
+        str(path.relative_to(stale)): (
+            path.read_bytes() if path.is_file() else None,
+            path.stat().st_mtime_ns,
+        )
+        for path in (stale, *stale.rglob("*"))
+    }
+    assert created.status == "created"
+    assert reused.status == "reused"
+    assert before == after
+    assert {
+        path.name for path in datasets_dir.iterdir()
+    } == {
+        generated.dataset_identity_sha256,
+        stale.name,
+    }
+
+
+def test_task3_c2b2b_final_reparse_branch_fails_without_link_privilege(
+    tmp_path, monkeypatch
+):
+    import stat as _stat
+    from types import SimpleNamespace
+    import gsdiff.data._artifact_persistence as persistence
+
+    generated = _phase3b_generate()
+    artifact_root = (tmp_path / "artifacts").absolute()
+    datasets_dir = artifact_root / "datasets"
+    datasets_dir.mkdir(parents=True)
+    final_dir = (
+        datasets_dir / generated.dataset_identity_sha256
+    ).absolute()
+    sentinel = tmp_path / "outside-sentinel.bin"
+    sentinel.write_bytes(b"outside")
+    real_lexists = persistence.os.path.lexists
+    real_lstat = persistence.os.lstat
+
+    def fake_lexists(path):
+        return Path(path).absolute() == final_dir or real_lexists(path)
+
+    def fake_lstat(path):
+        if Path(path).absolute() == final_dir:
+            return SimpleNamespace(
+                st_mode=_stat.S_IFDIR,
+                st_file_attributes=0x400,
+            )
+        return real_lstat(path)
+
+    monkeypatch.setattr(
+        persistence.os.path, "lexists", fake_lexists
+    )
+    monkeypatch.setattr(persistence.os, "lstat", fake_lstat)
+    with pytest.raises(ArtifactValidationError, match="linked|reparse"):
+        persistence.publish_dataset(artifact_root, generated)
+
+    assert sentinel.read_bytes() == b"outside"
+    assert not list(datasets_dir.iterdir())
+
+
+def test_task3_c2b2b_concurrent_mkdir_reparse_winner_fails_closed(
+    tmp_path, monkeypatch
+):
+    import stat as _stat
+    from types import SimpleNamespace
+    import gsdiff.data._artifact_persistence as persistence
+
+    generated = _phase3b_generate()
+    artifact_root = (tmp_path / "artifacts").absolute()
+    artifact_root.mkdir()
+    datasets_dir = (artifact_root / "datasets").absolute()
+    real_mkdir = persistence.os.mkdir
+    real_lstat = persistence.os.lstat
+    injected = False
+
+    def race_mkdir(path, mode=0o777, *, dir_fd=None):
+        nonlocal injected
+        if Path(path).absolute() == datasets_dir and not injected:
+            injected = True
+            real_mkdir(path, mode, dir_fd=dir_fd)
+            raise FileExistsError("injected reparse mkdir winner")
+        return real_mkdir(path, mode, dir_fd=dir_fd)
+
+    def fake_lstat(path):
+        if Path(path).absolute() == datasets_dir and injected:
+            return SimpleNamespace(
+                st_mode=_stat.S_IFDIR,
+                st_file_attributes=0x400,
+            )
+        return real_lstat(path)
+
+    monkeypatch.setattr(persistence.os, "mkdir", race_mkdir)
+    monkeypatch.setattr(persistence.os, "lstat", fake_lstat)
+    with pytest.raises(ArtifactValidationError, match="linked|reparse"):
+        persistence.publish_dataset(artifact_root, generated)
+
+    assert injected is True
+    assert list(datasets_dir.iterdir()) == []
+
+
+def test_task3_c2b2b_leaf_mutation_inside_promotion_is_rejected_before_rename(
+    tmp_path, monkeypatch
+):
+    import gsdiff.data._artifact_persistence as persistence
+
+    generated = _phase3b_generate()
+    artifact_root = tmp_path / "artifacts"
+    final_dir = (
+        artifact_root
+        / "datasets"
+        / generated.dataset_identity_sha256
+    )
+    real_verify_owned_stage = persistence._verify_owned_stage
+    verify_calls = 0
+    captured_stage = None
+
+    def verify_then_mutate(stage):
+        nonlocal verify_calls, captured_stage
+        result = real_verify_owned_stage(stage)
+        verify_calls += 1
+        captured_stage = stage.path
+        if verify_calls == 2:
+            preview = stage.path / "preview.png"
+            preview.write_bytes(b"x" * preview.stat().st_size)
+        return result
+
+    monkeypatch.setattr(
+        persistence, "_verify_owned_stage", verify_then_mutate
+    )
+    with pytest.raises(ArtifactValidationError):
+        persistence.publish_dataset(artifact_root, generated)
+
+    assert verify_calls >= 2
+    assert not final_dir.exists()
+    diagnostics = list(
+        final_dir.parent.glob(f".{final_dir.name}.rejected-*")
+    )
+    assert diagnostics == []
+    assert captured_stage is not None and captured_stage.exists()
+
+
+def test_task3_c2b2b_raw_bytes_detect_restored_mtime_before_rename(
+    tmp_path, monkeypatch
+):
+    import gsdiff.data._artifact_persistence as persistence
+
+    generated = _phase3b_generate()
+    artifact_root = tmp_path / "artifacts"
+    final_dir = (
+        artifact_root
+        / "datasets"
+        / generated.dataset_identity_sha256
+    )
+    captured_stage = None
+    stat_signature_restored = None
+
+    def mutate_and_restore_mtime(
+        name, *, staging_dir, final_dir
+    ):
+        nonlocal captured_stage, stat_signature_restored
+        if name != "before-promotion":
+            return
+        captured_stage = staging_dir
+        preview = staging_dir / "preview.png"
+        before = os.lstat(preview)
+        preview.write_bytes(b"x" * before.st_size)
+        os.utime(
+            preview,
+            ns=(before.st_atime_ns, before.st_mtime_ns),
+        )
+        stat_signature_restored = (
+            persistence._stat_signature(os.lstat(preview))
+            == persistence._stat_signature(before)
+        )
+
+    monkeypatch.setattr(
+        persistence,
+        "_publication_barrier",
+        mutate_and_restore_mtime,
+    )
+    with pytest.raises(
+        ArtifactValidationError, match="staging bytes"
+    ):
+        persistence.publish_dataset(artifact_root, generated)
+
+    if os.name == "nt":
+        assert stat_signature_restored is True
+    assert not final_dir.exists()
+    assert list(
+        final_dir.parent.glob(f".{final_dir.name}.rejected-*")
+    ) == []
+    assert captured_stage is not None
+
+
+def test_task3_c2b2b_stage_is_readonly_before_final_raw_gate(
+    tmp_path, monkeypatch
+):
+    import stat as _stat
+
+    import gsdiff.data._artifact_persistence as persistence
+
+    generated = _phase3b_generate()
+    artifact_root = tmp_path / "artifacts"
+    final_dir = (
+        artifact_root
+        / "datasets"
+        / generated.dataset_identity_sha256
+    )
+    real_verify_bytes = persistence._verify_owned_stage_bytes
+    attempted_write = False
+    write_denied = False
+    expected_files = None
+
+    def verify_then_attempt_ordinary_write(stage, expected):
+        nonlocal attempted_write, write_denied, expected_files
+        real_verify_bytes(stage, expected)
+        expected_files = dict(expected)
+        preview = stage.path / "preview.png"
+        info = os.lstat(preview)
+        if os.name == "nt":
+            assert info.st_file_attributes & _stat.FILE_ATTRIBUTE_READONLY
+        else:
+            assert info.st_mode & 0o222 == 0
+        if os.name != "nt" and hasattr(os, "geteuid") and os.geteuid() == 0:
+            return
+        attempted_write = True
+        try:
+            preview.write_bytes(b"x" * info.st_size)
+        except PermissionError:
+            write_denied = True
+
+    monkeypatch.setattr(
+        persistence,
+        "_verify_owned_stage_bytes",
+        verify_then_attempt_ordinary_write,
+    )
+    publication = persistence.publish_dataset(artifact_root, generated)
+
+    assert publication.status == "created"
+    if os.name != "nt" and hasattr(os, "geteuid") and os.geteuid() == 0:
+        assert attempted_write is False
+    else:
+        assert attempted_write is True
+        assert write_denied is True
+    assert expected_files is not None
+    for name, expected in expected_files.items():
+        final_file = final_dir / name
+        assert final_file.read_bytes() == expected
+        info = os.lstat(final_file)
+        if os.name == "nt":
+            assert info.st_file_attributes & _stat.FILE_ATTRIBUTE_READONLY
+        else:
+            assert info.st_mode & 0o222 == 0
+
+
+def test_task3_c2b2b_final_verify_precedes_sync_and_quarantines_failure(
+    tmp_path, monkeypatch
+):
+    import gsdiff.data._artifact_persistence as persistence
+
+    generated = _phase3b_generate()
+    artifact_root = tmp_path / "artifacts"
+    final_dir = (
+        artifact_root
+        / "datasets"
+        / generated.dataset_identity_sha256
+    )
+    real_verify = persistence.verify_dataset_directory
+    mutated = False
+
+    def mutate_before_final_verify(dataset_dir, **kwargs):
+        nonlocal mutated
+        if Path(dataset_dir).absolute() == final_dir.absolute():
+            preview = Path(dataset_dir) / "preview.png"
+            preview.chmod(0o600)
+            preview.write_bytes(b"x" * preview.stat().st_size)
+            mutated = True
+        return real_verify(dataset_dir, **kwargs)
+
+    def forbidden_parent_sync(path):
+        raise AssertionError("invalid final reached parent sync")
+
+    monkeypatch.setattr(
+        persistence,
+        "verify_dataset_directory",
+        mutate_before_final_verify,
+    )
+    monkeypatch.setattr(
+        persistence, "_sync_publication_parent", forbidden_parent_sync
+    )
+    with pytest.raises(ArtifactValidationError):
+        persistence.publish_dataset(artifact_root, generated)
+
+    assert mutated is True
+    assert not final_dir.exists()
+    diagnostics = list(
+        final_dir.parent.glob(f".{final_dir.name}.rejected-*")
+    )
+    assert len(diagnostics) == 1
+    assert {
+        path.name for path in diagnostics[0].iterdir()
+    } == {
+        "dataset-manifest.json",
+        "measurements.npz",
+        "evaluation-truth.npz",
+        "preview.png",
+    }
+
+
+@pytest.mark.skipif(
+    os.name != "nt",
+    reason=(
+        "portable POSIX unlinkat cannot bind deletion to an opened leaf; "
+        "hostile same-UID directory writers are outside the threat model"
+    ),
+)
+def test_task3_c2b2b_windows_cleanup_never_deletes_swapped_external_leaf(
+    tmp_path, monkeypatch
+):
+    import gsdiff.data._artifact_persistence as persistence
+
+    generated = _phase3b_generate()
+    artifact_root = tmp_path / "artifacts"
+    outside = tmp_path / "outside-sentinel.bin"
+    outside.write_bytes(b"outside-sentinel")
+    captured_stage = None
+    displaced_owned = None
+    injected_path = None
+    swap_triggered = False
+
+    def fail_before_promotion(name, *, staging_dir, final_dir):
+        nonlocal captured_stage
+        if name == "before-promotion":
+            captured_stage = staging_dir
+            raise RuntimeError("injected cleanup trigger")
+
+    def swap_into_leaf(path):
+        nonlocal displaced_owned, injected_path, swap_triggered
+        candidate = Path(path)
+        if not candidate.is_absolute():
+            assert captured_stage is not None
+            candidate = captured_stage / candidate.name
+        if candidate.name != "measurements.npz" or swap_triggered:
+            return
+        displaced_owned = candidate.with_name("owned-displaced.bin")
+        candidate.rename(displaced_owned)
+        outside.rename(candidate)
+        injected_path = candidate
+        swap_triggered = True
+
+    monkeypatch.setattr(
+        persistence, "_publication_barrier", fail_before_promotion
+    )
+    real_delete = persistence._delete_windows_owned_path
+
+    def swap_then_handle_delete(path, *args, **kwargs):
+        swap_into_leaf(path)
+        return real_delete(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        persistence,
+        "_delete_windows_owned_path",
+        swap_then_handle_delete,
+    )
+
+    with pytest.raises(RuntimeError, match="cleanup trigger"):
+        persistence.publish_dataset(artifact_root, generated)
+
+    assert swap_triggered is True
+    assert captured_stage is not None and captured_stage.exists()
+    assert displaced_owned is not None and displaced_owned.exists()
+    assert displaced_owned.read_bytes() != b"outside-sentinel"
+    assert injected_path is not None
+    preserved_paths = [
+        path
+        for path in (outside, injected_path)
+        if path.exists()
+    ]
+    assert len(preserved_paths) == 1
+    assert preserved_paths[0].read_bytes() == b"outside-sentinel"
+
+
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="POSIX descriptor-bound chmod/unlinkat semantics",
+)
+def test_task3_c2b2b_posix_collision_thaws_readonly_stage_for_cleanup(
+    tmp_path, monkeypatch
+):
+    import gsdiff.data._artifact_persistence as persistence
+
+    generated = _phase3b_generate()
+    artifact_root = tmp_path / "artifacts"
+    captured_stage = None
+    frozen_mode = None
+
+    def install_winner_after_freeze(source, final_dir):
+        nonlocal captured_stage, frozen_mode
+        captured_stage = Path(source)
+        frozen_mode = os.lstat(captured_stage).st_mode
+        final_dir.mkdir()
+        for source_file in captured_stage.iterdir():
+            destination = final_dir / source_file.name
+            destination.write_bytes(source_file.read_bytes())
+            destination.chmod(0o400)
+        final_dir.chmod(0o500)
+        raise FileExistsError("injected POSIX promotion loser")
+
+    monkeypatch.setattr(
+        persistence,
+        "_rename_directory_path_no_clobber",
+        install_winner_after_freeze,
+    )
+    publication = persistence.publish_dataset(artifact_root, generated)
+
+    assert publication.status == "reused"
+    assert captured_stage is not None
+    assert frozen_mode is not None and frozen_mode & 0o222 == 0
+    assert not captured_stage.exists()
+    assert {
+        path.name
+        for path in publication.dataset_dir.parent.iterdir()
+    } == {generated.dataset_identity_sha256}
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["final-file", "extra-file", "leaf-directory", "leaf-hardlink"],
+)
+def test_task3_c2b2b_unsafe_existing_final_is_never_repaired(
+    tmp_path, mutation
+):
+    import gsdiff.data._artifact_persistence as persistence
+
+    generated = _phase3b_generate()
+    artifact_root = tmp_path / "artifacts"
+    final_dir = (
+        artifact_root
+        / "datasets"
+        / generated.dataset_identity_sha256
+    )
+    outside = tmp_path / "outside-sentinel.bin"
+    outside.write_bytes(b"outside")
+    if mutation == "final-file":
+        final_dir.parent.mkdir(parents=True)
+        final_dir.write_bytes(b"not-a-directory")
+        before = final_dir.read_bytes()
+    else:
+        persistence.publish_dataset(artifact_root, generated)
+        if mutation == "extra-file":
+            (final_dir / "extra.bin").write_bytes(b"extra")
+        elif mutation == "leaf-directory":
+            preview = final_dir / "preview.png"
+            preview.chmod(0o600)
+            preview.unlink()
+            preview.mkdir()
+        else:
+            preview = final_dir / "preview.png"
+            preview.chmod(0o600)
+            preview.unlink()
+            try:
+                os.link(outside, preview)
+            except OSError as error:
+                pytest.skip(f"hardlinks unavailable: {error}")
+        before = {
+            path.name: (
+                "directory" if path.is_dir() else path.read_bytes()
+            )
+            for path in final_dir.iterdir()
+        }
+
+    with pytest.raises(ArtifactValidationError):
+        persistence.publish_dataset(artifact_root, generated)
+
+    if mutation == "final-file":
+        assert final_dir.read_bytes() == before
+    else:
+        after = {
+            path.name: (
+                "directory" if path.is_dir() else path.read_bytes()
+            )
+            for path in final_dir.iterdir()
+        }
+        assert after == before
+    assert outside.read_bytes() == b"outside"
+
+
+def test_task3_c3a_dataset_discovery_is_read_only_sorted_and_recheckable(
+    tmp_path,
+):
+    from gsdiff.data.artifacts import (
+        ArtifactValidationError,
+        discover_dataset_directories,
+        verify_dataset_directory_discovery,
+    )
+
+    artifact_root = tmp_path / "artifacts"
+    missing = discover_dataset_directories(artifact_root)
+
+    assert missing.datasets_dir_exists is False
+    assert missing.canonical_directories == ()
+    assert missing.stale_staging_directories == ()
+    assert missing.rejected_directories == ()
+    assert not artifact_root.exists()
+    verify_dataset_directory_discovery(missing)
+
+    datasets_dir = artifact_root / "datasets"
+    datasets_dir.mkdir(parents=True)
+    first_identity = "a" * 64
+    second_identity = "b" * 64
+    names = (
+        second_identity,
+        f".{first_identity}.staging-crashleft",
+        f".{first_identity}.rejected-{'1' * 24}",
+        first_identity,
+    )
+    for name in names:
+        (datasets_dir / name).mkdir()
+
+    discovery = discover_dataset_directories(artifact_root)
+
+    assert tuple(path.name for path in discovery.canonical_directories) == (
+        first_identity,
+        second_identity,
+    )
+    assert tuple(
+        path.name for path in discovery.stale_staging_directories
+    ) == (f".{first_identity}.staging-crashleft",)
+    assert tuple(
+        path.name for path in discovery.rejected_directories
+    ) == (f".{first_identity}.rejected-{'1' * 24}",)
+    verify_dataset_directory_discovery(discovery)
+
+    displaced = datasets_dir / f".{first_identity}.displaced"
+    (datasets_dir / first_identity).rename(displaced)
+    (datasets_dir / first_identity).write_bytes(b"replacement")
+
+    with pytest.raises(ArtifactValidationError, match="discovery changed"):
+        verify_dataset_directory_discovery(discovery)
+
+
+def test_task3_c3a_dataset_discovery_rejects_unknown_or_non_directory_entries(
+    tmp_path,
+):
+    from gsdiff.data.artifacts import (
+        ArtifactValidationError,
+        discover_dataset_directories,
+    )
+
+    datasets_dir = tmp_path / "artifacts" / "datasets"
+    datasets_dir.mkdir(parents=True)
+    (datasets_dir / "unexpected.txt").write_bytes(b"unexpected")
+
+    with pytest.raises(
+        ArtifactValidationError,
+        match="unexpected dataset directory entry",
+    ):
+        discover_dataset_directories(tmp_path / "artifacts")
+
+
+def test_task3_c3a_dataset_discovery_rejects_cross_device_candidate(
+    tmp_path, monkeypatch
+):
+    import gsdiff.data._artifact_persistence as persistence
+
+    datasets_dir = tmp_path / "artifacts" / "datasets"
+    datasets_dir.mkdir(parents=True)
+    identity = "a" * 64
+    (datasets_dir / identity).mkdir()
+    real_signature = persistence._discovery_directory_signature
+
+    def cross_device_signature(path, noun):
+        signature = real_signature(path, noun)
+        if path.name == identity:
+            return (signature[0] + 1, *signature[1:])
+        return signature
+
+    monkeypatch.setattr(
+        persistence,
+        "_discovery_directory_signature",
+        cross_device_signature,
+    )
+
+    with pytest.raises(
+        ArtifactValidationError,
+        match="crosses a filesystem boundary",
+    ):
+        persistence.discover_dataset_directories(tmp_path / "artifacts")
+
+
+def test_task3_c3a_dataset_discovery_rejects_non_directory_ancestor(
+    tmp_path,
+):
+    from gsdiff.data.artifacts import discover_dataset_directories
+
+    blocker = tmp_path / "blocker"
+    blocker.write_bytes(b"not-a-directory")
+    artifact_root = blocker / "artifacts"
+
+    with pytest.raises(
+        ArtifactValidationError,
+        match="ancestor must be a real directory",
+    ):
+        discover_dataset_directories(artifact_root)
+
+    assert blocker.read_bytes() == b"not-a-directory"
+
+
+def test_task3_c3a_missing_discovery_recheck_rejects_ancestor_file(
+    tmp_path,
+):
+    from gsdiff.data.artifacts import (
+        discover_dataset_directories,
+        verify_dataset_directory_discovery,
+    )
+
+    blocker = tmp_path / "missing-parent"
+    discovery = discover_dataset_directories(blocker / "artifacts")
+    blocker.write_bytes(b"replacement")
+
+    with pytest.raises(ArtifactValidationError, match="discovery changed"):
+        verify_dataset_directory_discovery(discovery)
+
+
+def test_task3_c3d_discovery_fails_closed_when_datasets_appears_after_root_scan(
+    tmp_path, monkeypatch
+):
+    import gsdiff.data._artifact_persistence as persistence
+
+    artifact_root = (tmp_path / "artifacts").absolute()
+    datasets_dir = artifact_root / "datasets"
+    real_lexists = persistence.os.path.lexists
+    real_reject_links = persistence._reject_linked_ancestors
+    armed = False
+    injected = False
+
+    def arm_after_initial_ancestor_scan(path):
+        nonlocal armed
+        result = real_reject_links(path)
+        armed = True
+        return result
+
+    def inject_after_missing_root_observation(path):
+        nonlocal injected
+        result = real_lexists(path)
+        if (
+            armed
+            and not injected
+            and Path(path) == artifact_root
+            and result is False
+        ):
+            datasets_dir.mkdir(parents=True)
+            injected = True
+        return result
+
+    monkeypatch.setattr(
+        persistence,
+        "_reject_linked_ancestors",
+        arm_after_initial_ancestor_scan,
+    )
+    monkeypatch.setattr(
+        persistence.os.path,
+        "lexists",
+        inject_after_missing_root_observation,
+    )
+
+    with pytest.raises(
+        ArtifactValidationError,
+        match="discovery changed during scan",
+    ):
+        persistence.discover_dataset_directories(artifact_root)
+
+    assert injected is True
+    assert datasets_dir.is_dir()

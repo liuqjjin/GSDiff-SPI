@@ -4,6 +4,7 @@
 
 # Datasets (large binaries) — root-anchored (NOT gsdiff/data/ source)
 /data/
+/artifacts/
 
 # Experiment outputs (figures, checkpoints, per-run json)
 /results/

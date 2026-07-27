@@ -35,6 +35,7 @@ def parse_args(argv=None):
     p.add_argument("--config", default="configs/default.yaml")
     p.add_argument("--solver", default=None)
     p.add_argument("--measurements-path", default=None)
+    p.add_argument("--dataset-identity-sha256", default=None)
     p.add_argument("--truth-path", default=None)
     p.add_argument("--output-dir", default=None)
     p.add_argument("--device", default=None)
@@ -214,6 +215,13 @@ def main(argv=None):
     )
     if truth_path is not None and measurements_path is None:
         raise ValueError("--truth-path requires --measurements-path")
+    if (measurements_path is None) != (
+        args.dataset_identity_sha256 is None
+    ):
+        raise ValueError(
+            "--measurements-path and --dataset-identity-sha256 "
+            "must be provided together"
+        )
     blind_method_child = measurements_path is not None and truth_path is None
     execution_policy = method_execution_policy(truth_path=truth_path)
 
@@ -225,12 +233,16 @@ def main(argv=None):
 
     # ── 1. Generate or load data ──────────────────────────────
     if measurements_path is not None:
-        if not isinstance(raw.get("dataset_spec"), dict):
+        if not isinstance(raw.get("acquisition_spec"), dict):
             raise ValueError(
-                "method-child config requires complete dataset_spec"
+                "method-child config requires blind acquisition_spec"
             )
         acquisition = load_acquisition_data(
-            measurements_path, expected_spec=raw["dataset_spec"]
+            measurements_path,
+            expected_dataset_identity_sha256=(
+                args.dataset_identity_sha256
+            ),
+            expected_acquisition_spec=raw["acquisition_spec"],
         )
         data = acquisition
         if truth_path is not None:
@@ -271,10 +283,7 @@ def main(argv=None):
     # Update T in case motion_mode=1 changed it
     T = data.T
 
-    motion_label = (
-        acquisition.motion_model if measurements_path is not None
-        else data.motion_type
-    )
+    motion_label = "blind" if measurements_path is not None else data.motion_type
     print(f"Data: {H}x{W}, T={T}, K={K}, motion={motion_label}")
     if not blind_method_child:
         print(f"GT vel={data.gt_velocity}, omega={data.gt_omega:.4f}")

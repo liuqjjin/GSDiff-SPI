@@ -1,0 +1,878 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "dataset-manifest-v1.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "status",
+    "dataset_identity_sha256",
+    "dataset_identity_spec",
+    "resolved_generator_config",
+    "noise_calibration_record",
+    "files"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "dataset-manifest-v1"
+    },
+    "status": {
+      "const": "complete"
+    },
+    "dataset_identity_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "dataset_identity_spec": {
+      "$ref": "#/$defs/datasetIdentity"
+    },
+    "resolved_generator_config": {
+      "$ref": "#/$defs/resolvedGeneratorConfig"
+    },
+    "noise_calibration_record": {
+      "$ref": "#/$defs/noiseCalibrationRecord"
+    },
+    "files": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "measurements.npz",
+        "evaluation-truth.npz",
+        "preview.png"
+      ],
+      "properties": {
+        "measurements.npz": {
+          "$ref": "#/$defs/measurementsFile"
+        },
+        "evaluation-truth.npz": {
+          "$ref": "#/$defs/truthFile"
+        },
+        "preview.png": {
+          "$ref": "#/$defs/previewFile"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "namedHashes": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "$ref": "#/$defs/sha256"
+      }
+    },
+    "scientificContract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "sha256"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "generator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version", "git_commit"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "git_commit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "dependencies_sha256",
+        "environment_lock_sha256"
+      ],
+      "properties": {
+        "dependencies_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "environment_lock_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "vector2": {
+      "type": "array",
+      "prefixItems": [
+        {
+          "type": "number"
+        },
+        {
+          "type": "number"
+        }
+      ],
+      "items": false,
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "glyphRenderer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "font_family",
+        "fill_fraction",
+        "resample",
+        "supersample"
+      ],
+      "properties": {
+        "font_family": {
+          "type": "string",
+          "minLength": 1
+        },
+        "fill_fraction": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 1
+        },
+        "resample": {
+          "const": "lanczos"
+        },
+        "supersample": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "fileRenderer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["color_mode", "resample"],
+      "properties": {
+        "color_mode": {
+          "const": "grayscale"
+        },
+        "resample": {
+          "const": "lanczos"
+        }
+      }
+    },
+    "targetRenderer": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/glyphRenderer"
+        },
+        {
+          "$ref": "#/$defs/fileRenderer"
+        }
+      ]
+    },
+    "resolvedDimensions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["H", "W", "T", "K", "holdout_K"],
+      "properties": {
+        "H": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "W": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "T": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "K": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "holdout_K": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "resolvedTarget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "descriptor", "assets_sha256", "renderer"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "descriptor": {
+          "type": "string",
+          "minLength": 1
+        },
+        "assets_sha256": {
+          "$ref": "#/$defs/namedHashes"
+        },
+        "renderer": {
+          "$ref": "#/$defs/targetRenderer"
+        }
+      }
+    },
+    "resolvedMotion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "velocity",
+        "acceleration",
+        "omega",
+        "beta"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "velocity": {
+          "$ref": "#/$defs/vector2"
+        },
+        "acceleration": {
+          "$ref": "#/$defs/vector2"
+        },
+        "omega": {
+          "type": "number"
+        },
+        "beta": {
+          "type": "number"
+        }
+      }
+    },
+    "binaryPatternValues": {
+      "type": "array",
+      "prefixItems": [
+        {
+          "const": 0
+        },
+        {
+          "const": 1
+        }
+      ],
+      "items": false,
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "signedPatternValues": {
+      "type": "array",
+      "prefixItems": [
+        {
+          "const": -1
+        },
+        {
+          "const": 1
+        }
+      ],
+      "items": false,
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "gaussianPatternValues": {
+      "type": "array",
+      "prefixItems": [
+        {
+          "const": "real"
+        }
+      ],
+      "items": false,
+      "minItems": 1,
+      "maxItems": 1
+    },
+    "resolvedAcquisition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pattern_family",
+        "pattern_values",
+        "pattern_order",
+        "time_assignment",
+        "holdout_pattern_family",
+        "snr_db",
+        "noise_calibration_id"
+      ],
+      "properties": {
+        "pattern_family": {
+          "enum": [
+            "bernoulli",
+            "gaussian",
+            "random",
+            "hadamard",
+            "hadamard_cc",
+            "hadamard_walsh",
+            "hadamard_natural",
+            "fourier",
+            "s_matrix",
+            "s_matrix_m"
+          ]
+        },
+        "pattern_values": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/binaryPatternValues"
+            },
+            {
+              "$ref": "#/$defs/signedPatternValues"
+            },
+            {
+              "$ref": "#/$defs/gaussianPatternValues"
+            }
+          ]
+        },
+        "pattern_order": {
+          "enum": ["sequential", "stratified", "random"]
+        },
+        "time_assignment": {
+          "const": "uniform"
+        },
+        "holdout_pattern_family": {
+          "const": "uniform-random"
+        },
+        "snr_db": {
+          "type": "number"
+        },
+        "noise_calibration_id": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "pattern_family": {
+                "const": "gaussian"
+              }
+            },
+            "required": ["pattern_family"]
+          },
+          "then": {
+            "properties": {
+              "pattern_values": {
+                "$ref": "#/$defs/gaussianPatternValues"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "pattern_family": {
+                "enum": [
+                  "hadamard",
+                  "hadamard_cc",
+                  "hadamard_walsh",
+                  "hadamard_natural"
+                ]
+              }
+            },
+            "required": ["pattern_family"]
+          },
+          "then": {
+            "properties": {
+              "pattern_values": {
+                "$ref": "#/$defs/signedPatternValues"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "pattern_family": {
+                "enum": [
+                  "bernoulli",
+                  "random",
+                  "fourier",
+                  "s_matrix",
+                  "s_matrix_m"
+                ]
+              }
+            },
+            "required": ["pattern_family"]
+          },
+          "then": {
+            "properties": {
+              "pattern_values": {
+                "$ref": "#/$defs/binaryPatternValues"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "resolvedRng": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bit_generator", "seed_sequence", "streams"],
+      "properties": {
+        "bit_generator": {
+          "const": "PCG64"
+        },
+        "seed_sequence": {
+          "const": "SeedSequence(entropy=seed, spawn_key=(stream_id,))"
+        },
+        "streams": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "train-pattern",
+            "train-noise",
+            "holdout-pattern",
+            "holdout-noise"
+          ],
+          "properties": {
+            "train-pattern": {
+              "const": 0
+            },
+            "train-noise": {
+              "const": 1
+            },
+            "holdout-pattern": {
+              "const": 2
+            },
+            "holdout-noise": {
+              "const": 3
+            }
+          }
+        }
+      }
+    },
+    "motionRenderer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "acceleration_factor",
+        "angular_acceleration_factor",
+        "interpolation_order",
+        "mode",
+        "normalized_time"
+      ],
+      "properties": {
+        "acceleration_factor": {
+          "const": 1
+        },
+        "angular_acceleration_factor": {
+          "const": 1
+        },
+        "interpolation_order": {
+          "const": 1
+        },
+        "mode": {
+          "const": "constant"
+        },
+        "normalized_time": {
+          "type": "array",
+          "prefixItems": [
+            {
+              "const": 0
+            },
+            {
+              "const": 1
+            }
+          ],
+          "items": false,
+          "minItems": 2,
+          "maxItems": 2
+        }
+      }
+    },
+    "serializer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["measurements_schema", "truth_schema"],
+      "properties": {
+        "measurements_schema": {
+          "const": "measurements-blind-v1"
+        },
+        "truth_schema": {
+          "const": "evaluation-truth-v2"
+        }
+      }
+    },
+    "resolvedGeneratorConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "dimensions",
+        "target",
+        "motion",
+        "acquisition",
+        "rng",
+        "motion_renderer",
+        "serializer"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "corrected-generator-config-v1"
+        },
+        "dimensions": {
+          "$ref": "#/$defs/resolvedDimensions"
+        },
+        "target": {
+          "$ref": "#/$defs/resolvedTarget"
+        },
+        "motion": {
+          "$ref": "#/$defs/resolvedMotion"
+        },
+        "acquisition": {
+          "$ref": "#/$defs/resolvedAcquisition"
+        },
+        "rng": {
+          "$ref": "#/$defs/resolvedRng"
+        },
+        "motion_renderer": {
+          "$ref": "#/$defs/motionRenderer"
+        },
+        "serializer": {
+          "$ref": "#/$defs/serializer"
+        }
+      }
+    },
+    "calibrationDescriptor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "registry_entry_sha256"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "registry_entry_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "referenceMeasurements": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dtype", "shape", "sha256"],
+      "properties": {
+        "dtype": {
+          "const": "<f8"
+        },
+        "shape": {
+          "type": "array",
+          "prefixItems": [
+            {
+              "type": "integer",
+              "minimum": 1
+            }
+          ],
+          "items": false,
+          "minItems": 1,
+          "maxItems": 1
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "realizedSnr": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["train", "holdout"],
+      "properties": {
+        "train": {
+          "type": ["number", "null"]
+        },
+        "holdout": {
+          "type": ["number", "null"]
+        }
+      }
+    },
+    "noiseCalibrationRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "calibration",
+        "scientific_contract",
+        "target_id",
+        "motion_id",
+        "seed",
+        "reference_cell_sha256",
+        "reference_measurements",
+        "requested_snr_db",
+        "ddof",
+        "reference_variance",
+        "sigma_absolute",
+        "realized_snr_db",
+        "generator",
+        "generator_config_sha256",
+        "runtime"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "noise-calibration-record-v1"
+        },
+        "calibration": {
+          "$ref": "#/$defs/calibrationDescriptor"
+        },
+        "scientific_contract": {
+          "$ref": "#/$defs/scientificContract"
+        },
+        "target_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "motion_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "seed": {
+          "type": "integer"
+        },
+        "reference_cell_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "reference_measurements": {
+          "$ref": "#/$defs/referenceMeasurements"
+        },
+        "requested_snr_db": {
+          "type": "number"
+        },
+        "ddof": {
+          "const": 0
+        },
+        "reference_variance": {
+          "type": "number",
+          "minimum": 0
+        },
+        "sigma_absolute": {
+          "type": "number",
+          "minimum": 0
+        },
+        "realized_snr_db": {
+          "$ref": "#/$defs/realizedSnr"
+        },
+        "generator": {
+          "$ref": "#/$defs/generator"
+        },
+        "generator_config_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "runtime": {
+          "$ref": "#/$defs/runtime"
+        }
+      }
+    },
+    "datasetIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "scientific_contract",
+        "target",
+        "motion",
+        "seed",
+        "generator_config_sha256",
+        "noise_calibration",
+        "generator",
+        "runtime"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "dataset-identity-v1"
+        },
+        "scientific_contract": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["id", "sha256"],
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "sha256": {
+              "$ref": "#/$defs/sha256"
+            }
+          }
+        },
+        "target": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["id", "assets_sha256"],
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "assets_sha256": {
+              "$ref": "#/$defs/namedHashes"
+            }
+          }
+        },
+        "motion": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["id"],
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "seed": {
+          "type": "integer"
+        },
+        "generator_config_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "noise_calibration": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["id", "sha256"],
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "sha256": {
+              "$ref": "#/$defs/sha256"
+            }
+          }
+        },
+        "generator": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["id", "version", "git_commit"],
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "version": {
+              "type": "string",
+              "minLength": 1
+            },
+            "git_commit": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{40}$"
+            }
+          }
+        },
+        "runtime": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "dependencies_sha256",
+            "environment_lock_sha256"
+          ],
+          "properties": {
+            "dependencies_sha256": {
+              "$ref": "#/$defs/sha256"
+            },
+            "environment_lock_sha256": {
+              "$ref": "#/$defs/sha256"
+            }
+          }
+        }
+      }
+    },
+    "fileBase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "role",
+        "schema_version",
+        "sha256",
+        "size_bytes"
+      ],
+      "properties": {
+        "role": {
+          "type": "string",
+          "minLength": 1
+        },
+        "schema_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "measurementsFile": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/fileBase"
+        },
+        {
+          "properties": {
+            "role": {
+              "const": "blind-measurements"
+            },
+            "schema_version": {
+              "const": "measurements-blind-v1"
+            },
+            "size_bytes": {
+              "maximum": 1073741824
+            }
+          }
+        }
+      ]
+    },
+    "truthFile": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/fileBase"
+        },
+        {
+          "properties": {
+            "role": {
+              "const": "evaluation-truth"
+            },
+            "schema_version": {
+              "const": "evaluation-truth-v2"
+            },
+            "size_bytes": {
+              "maximum": 1073741824
+            }
+          }
+        }
+      ]
+    },
+    "previewFile": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/fileBase"
+        },
+        {
+          "properties": {
+            "role": {
+              "const": "preview"
+            },
+            "schema_version": {
+              "const": "dataset-preview-v1"
+            },
+            "size_bytes": {
+              "maximum": 67108864
+            }
+          }
+        }
+      ]
+    }
+  }
+}

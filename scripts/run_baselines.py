@@ -84,6 +84,7 @@ def main(argv=None):
     ap.add_argument("--baselines", nargs="+", default=ALL)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--measurements-path", default=None)
+    ap.add_argument("--dataset-identity-sha256", default=None)
     ap.add_argument("--truth-path", default=None)
     ap.add_argument("--output-dir", default=None)
     args = ap.parse_args(argv)
@@ -102,16 +103,27 @@ def main(argv=None):
     )
     if truth_path is not None and measurements_path is None:
         raise ValueError("--truth-path requires --measurements-path")
+    if (measurements_path is None) != (
+        args.dataset_identity_sha256 is None
+    ):
+        raise ValueError(
+            "--measurements-path and --dataset-identity-sha256 "
+            "must be provided together"
+        )
     blind_method_child = measurements_path is not None and truth_path is None
     execution_policy = method_execution_policy(truth_path=truth_path)
     acquisition = None
     if measurements_path is not None:
-        if not isinstance(cfg.get("dataset_spec"), dict):
+        if not isinstance(cfg.get("acquisition_spec"), dict):
             raise ValueError(
-                "method-child config requires complete dataset_spec"
+                "method-child config requires blind acquisition_spec"
             )
         acquisition = load_acquisition_data(
-            measurements_path, expected_spec=cfg["dataset_spec"]
+            measurements_path,
+            expected_dataset_identity_sha256=(
+                args.dataset_identity_sha256
+            ),
+            expected_acquisition_spec=cfg["acquisition_spec"],
         )
         data = acquisition
         if truth_path is not None:

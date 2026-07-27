@@ -138,6 +138,31 @@ def deep_freeze_json(value: object) -> object:
     return freeze(native)
 
 
+def validate_exact_json_native(value: object, field: str = "$") -> None:
+    """Reject coercible subclasses and non-finite values at public boundaries."""
+    if value is None or type(value) in (str, bool, int):
+        return
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ArtifactValidationError(f"{field} must be finite")
+        return
+    if type(value) in (list, tuple):
+        for index, child in enumerate(value):
+            validate_exact_json_native(child, f"{field}[{index}]")
+        return
+    if type(value) in (dict, MappingProxyType):
+        for key, child in value.items():
+            if type(key) is not str:
+                raise ArtifactValidationError(
+                    f"{field} keys must be exact strings"
+                )
+            validate_exact_json_native(child, f"{field}.{key}")
+        return
+    raise ArtifactValidationError(
+        f"{field} contains non-native JSON type {type(value).__name__}"
+    )
+
+
 def array_descriptor(
     array: np.ndarray | None,
 ) -> Mapping[str, object] | None:

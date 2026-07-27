@@ -22,13 +22,16 @@ from ._artifact_io import (
     METADATA_MEMBER,
     decode_metadata,
     load_array_member,
+    npz_bytes,
     read_npz_members,
+    read_npz_members_bytes,
     write_npz,
 )
 from ._artifact_models import EvaluationTruth
 
 
 TRUTH_SCHEMA = "evaluation-truth-v1"
+CORRECTED_TRUTH_SCHEMA = "evaluation-truth-v2"
 _TRUTH_ARRAY_NAMES = {
     "canonical_image",
     "gt_frames",
@@ -48,6 +51,9 @@ _TRUTH_METADATA_KEYS = {
     "motion_model",
     "schema",
 }
+_TRUTH_MEMBER_ALLOWLIST = {METADATA_MEMBER} | {
+    f"{name}.npy" for name in _TRUTH_ARRAY_NAMES
+}
 
 
 def _truth_arrays(data: EvaluationTruth) -> Mapping[str, np.ndarray]:
@@ -56,6 +62,15 @@ def _truth_arrays(data: EvaluationTruth) -> Mapping[str, np.ndarray]:
 
 def _validate_truth(data: EvaluationTruth) -> None:
     validate_sha256(data.dataset_identity_sha256, "dataset identity")
+    if (
+        isinstance(data.dataset_identity_spec, Mapping)
+        and data.dataset_identity_spec.get("schema_version")
+        == "dataset-identity-v1"
+    ):
+        from ._corrected_generation import validate_corrected_truth
+
+        validate_corrected_truth(data)
+        return
     expected_identity = sha256_bytes(
         canonical_json_bytes(data.dataset_identity_spec)
     )
@@ -137,10 +152,28 @@ def _validate_truth(data: EvaluationTruth) -> None:
 
 
 def save_evaluation_truth(data: EvaluationTruth, path: Path) -> str:
+    arrays, metadata = _truth_metadata(data)
+    return write_npz(Path(path), arrays=arrays, metadata=metadata)
+
+
+def evaluation_truth_npz_bytes(data: EvaluationTruth) -> bytes:
+    arrays, metadata = _truth_metadata(data)
+    return npz_bytes(arrays=arrays, metadata=metadata)
+
+
+def _truth_metadata(
+    data: EvaluationTruth,
+) -> tuple[Mapping[str, np.ndarray], Mapping[str, object]]:
     _validate_truth(data)
     arrays = _truth_arrays(data)
+    schema = (
+        CORRECTED_TRUTH_SCHEMA
+        if data.dataset_identity_spec.get("schema_version")
+        == "dataset-identity-v1"
+        else TRUTH_SCHEMA
+    )
     metadata = {
-        "schema": TRUTH_SCHEMA,
+        "schema": schema,
         "dataset_identity_sha256": data.dataset_identity_sha256,
         "dataset_identity_spec": data.dataset_identity_spec,
         "dimensions": {"H": data.H, "W": data.W, "T": data.T},
@@ -152,7 +185,7 @@ def save_evaluation_truth(data: EvaluationTruth, path: Path) -> str:
             name: array_descriptor(array) for name, array in arrays.items()
         },
     }
-    return write_npz(Path(path), arrays=arrays, metadata=metadata)
+    return arrays, metadata
 
 
 def load_evaluation_truth(
@@ -160,13 +193,51 @@ def load_evaluation_truth(
     *,
     expected_dataset_identity_sha256: str,
 ) -> EvaluationTruth:
+    return _load_evaluation_truth_members(
+        read_npz_members(
+            Path(path), allowed_members=_TRUTH_MEMBER_ALLOWLIST
+        ),
+        expected_dataset_identity_sha256=(
+            expected_dataset_identity_sha256
+        ),
+    )
+
+
+def load_evaluation_truth_bytes(
+    payload: bytes,
+    *,
+    expected_dataset_identity_sha256: str,
+) -> EvaluationTruth:
+    return _load_evaluation_truth_members(
+        read_npz_members_bytes(
+            payload, allowed_members=_TRUTH_MEMBER_ALLOWLIST
+        ),
+        expected_dataset_identity_sha256=(
+            expected_dataset_identity_sha256
+        ),
+    )
+
+
+def _load_evaluation_truth_members(
+    members: Mapping[str, bytes],
+    *,
+    expected_dataset_identity_sha256: str,
+) -> EvaluationTruth:
     validate_sha256(
         expected_dataset_identity_sha256, "expected dataset identity"
     )
-    members = read_npz_members(Path(path))
     metadata = decode_metadata(members)
     validate_exact_keys(metadata, _TRUTH_METADATA_KEYS, "truth metadata")
-    if metadata["schema"] != TRUTH_SCHEMA:
+    expected_schema = (
+        CORRECTED_TRUTH_SCHEMA
+        if (
+            isinstance(metadata["dataset_identity_spec"], Mapping)
+            and metadata["dataset_identity_spec"].get("schema_version")
+            == "dataset-identity-v1"
+        )
+        else TRUTH_SCHEMA
+    )
+    if metadata["schema"] != expected_schema:
         raise ArtifactValidationError("truth schema mismatch")
     if metadata["dataset_identity_sha256"] != expected_dataset_identity_sha256:
         raise ArtifactValidationError("truth dataset identity mismatch")
