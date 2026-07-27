@@ -288,6 +288,53 @@ def test_output_verification_rejects_entries_added_during_hashing(tmp_path: Path
         load_complete_manifest(path)
 
 
+def test_manifest_snapshot_is_bound_across_environment_verification(
+    tmp_path: Path, monkeypatch
+):
+    path, _ = _write_physical_complete(tmp_path)
+    original_verify = manifest_module.verify_environment_requirements
+
+    def mutate_manifest_during_environment_check(*args, **kwargs):
+        hashes = original_verify(*args, **kwargs)
+        raw = path.read_bytes()
+        mutated = raw.replace(b'"python":"3.12"', b'"python":"9.99"')
+        assert len(mutated) == len(raw)
+        assert mutated != raw
+        path.write_bytes(mutated)
+        return hashes
+
+    monkeypatch.setattr(
+        manifest_module,
+        "verify_environment_requirements",
+        mutate_manifest_during_environment_check,
+    )
+
+    with pytest.raises(ValueError, match="manifest|directory changed"):
+        load_complete_manifest(path)
+
+
+def test_output_hashing_streams_without_buffering_through_manifest_reader(
+    tmp_path: Path, monkeypatch
+):
+    path = tmp_path / "large-output.bin"
+    payload = b"a" * (2 * 1024 * 1024 + 17)
+    path.write_bytes(payload)
+
+    def forbid_buffered_reader(*args, **kwargs):
+        raise AssertionError("output hashing must not buffer via _read_regular_file")
+
+    monkeypatch.setattr(
+        manifest_module,
+        "_read_regular_file",
+        forbid_buffered_reader,
+    )
+
+    digest, size = manifest_module._hash_regular_file(path)
+
+    assert digest == hashlib.sha256(payload).hexdigest()
+    assert size == len(payload)
+
+
 def test_load_complete_manifest_rejects_duplicate_json_keys(tmp_path: Path):
     path = tmp_path / "manifest.json"
     path.write_text('{"status":"running","status":"failed"}', encoding="utf-8")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 import hashlib
 import json
 import math
@@ -42,6 +43,16 @@ _RESERVED_WINDOWS_NAMES = frozenset(
     | {f"com{suffix}" for suffix in "¹²³"}
     | {f"lpt{suffix}" for suffix in "¹²³"}
 )
+
+_StatSnapshot = tuple[int, int, int, int, int]
+
+
+@dataclass(frozen=True)
+class _SafeRead:
+    raw: bytes
+    link_snapshot: _StatSnapshot
+    path_snapshot: _StatSnapshot
+    handle_snapshot: _StatSnapshot
 
 
 def build_manifest(
@@ -289,7 +300,8 @@ def _load_complete_manifest_raw(
 ) -> tuple[bytes, dict[str, object]] | None:
     """Load a physical clean complete run directory, otherwise fail closed."""
     manifest_path = Path(path)
-    raw, value = _load_unique_json(manifest_path)
+    manifest_read, value = _load_unique_json(manifest_path)
+    raw = manifest_read.raw
     if type(value) is not dict:
         raise ValueError("manifest JSON must be an object")
     validate_manifest(value)
@@ -307,6 +319,12 @@ def _load_complete_manifest_raw(
         raise ValueError("complete manifest directory must be the full identity SHA-256")
     if raw != canonical_json_bytes(value):
         raise ValueError("manifest file is not canonical JSON bytes")
+    initial_inventory = _directory_inventory(manifest_path.parent)
+    if (
+        manifest_path.name,
+        manifest_read.link_snapshot,
+    ) not in initial_inventory:
+        raise ValueError("manifest changed before run-directory verification")
     if requirements_lock is None:
         requirements_lock = _DEFAULT_REQUIREMENTS_LOCK
     if environment_lock is None:
@@ -324,7 +342,14 @@ def _load_complete_manifest_raw(
             or runtime["environment_lock_sha256"] != hashes["environment_lock_sha256"]
         ):
             raise ValueError("manifest runtime lock hashes do not match the strict environment")
-    _verify_complete_outputs(manifest_path, value)
+    _verify_complete_outputs(
+        manifest_path,
+        value,
+        initial_inventory=initial_inventory,
+    )
+    _verify_safe_read_path_unchanged(manifest_path, manifest_read, "manifest")
+    # Task 5's atomic promotion is the writer-side boundary after this final
+    # pathname check; this loader cannot lock out a mutation after it returns.
     return raw, value
 
 
@@ -496,14 +521,14 @@ def _validate_relative_path(value: object) -> None:
             raise ValueError("output path contains a Windows-unsafe component")
 
 
-def _load_unique_json(path: Path) -> tuple[bytes, object]:
-    raw = _read_regular_file(path, "manifest")
+def _load_unique_json(path: Path) -> tuple[_SafeRead, object]:
+    safe_read = _read_regular_file_snapshot(path, "manifest")
     try:
-        text = raw.decode("utf-8", errors="strict")
+        text = safe_read.raw.decode("utf-8", errors="strict")
     except UnicodeDecodeError as error:
         raise ValueError("manifest is not strict UTF-8") from error
     try:
-        return raw, json.loads(text, object_pairs_hook=_unique_object)
+        return safe_read, json.loads(text, object_pairs_hook=_unique_object)
     except json.JSONDecodeError as error:
         raise ValueError("manifest is not valid JSON") from error
 
@@ -517,7 +542,7 @@ def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return result
 
 
-def _snapshot(info: os.stat_result) -> tuple[int, int, int, int, int]:
+def _snapshot(info: os.stat_result) -> _StatSnapshot:
     return (
         info.st_dev,
         info.st_ino,
@@ -528,6 +553,13 @@ def _snapshot(info: os.stat_result) -> tuple[int, int, int, int, int]:
 
 
 def _read_regular_file(path: Path, noun: str) -> bytes:
+    return _read_regular_file_snapshot(path, noun).raw
+
+
+def _open_regular_file(
+    path: Path,
+    noun: str,
+) -> tuple[int, os.stat_result, os.stat_result, os.stat_result]:
     _reject_linked_path(path)
     try:
         before_link = os.lstat(path)
@@ -549,21 +581,73 @@ def _read_regular_file(path: Path, noun: str) -> bytes:
             or _snapshot(before)[:2] != _snapshot(opened)[:2]
         ):
             raise ValueError(f"{noun} changed or is not a regular file: {path}")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor, before_link, before, opened
+
+
+def _verify_opened_file_unchanged(
+    descriptor: int,
+    opened: os.stat_result,
+    path: Path,
+    noun: str,
+) -> os.stat_result:
+    after = os.fstat(descriptor)
+    if _snapshot(opened) != _snapshot(after):
+        raise ValueError(f"{noun} changed while being verified: {path}")
+    return after
+
+
+def _read_regular_file_snapshot(path: Path, noun: str) -> _SafeRead:
+    descriptor, before_link, before, opened = _open_regular_file(path, noun)
+    try:
         chunks: list[bytes] = []
         while True:
             block = os.read(descriptor, 1024 * 1024)
             if not block:
                 break
             chunks.append(block)
-        after = os.fstat(descriptor)
+        after = _verify_opened_file_unchanged(
+            descriptor,
+            opened,
+            path,
+            noun,
+        )
     finally:
         os.close(descriptor)
-    if _snapshot(opened) != _snapshot(after):
-        raise ValueError(f"{noun} changed while being verified: {path}")
-    return b"".join(chunks)
+    return _SafeRead(
+        raw=b"".join(chunks),
+        link_snapshot=_snapshot(before_link),
+        path_snapshot=_snapshot(before),
+        handle_snapshot=_snapshot(after),
+    )
 
 
-def _verify_complete_outputs(manifest_path: Path, manifest: Mapping[str, object]) -> None:
+def _verify_safe_read_path_unchanged(
+    path: Path,
+    safe_read: _SafeRead,
+    noun: str,
+) -> None:
+    _reject_linked_path(path)
+    try:
+        final_link = os.lstat(path)
+        final_path = os.stat(path)
+    except OSError as error:
+        raise ValueError(f"cannot restat {noun}: {path}") from error
+    if (
+        _snapshot(final_link) != safe_read.link_snapshot
+        or _snapshot(final_path) != safe_read.path_snapshot
+    ):
+        raise ValueError(f"{noun} path changed during verification: {path}")
+
+
+def _verify_complete_outputs(
+    manifest_path: Path,
+    manifest: Mapping[str, object],
+    *,
+    initial_inventory: frozenset[tuple[str, _StatSnapshot]],
+) -> None:
     root = manifest_path.parent
     for ancestor in (root, *root.parents):
         _reject_linked_path(ancestor)
@@ -575,7 +659,6 @@ def _verify_complete_outputs(manifest_path: Path, manifest: Mapping[str, object]
     }
     for artifact in artifacts:
         expected[artifact["path"]] = (artifact["sha256"], artifact["size_bytes"])
-    initial_inventory = _directory_inventory(root)
     found: set[str] = set()
     for current, directories, files in os.walk(root, followlinks=False):
         current_path = Path(current)
@@ -604,8 +687,8 @@ def _verify_complete_outputs(manifest_path: Path, manifest: Mapping[str, object]
         raise ValueError("run directory changed while outputs were being verified")
 
 
-def _directory_inventory(root: Path) -> frozenset[tuple[str, tuple[int, int, int, int, int]]]:
-    entries: set[tuple[str, tuple[int, int, int, int, int]]] = set()
+def _directory_inventory(root: Path) -> frozenset[tuple[str, _StatSnapshot]]:
+    entries: set[tuple[str, _StatSnapshot]] = set()
     for current, directories, files in os.walk(root, followlinks=False):
         current_path = Path(current)
         _reject_linked_path(current_path)
@@ -628,5 +711,25 @@ def _reject_linked_path(path: Path) -> None:
 
 
 def _hash_regular_file(path: Path) -> tuple[str, int]:
-    raw = _read_regular_file(path, "output")
-    return hashlib.sha256(raw).hexdigest(), len(raw)
+    descriptor, _before_link, _before, opened = _open_regular_file(
+        path,
+        "output",
+    )
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        while True:
+            block = os.read(descriptor, 1024 * 1024)
+            if not block:
+                break
+            digest.update(block)
+            size += len(block)
+        _verify_opened_file_unchanged(
+            descriptor,
+            opened,
+            path,
+            "output",
+        )
+    finally:
+        os.close(descriptor)
+    return digest.hexdigest(), size
