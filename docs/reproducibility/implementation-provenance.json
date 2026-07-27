@@ -70,5 +70,38 @@
     "recorded_git_facts_valid": true,
     "sha256_entries_valid": 4,
     "immutable_inputs_match_plan_baseline": true
+  },
+  "no_install_baseline": {
+    "executed_at": "2026-07-27T12:06:58.1736552+08:00",
+    "interpreter": "D:\\conda\\envs\\spi\\python.exe",
+    "interpreter_version": "Python 3.12.13",
+    "commands": [
+      {
+        "command": "D:\\conda\\envs\\spi\\python.exe -m compileall -q gsdiff scripts train.py",
+        "observed_exit_code": 0
+      },
+      {
+        "command": "D:\\conda\\envs\\spi\\python.exe -c \"import gsdiff; print('import_gsdiff=ok')\"",
+        "observed_stdout": "import_gsdiff=ok",
+        "observed_exit_code": 0
+      }
+    ],
+    "discoverable_test_suite": {
+      "found": false,
+      "method": "Tracked-file scan for test files and pytest/tox/nox/project test configuration.",
+      "result": "No discoverable test files or test-runner configuration found."
+    },
+    "overall_observed_status": "passed"
+  },
+  "baseline_record_validation": {
+    "executed_at": "2026-07-27T12:07:12.3759177+08:00",
+    "command": "D:\\conda\\envs\\spi\\python.exe - (standard-library baseline-record schema validator)",
+    "success_output": [
+      "baseline_record_schema=valid",
+      "baseline_command_definitions=valid",
+      "baseline_result_status=passed",
+      "validation_scope=recorded_evidence_only"
+    ],
+    "scope": "Validates the recorded baseline schema, required command definitions, captured status fields, and stated overall status. It does not re-execute the baseline commands or cryptographically prove historical subprocess exit codes."
   }
 }
