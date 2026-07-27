@@ -14,6 +14,8 @@ _HEX_DIGITS = frozenset("0123456789abcdef")
 _TARGET_DESCRIPTOR_PATTERN = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z", re.ASCII
 )
+_BUILTIN_CHAR_TARGET_PATTERN = re.compile(r"char:[A-Za-z0-9]\Z", re.ASCII)
+_TARGET_KINDS = frozenset({"builtin", "asset"})
 _TARGET_DESCRIPTOR_RESERVED_TOKENS = (
     "truth",
     "evaluation",
@@ -217,6 +219,11 @@ def validate_index_array(
         raise ArtifactValidationError(f"{field} must use an integer dtype")
     if array.shape != shape:
         raise ArtifactValidationError(f"{field} must have shape {shape}")
+    dtype_range = np.iinfo(array.dtype)
+    if dtype_range.min > 0 or dtype_range.max < upper_bound - 1:
+        raise ArtifactValidationError(
+            f"{field} dtype must represent [0, {upper_bound})"
+        )
     if np.any(array < 0) or np.any(array >= upper_bound):
         raise ArtifactValidationError(
             f"{field} values must be in [0, {upper_bound})"
@@ -242,8 +249,13 @@ def _validate_nonempty_string(value: object, field: str) -> str:
     return value
 
 
-def _validate_target_descriptor(value: object) -> str:
+def _validate_target_descriptor(kind: str, value: object) -> str:
     descriptor = _validate_nonempty_string(value, "target.descriptor")
+    if (
+        kind == "builtin"
+        and _BUILTIN_CHAR_TARGET_PATTERN.fullmatch(descriptor) is not None
+    ):
+        return descriptor
     descriptor_lower = descriptor.lower()
     if (
         _TARGET_DESCRIPTOR_PATTERN.fullmatch(descriptor) is None
@@ -320,9 +332,14 @@ def validate_generation_config(
         config["target"], "resolved_generation_config.target"
     )
     validate_exact_keys(target, {"kind", "descriptor"}, "target")
+    target_kind = _validate_nonempty_string(target["kind"], "target.kind")
+    if target_kind not in _TARGET_KINDS:
+        raise ArtifactValidationError("target.kind is unsupported")
     target_native = {
-        "kind": _validate_nonempty_string(target["kind"], "target.kind"),
-        "descriptor": _validate_target_descriptor(target["descriptor"]),
+        "kind": target_kind,
+        "descriptor": _validate_target_descriptor(
+            target_kind, target["descriptor"]
+        ),
     }
 
     pattern = _validate_mapping(

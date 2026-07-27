@@ -101,11 +101,12 @@ def validate_evaluation_inputs(
         raise ArtifactValidationError(
             "reconstruction time_grid must exactly match acquisition time_grid"
         )
-    expected_frame_indices = np.arange(
-        acquisition.T, dtype=reconstruction.frame_indices.dtype
+    canonical_frame_indices = reconstruction.frame_indices.astype(
+        np.int64, copy=False
     )
+    expected_frame_indices = np.arange(acquisition.T, dtype=np.int64)
     if not np.array_equal(
-        reconstruction.frame_indices, expected_frame_indices
+        canonical_frame_indices, expected_frame_indices
     ):
         raise ArtifactValidationError(
             "reconstruction frame_indices must equal arange(T)"

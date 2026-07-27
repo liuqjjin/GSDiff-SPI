@@ -97,9 +97,9 @@ def _tiny_source(*, seed=7, shape="L", holdout_count=6, T=3):
     return data, generation_config, target_asset_sha256
 
 
-def _tiny_pair(*, seed=7, shape="L", holdout_count=6):
+def _tiny_pair(*, seed=7, shape="L", holdout_count=6, T=3):
     data, generation_config, target_asset_sha256 = _tiny_source(
-        seed=seed, shape=shape, holdout_count=holdout_count
+        seed=seed, shape=shape, holdout_count=holdout_count, T=T
     )
     return split_spi_data(
         data,
@@ -235,6 +235,23 @@ def _raw_output(acquisition):
         method_metadata={"solver": "direct-dgi"},
         execution_policy=method_execution_policy(truth_path=None),
     )
+
+
+def _output_with_index_dtype(acquisition, *, T, dtype):
+    return dataclasses.replace(
+        _raw_output(acquisition),
+        reconstruction=np.zeros(
+            (T, acquisition.H, acquisition.W), dtype=np.float32
+        ),
+        estimated_motion_trajectory=np.zeros((T, 3), dtype=np.float32),
+        frame_indices=np.arange(T, dtype=dtype),
+        time_grid=np.linspace(0.0, 1.0, T, dtype=np.float32),
+    )
+
+
+@pytest.fixture(scope="module")
+def t300_pair():
+    return _tiny_pair(T=300)
 
 
 def _write_entry_config(path, acquisition, output_dir):
@@ -665,6 +682,75 @@ def test_target_descriptor_accepts_opaque_logical_ids(descriptor):
     )
 
 
+@pytest.mark.parametrize("descriptor", ["char:A", "char:5"])
+def test_builtin_char_target_round_trips_complete_artifact_pair(
+    tmp_path, descriptor
+):
+    data, config, target_hash = _tiny_source(shape=descriptor)
+    acquisition, truth = split_spi_data(
+        data,
+        resolved_generation_config=config,
+        generator_code_version="gsdiff-simulation-test-v1",
+        target_asset_sha256=target_hash,
+    )
+    acquisition_path = tmp_path / "measurements.npz"
+    truth_path = tmp_path / "evaluation-truth.npz"
+    save_acquisition_data(acquisition, acquisition_path)
+    save_evaluation_truth(truth, truth_path)
+
+    loaded_acquisition = load_acquisition_data(
+        acquisition_path, expected_spec=config
+    )
+    loaded_truth = load_evaluation_truth(
+        truth_path,
+        expected_dataset_identity_sha256=(
+            loaded_acquisition.dataset_identity_sha256
+        ),
+    )
+
+    assert loaded_acquisition.resolved_generation_config["target"] == {
+        "kind": "builtin",
+        "descriptor": descriptor,
+    }
+    assert loaded_truth.dataset_identity_sha256 == (
+        loaded_acquisition.dataset_identity_sha256
+    )
+
+
+@pytest.mark.parametrize(
+    ("kind", "descriptor"),
+    [
+        ("builtin", "char:../truth"),
+        ("builtin", r"char:C:\private\target.png"),
+        ("builtin", "char:https://example.invalid/target.png"),
+        ("builtin", "char:evaluation"),
+        ("asset", "char:A"),
+        ("external", "L"),
+    ],
+    ids=[
+        "char-traversal",
+        "char-windows-path",
+        "char-uri",
+        "char-capability",
+        "char-only-for-builtin",
+        "unsupported-kind",
+    ],
+)
+def test_target_schema_rejects_malicious_char_ids_and_unknown_kinds(
+    kind, descriptor
+):
+    data, config, target_hash = _tiny_source()
+    config["target"] = {"kind": kind, "descriptor": descriptor}
+
+    with pytest.raises(ArtifactValidationError, match="target"):
+        split_spi_data(
+            data,
+            resolved_generation_config=config,
+            generator_code_version="gsdiff-simulation-test-v1",
+            target_asset_sha256=target_hash,
+        )
+
+
 @pytest.mark.parametrize(
     ("metadata_field", "identity_field", "changed"),
     [
@@ -954,6 +1040,20 @@ def test_acquisition_rejects_invalid_index_arrays(
 
 
 @pytest.mark.parametrize(
+    "field", ["frame_indices", "holdout_frame_indices"]
+)
+def test_acquisition_index_dtype_must_represent_full_frame_domain(
+    tmp_path, t300_pair, field
+):
+    acquisition, _ = t300_pair
+    wrapped = getattr(acquisition, field).astype(np.uint8)
+    tampered = dataclasses.replace(acquisition, **{field: wrapped})
+
+    with pytest.raises(ArtifactValidationError, match="dtype.*represent"):
+        save_acquisition_data(tampered, tmp_path / "measurements.npz")
+
+
+@pytest.mark.parametrize(
     "time_grid",
     [
         np.array([0.0, 0.75, 0.5], dtype=np.float32),
@@ -1095,6 +1195,48 @@ def test_reconstruction_rejects_invalid_frame_indices(tmp_path, mutation):
         )
 
 
+@pytest.mark.parametrize(
+    ("T", "dtype", "accepted"),
+    [
+        (256, np.uint8, True),
+        (257, np.uint8, False),
+        (300, np.uint8, False),
+        (128, np.int8, True),
+        (129, np.int8, False),
+        (300, np.int16, True),
+    ],
+    ids=[
+        "uint8-t256-boundary",
+        "uint8-t257-overflow",
+        "reviewer-t300-uint8-wrap",
+        "int8-t128-boundary",
+        "int8-t129-overflow",
+        "int16-t300-wide-enough",
+    ],
+)
+def test_reconstruction_index_dtype_capacity_boundaries(
+    tmp_path, T, dtype, accepted
+):
+    acquisition, _ = _tiny_pair()
+    output = _output_with_index_dtype(acquisition, T=T, dtype=dtype)
+
+    if accepted:
+        write_method_child_outputs(
+            tmp_path / f"outputs-{T}-{np.dtype(dtype).name}",
+            output,
+            history=[],
+        )
+    else:
+        with pytest.raises(
+            ArtifactValidationError, match="dtype.*represent"
+        ):
+            write_method_child_outputs(
+                tmp_path / f"outputs-{T}-{np.dtype(dtype).name}",
+                output,
+                history=[],
+            )
+
+
 def test_reconstruction_time_grid_must_be_strictly_increasing(tmp_path):
     acquisition, _ = _tiny_pair()
     output = dataclasses.replace(
@@ -1128,6 +1270,18 @@ def test_evaluator_requires_canonical_output_frame_indices():
     )
 
     with pytest.raises(ArtifactValidationError, match="frame_indices"):
+        validate_evaluation_inputs(output, acquisition, truth)
+
+
+def test_evaluator_rejects_wrapped_uint8_arange_for_t300(t300_pair):
+    acquisition, truth = t300_pair
+    validate_evaluation_inputs(_raw_output(acquisition), acquisition, truth)
+    output = dataclasses.replace(
+        _raw_output(acquisition),
+        frame_indices=np.arange(300, dtype=np.uint8),
+    )
+
+    with pytest.raises(ArtifactValidationError, match="dtype.*represent"):
         validate_evaluation_inputs(output, acquisition, truth)
 
 

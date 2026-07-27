@@ -1522,3 +1522,73 @@ This permanent append-only ledger is intentionally empty of implementation recor
   `blind_method_child` production references.
 - `git diff --check` → exit `0`, silent. Test/verifier output was pristine,
   with no warnings or unexpected skips.
+
+## Task 9 Fix Round 3 — Close artifact index edge cases (2026-07-27)
+
+- Started from reviewed Task 9 Fix Round 2 commit
+  `f049cdbdd23d0f04880492988ae5541bdbec89ba` with a clean tracked
+  worktree. Scope remains Task 9; no Task 10 run-identity or run-root behavior
+  was added.
+- The shared acquisition, holdout, and reconstruction index validator now
+  proves that an integer dtype can represent the complete frame domain
+  `[0,T)` before inspecting its values. This rejects arrays that already
+  wrapped during construction, including `np.arange(300, dtype=np.uint8)`,
+  even though every wrapped value is superficially in range.
+- The evaluator first admits reconstruction indices through that shared
+  validator, then promotes the validated indices to `int64` and compares them
+  with `np.arange(T, dtype=int64)`. It never constructs the expected sequence
+  in an untrusted output dtype.
+- Target validation is conditional on the exact supported kinds `builtin` and
+  `asset`. Both retain the colon-free opaque logical-ID contract from Fix
+  Round 2. In addition, `builtin` accepts exactly
+  `char:[A-Za-z0-9]`, matching the generator's documented single-glyph
+  targets. `asset` does not inherit this exception, and unknown kinds,
+  multi-character glyphs, traversal, drive, UNC, URI, path, and capability
+  forms remain rejected.
+
+### RED/GREEN evidence
+
+- The targeted baseline run selected 17 cases and produced
+  `9 failed, 8 passed, 145 deselected`. The failures reproduced both real
+  `char:A`/`char:5` split failures, acceptance of an unknown target kind,
+  acceptance of wrapped `uint8` reconstruction indices at `T=257` and
+  `T=300`, failure to enforce dtype capacity on acquisition and holdout
+  indices, narrow-signed rejection for only the observed negative value, and
+  evaluator acceptance of the reviewer's exact wrapped `T=300` output.
+- Malicious `char:` path/URI/capability forms and `asset` plus `char:A` were
+  already rejected because the prior schema categorically rejected every
+  colon; those eight passing baseline cases are recorded as coverage-only,
+  not fabricated RED evidence.
+- After the minimal shared-validator, evaluator, and target-schema changes,
+  the targeted run was `17 passed, 145 deselected`.
+- Final focused artifacts were `162 passed in 7.62s`. Coverage includes the
+  `uint8` boundary at `T=256/257`, `int8` at `T=128/129`, a valid `int16`
+  sequence at `T=300`, both acquisition index fields, evaluator admission of
+  valid wide indices, and complete split/save/load round trips for real
+  generated `char:A` and `char:5` targets.
+
+### Verification
+
+- Accumulated CPU → exit `0`,
+  `376 passed, 1 deselected in 20.06s`.
+- Real CUDA → exit `0`,
+  `1 passed, 376 deselected in 1.20s`; exactly one executed and zero skipped.
+- Full suite → exit `0`, `377 passed in 20.73s`.
+- Strict environment verification → exit `0`, fingerprint
+  `b5d6922a9f3a9638ee8826b9a74f00998cd3ac81aa25c03de016358e0e435a56`.
+- Strict implementation-provenance verification → exit `0`; four immutable
+  inputs verified at base
+  `f049cdbdd23d0f04880492988ae5541bdbec89ba`.
+- `D:\conda\envs\spi\python.exe -m pip check` → exit `0`,
+  `No broken requirements found.`
+- `compileall` completed silently with exit `0`.
+- The five-save deterministic audit retained one acquisition hash
+  `1248786ce0f22d193feb97bace37d63f9ba9a3f349042b8dfb5e0b132dea4da9`
+  and one truth hash
+  `81ff0c059b42d452a07668475111e405a94b2a52ba354641309ce71729fd3933`;
+  every returned hash equalled the direct file-byte hash.
+- Static audits again reported zero forbidden acquisition fields, zero old
+  blind literal references, zero Task 10 builder references, and 13 exact
+  `blind_method_child` production references.
+- `git diff --check` → exit `0`, silent. All test and verifier output was
+  pristine, with no warnings, compatibility failures, or unexpected skips.
