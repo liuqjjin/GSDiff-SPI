@@ -23,8 +23,8 @@ class SPIForwardModel(nn.Module):
         """
         H, W, dev = self.H, self.W, centers_t.device
         gy, gx = torch.meshgrid(
-            torch.arange(H, device=dev, dtype=torch.float32),
-            torch.arange(W, device=dev, dtype=torch.float32), indexing='ij')
+            torch.arange(H, device=dev, dtype=centers_t.dtype),
+            torch.arange(W, device=dev, dtype=centers_t.dtype), indexing='ij')
         coords = torch.stack([gy.reshape(-1), gx.reshape(-1)], -1)  # [N,2]
         diff = coords.unsqueeze(0) - centers_t.unsqueeze(1)  # [M,N,2]
         quad = (torch.einsum('mni,mij->mnj', diff, Sinv_t) * diff).sum(-1)  # [M,N]
@@ -39,7 +39,9 @@ class SPIForwardModel(nn.Module):
 
         centers_t = self.motion.transform_centers(centers, t_grid)      # [T,M,2]
         Sigma_t = self.motion.transform_covariances(Sigma, t_grid)      # [T,M,2,2]
-        eye = 1e-6 * torch.eye(2, device=Sigma_t.device)
+        eye = 1e-6 * torch.eye(
+            2, device=Sigma_t.device, dtype=Sigma_t.dtype
+        )
         Sinv_t = torch.linalg.inv(Sigma_t + eye)                       # [T,M,2,2]
 
         frames = []
@@ -52,8 +54,8 @@ class SPIForwardModel(nn.Module):
         """y_k = <P_k, frame[f(k)]>.
         video: [T,1,H,W], patterns: [K,H,W], frame_idx: [K] → y: [K]
         """
-        K, dev = patterns.shape[0], video.device
-        y = torch.empty(K, device=dev)
+        K = patterns.shape[0]
+        y = video.new_empty(K)
         T = video.shape[0]
         for f in range(T):
             mask = (frame_idx == f)
@@ -77,10 +79,10 @@ class SPIForwardModel(nn.Module):
         K = patterns.shape[0]
         dev = video.device
 
-        k_idx = torch.arange(K, device=dev, dtype=torch.float32)
+        k_idx = torch.arange(K, device=dev, dtype=video.dtype)
         u = k_idx / max(K - 1, 1) * (T - 1)       # [K], continuous frame position in [0, T-1]
         m_raw = torch.floor(u).long()               # [K]
-        alpha_raw = u - m_raw.float()               # [K], in [0, 1)
+        alpha_raw = u - m_raw.to(dtype=u.dtype)      # [K], in [0, 1)
 
         # Boundary: when m_raw == T-1 (only k=K-1), set m=T-2, alpha=1.0
         boundary = (m_raw >= T - 1)
@@ -94,7 +96,7 @@ class SPIForwardModel(nn.Module):
         # Linear interpolation then inner product (numerically equivalent to interp then dot)
         HW = patterns.shape[1] * patterns.shape[2]
         P  = patterns.reshape(K, HW)                # [K, HW]
-        a  = alpha.unsqueeze(1)                     # [K, 1]
+        a  = alpha                                  # [K]
         y  = (1.0 - a) * (P * frame0.reshape(K, HW)).sum(-1) \
            +        a  * (P * frame1.reshape(K, HW)).sum(-1)  # [K]
         return y

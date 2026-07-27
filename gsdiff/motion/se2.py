@@ -51,7 +51,9 @@ class SE2Motion(nn.Module):
         """Linear part A(t) = R(angle(t)) · (I + t·L_sym). t: [T] → [T,2,2]."""
         angle = self._angle(t)
         if angle is None:
-            R = torch.eye(2, device=t.device).unsqueeze(0).expand(t.shape[0], 2, 2)
+            R = torch.eye(
+                2, device=t.device, dtype=t.dtype
+            ).unsqueeze(0).expand(t.shape[0], 2, 2)
         else:
             c, s = torch.cos(angle), torch.sin(angle)
             R = torch.stack([c, -s, s, c], -1).reshape(-1, 2, 2)
@@ -59,7 +61,8 @@ class SE2Motion(nn.Module):
             return R
         lyy, lxx, lyx = self.lin[0], self.lin[1], self.lin[2]
         L = torch.stack([lyy, lyx, lyx, lxx]).reshape(2, 2)
-        S = torch.eye(2, device=t.device) + t.reshape(-1, 1, 1) * L  # [T,2,2]
+        S = torch.eye(2, device=t.device, dtype=t.dtype) \
+            + t.reshape(-1, 1, 1) * L  # [T,2,2]
         return torch.einsum('tij,tjk->tik', R, S)
 
     def _displacement(self, t):

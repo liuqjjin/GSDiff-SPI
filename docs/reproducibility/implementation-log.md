@@ -794,3 +794,97 @@ This permanent append-only ledger is intentionally empty of implementation recor
   deterministic `round` path. `git diff --check` → exit `0` with silent
   output. All test and verifier output was pristine, with no warnings or
   unexpected skips.
+
+## Task 7 — Lock forward, gradient, and data reproducibility contracts (2026-07-27)
+
+- Prior approved commit and clean starting HEAD:
+  `f9216bfbda54615c909a300239e237c45d2780ac` on
+  `debug/admm-vs-sgd`.
+- API/reference inspection confirmed identical NumPy/PyTorch interpolation:
+  `u=k/max(K-1,1)*(T-1)`, `m=floor(u)`, `alpha=u-m`, with the last boundary
+  represented by `m=T-2, alpha=1`. No time-semantics choice was required.
+- Initial focused RED, after all three test files existed and before production
+  edits: `4 failed, 6 passed in 0.43s`. All data tests and the independent
+  center/translation/angular gradient tests already passed and were locked
+  without simulation, pattern, scene, or motion edits.
+- Direct-measurement root/backward trace:
+  `forward -> measure -> y[mask] = P @ fr`. Float64 operands produced a
+  float64 matmul result, but `torch.empty(K)` created a float32 destination.
+  The minimal fix is `video.new_empty(K)`. The direct and end-to-end rerun
+  passed: `2 passed in 0.10s`.
+- Interpolation-shape root/backward trace: two per-pattern dot vectors had
+  shape `[K]`, while `alpha.unsqueeze(1)` had shape `[K,1]`; broadcasting
+  produced `[K,K]` (`[1,1]` for `K=1`) instead of `[K]`. Retaining `alpha`
+  as `[K]` restores the declared elementwise equation.
+- After that correction, interpolation dtype RED was
+  `1 failed, 1 passed in 0.07s`: four of seven fractional-time measurements
+  differed from float64 NumPy, with maximum absolute error
+  `1.48018202e-07` and relative error `5.00679017e-06`. Backward trace:
+  `float32 arange -> u -> alpha_raw -> y`. The minimal fix inherits
+  `video.dtype` for time indices and `u.dtype` for integer-to-time
+  subtraction.
+- The dtype-literal audit then identified concrete Step 5 violations despite
+  output promotion. Four direct creation-instrumentation tests RED:
+  `4 failed, 4 deselected in 0.15s`. Gaussian render requested float32 grids
+  and a dtype-less precision identity; forward render requested a dtype-less
+  identity and float32 grids on each frame; SE2 no-rotation failed an actual
+  Float-versus-Double einsum; affine transport used a dtype-less identity.
+  Minimal fixes make Gaussian grids/eye inherit
+  `self.centers.dtype`/`Sigma.dtype`, forward grids/eye inherit
+  `centers_t.dtype`/`Sigma_t.dtype`, and both SE2 identities inherit
+  `t.dtype`, with devices unchanged. Dtype-focused GREEN:
+  `4 passed, 4 deselected in 0.12s`.
+- Final focused GREEN:
+  `D:\conda\envs\spi\python.exe -m pytest
+  tests\forward\test_measurement_consistency.py
+  tests\scene\test_numerical_gradients.py
+  tests\data\test_reproducibility.py -q` → exit `0`,
+  `14 passed in 0.33s`.
+- Direct float64 measurements were
+  `[-0.425, 2.175, -2.1, -1.025, -2.275]`. Interpolated `K=7` measurements
+  matched NumPy to `2.220446049250313e-16`; `K=1` returned the first-frame
+  inner product and the final boundary returned the final-frame inner
+  product. The direct fixture assigns no measurement to frame one.
+- Central differences used `h=1e-6`. Autograd versus finite difference
+  `(relative error)` was: center `0.3900542265806254` versus
+  `0.39005422669546874` (`2.944292080086366e-10`); translation velocity
+  `1.048` versus `1.0479999996704237` (`3.144812654562266e-10`); angular
+  velocity `-0.7193208014691927` versus `-0.7193208011457841`
+  (`4.496027816053279e-10`). End-to-end measurement-loss values were center
+  `-1.314375592723244` versus `-1.3143755928091139`
+  (`6.533138492894905e-11`), velocity `-0.8315084566939432` versus
+  `-0.8315084567556141` (`7.416748454623187e-11`), and omega
+  `1.959294777810261` versus `1.9592947770874503`
+  (`3.6891370730341706e-10`). All were finite and meaningfully nonzero; the
+  documented near-zero absolute fallback was not used.
+- Seed-7 repeated generation was byte-equal for all nine explicit public
+  arrays. Seed 7 with holdout zero versus 16 was byte-equal for all six
+  training arrays. Seed 11 preserved deterministic target/frames/indices/time
+  and shapes/dtypes while patterns, noisy measurements, holdout
+  patterns/measurements, and inferred noise differed. Inferred-noise SHA-256:
+  seed 7
+  `63e7e31cbeb3b4309444b5a83cb057b625e0f371109dd44c1bf071356241d470`;
+  seed 11
+  `2111c58d54fe78ad18d3f9221e62194d4d6547db4bc5847110001678a3c61f7e`.
+  Simulation and pattern RNG code was not modified.
+
+### Verification
+
+- Accumulated CPU suite → exit `0`,
+  `182 passed, 1 deselected in 21.52s`.
+- Real CUDA suite → exit `0`,
+  `1 passed, 182 deselected in 1.19s`; exactly one executed and zero skipped.
+- Full suite → exit `0`, `183 passed in 16.79s`.
+- Strict environment verification → exit `0`, fingerprint
+  `b5d6922a9f3a9638ee8826b9a74f00998cd3ac81aa25c03de016358e0e435a56`.
+- Strict implementation-provenance verification → exit `0`; four immutable
+  inputs verified at prior commit
+  `f9216bfbda54615c909a300239e237c45d2780ac`.
+- `D:\conda\envs\spi\python.exe -m pip check` → exit `0`,
+  `No broken requirements found.`
+- Targeted forward dtype audit reported
+  `hardcoded_forward_creation_violations=0`; every grid, identity,
+  interpolation index, and measurement buffer now inherits participating
+  dtype/device. `SE2Motion.center` also follows `.double()`.
+- `git diff --check` → exit `0` with silent output. All test and verifier
+  output was pristine, with no warnings or unexpected skips.

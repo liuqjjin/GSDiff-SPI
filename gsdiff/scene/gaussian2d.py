@@ -61,13 +61,15 @@ class GaussianScene2D(nn.Module):
 
         # Pixel grid [N, 2] where N = H*W, coords = (row, col)
         gy, gx = torch.meshgrid(
-            torch.arange(H, device=dev, dtype=torch.float32),
-            torch.arange(W, device=dev, dtype=torch.float32), indexing='ij')
+            torch.arange(H, device=dev, dtype=self.centers.dtype),
+            torch.arange(W, device=dev, dtype=self.centers.dtype), indexing='ij')
         coords = torch.stack([gy.reshape(-1), gx.reshape(-1)], -1)  # [N, 2]
 
         # Precision matrices Σ⁻¹
         Sigma = self.get_covariances()  # [M,2,2]
-        Sinv = torch.linalg.inv(Sigma + 1e-6 * torch.eye(2, device=dev))  # [M,2,2]
+        Sinv = torch.linalg.inv(
+            Sigma + 1e-6 * torch.eye(2, device=dev, dtype=Sigma.dtype)
+        )  # [M,2,2]
 
         amps = self.get_amplitudes()  # [M]
 
