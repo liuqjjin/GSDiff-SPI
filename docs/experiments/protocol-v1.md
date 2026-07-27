@@ -78,10 +78,23 @@ Main targets are `tank`, `digit5`, and `usaf`; motions are `trans`, `rot`, and
 overlap with main is 297 runs and 27 datasets. Supplement-only membership is
 231 runs; the union is 726 runs and 66 datasets.
 
-OOD targets are `cx_camera` and `cx_clutter`. Failure targets are `cx_coins`
-and `cx_text`, under `transrot`, with measurement configurations 320, 640,
-1,280, 2,560, 3,840, and 5,120. The failure matrix is an
-identifiability/measurement-budget study, not a representation-win claim.
+The versioned YAML files are authoritative. Their remaining matrix memberships
+are:
+
+- OOD: targets `[cx_camera, cx_clutter]`; motions
+  `[trans, rot, transrot]`; seeds `[7, 11, 42]`; acquisition config `[base]`;
+  and all 11 canonical methods (`dgi`, `static_cs`, `perframe_cs`, `tv3d`,
+  `monin`, `gidc3dtv`, `recinr`, `siren`, `recinr_se2`, `gsdiff_tv`,
+  `gsdiff_diffusion`). Every method uses method config `default`.
+- Failure: targets `[cx_coins, cx_text]`; motion `[transrot]`; seeds
+  `[7, 11, 42]`; methods `[dgi, tv3d, recinr_se2, gsdiff_tv,
+  gsdiff_diffusion]`; and acquisition configs
+  `[m320, m640, m1280, m2560, m3840, m5120]`, binding 320, 640, 1,280,
+  2,560, 3,840, and 5,120 training measurements respectively. Every method
+  uses method config `default`.
+
+The failure matrix is an identifiability/measurement-budget study, not a
+representation-win claim.
 
 The structural pilot uses `32×32`, 4 frames, 128 training measurements, and 16
 held-out measurements. It is intentionally `execution_ready: false` under
@@ -96,12 +109,38 @@ Diffusion-prior configurations use the separate `gsdiff_diffusion` lane.
 `gsdiff_diff` is recorded only as a compatibility alias and is never canonical.
 The confirmation comparison remains exactly `gsdiff_tv` versus `recinr_se2`.
 
-The ablation contract locks three selection anchors and seeds `7`, `11`, and
-`42`. Confirmatory seeds `73` and `101` are forbidden during selection. It
-declares 17 unique one-factor configurations and six exact joint-shortlist
-configurations: 207 decision cells, 207 post-freeze replay cells, and 126
-stress cells across 14 stress configurations. The lockable publication set is
-333 cells; the complete workflow before retries is 540 executions.
+The ablation contract uses selection anchors `tank/trans`, `digit5/rot`, and
+`usaf/transrot`, with seeds `[7, 11, 42]`. Confirmatory seeds `[73, 101]` are
+forbidden during selection. Its ten axes are locked exactly:
+
+- representation: `[gaussian, siren, grid, recinr_se2]`
+- solver: `[sgd, hqs, admm]`
+- prior: `[tv2d, tv3d_corrected, diffusion]`
+- motion warmup fraction: `[0, 0.1, 0.2, 0.4]`
+- temporal-TV weight: `[0, 0.05, 0.1, 0.3]`
+- training measurements: `[640, 1280, 1920, 2560, 3840, 5120]`
+- SNR in dB: `[15, 20, 25, 30]`
+- pattern: `[bernoulli, gaussian, hadamard_natural, fourier]`
+- motion fit: `[matched, translation_only, rotation_only]`
+- Gaussian count: `[250, 500, 1000, 1500]`
+
+The semantic anchor is `gaussian` representation, `admm` solver,
+`tv3d_corrected` prior, motion-warmup fraction `0.2`, temporal-TV weight `0.1`,
+and Gaussian count `1000`.
+
+| ID | Representation | Solver | Prior | Warmup | Temporal TV | Gaussians | Method lane | Method config |
+|---|---|---|---|---:|---:|---:|---|---|
+| `j1` | `recinr_se2` | `hqs` | `diffusion` | 0.2 | 0.1 | null | `gsdiff_diffusion` | `ablation-j1-v1` |
+| `j2` | `grid` | `admm` | `diffusion` | 0.2 | 0.1 | null | `gsdiff_diffusion` | `ablation-j2-v1` |
+| `j3` | `siren` | `sgd` | `tv3d_corrected` | 0.1 | 0.05 | null | `gsdiff_tv` | `ablation-j3-v1` |
+| `j4` | `gaussian` | `hqs` | `tv2d` | 0.1 | 0.05 | 1500 | `gsdiff_tv` | `ablation-j4-v1` |
+| `j5` | `recinr_se2` | `sgd` | `tv2d` | 0.4 | 0.3 | null | `gsdiff_tv` | `ablation-j5-v1` |
+| `j6` | `grid` | `hqs` | `tv3d_corrected` | 0.4 | 0.05 | null | `gsdiff_tv` | `ablation-j6-v1` |
+
+The locked counts are 17 one-factor configurations and six shortlist
+configurations; 207 decision cells; 207 post-freeze replay cells; 14 stress
+configurations and 126 stress cells; 333 publication-commit cells; and 540
+total executions before retries.
 
 Selection minimizes held-out normalized L2 residual over all nine
 anchor-by-seed cells, subject to the locked convergence and compute gates.
