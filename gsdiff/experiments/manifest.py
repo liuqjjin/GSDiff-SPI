@@ -554,14 +554,19 @@ def _snapshot(info: os.stat_result) -> tuple[int, int, int, int, int]:
 def _read_regular_file(path: Path, noun: str) -> bytes:
     _reject_linked_path(path)
     try:
-        before = os.lstat(path)
+        before_link = os.lstat(path)
+        before = os.stat(path)
         flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(path, flags)
     except OSError as error:
         raise ValueError(f"cannot safely open {noun}: {path}") from error
     try:
         opened = os.fstat(descriptor)
-        if not stat.S_ISREG(opened.st_mode) or _snapshot(before)[:2] != _snapshot(opened)[:2]:
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or _snapshot(before_link)[:2] != _snapshot(opened)[:2]
+            or _snapshot(before)[:2] != _snapshot(opened)[:2]
+        ):
             raise ValueError(f"{noun} changed or is not a regular file: {path}")
         chunks: list[bytes] = []
         while True:

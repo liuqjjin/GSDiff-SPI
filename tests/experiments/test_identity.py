@@ -1114,3 +1114,37 @@ def test_environment_requirements_rejects_live_full_fingerprint_mismatch(
             environment_lock,
             live_fingerprint={**fingerprint, "gpu": "different"},
         )
+
+
+def test_identity_rejects_string_and_mapping_subclasses_at_cryptographic_boundary():
+    class StringSubclass(str):
+        pass
+
+    class MappingSubclass(dict):
+        pass
+
+    with pytest.raises(TypeError, match="scientific_contract_id"):
+        identity.build_run_identity(
+            **{**_identity_kwargs(), "scientific_contract_id": StringSubclass("gsdiff-sim-v1")}
+        )
+    with pytest.raises(TypeError, match="assets_sha256"):
+        identity.build_run_identity(
+            **{**_identity_kwargs(), "assets_sha256": MappingSubclass()}
+        )
+    with pytest.raises(TypeError, match="code_commit"):
+        identity.build_run_identity(
+            **{**_identity_kwargs(), "code_commit": StringSubclass("c" * 40)}
+        )
+
+
+def test_resolved_config_rejects_custom_container_subclasses():
+    class MappingSubclass(dict):
+        pass
+
+    class ListSubclass(list):
+        pass
+
+    with pytest.raises(TypeError):
+        identity.resolved_config_sha256(MappingSubclass())
+    with pytest.raises(TypeError):
+        identity.resolved_config_sha256({"values": ListSubclass([1])})

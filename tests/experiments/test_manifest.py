@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+import gsdiff.experiments.manifest as manifest_module
+
 from gsdiff.experiments.identity import (
     build_run_identity,
     canonical_json_bytes,
@@ -216,6 +218,55 @@ def test_load_complete_manifest_rejects_an_undeclared_empty_directory(tmp_path: 
 
     with pytest.raises(ValueError, match="unlisted output directory"):
         load_complete_manifest(path)
+
+
+def test_load_complete_manifest_rejects_a_symlinked_output_leaf(tmp_path: Path):
+    path, manifest = _write_physical_complete(tmp_path)
+    artifact = path.parent / "reconstruction.npz"
+    target = path.parent / "target.npz"
+    target.write_bytes(artifact.read_bytes())
+    artifact.unlink()
+    try:
+        artifact.symlink_to(target)
+    except OSError:
+        pytest.skip("filesystem does not permit symlink creation")
+
+    with pytest.raises(ValueError, match="symlink|reparse"):
+        load_complete_manifest(path, expected_identity_sha256=manifest["identity_sha256"])
+
+
+def test_load_complete_manifest_rejects_a_symlinked_manifest_leaf(tmp_path: Path):
+    path, _ = _write_physical_complete(tmp_path)
+    target = path.parent / "manifest-target.json"
+    target.write_bytes(path.read_bytes())
+    path.unlink()
+    try:
+        path.symlink_to(target)
+    except OSError:
+        pytest.skip("filesystem does not permit symlink creation")
+
+    with pytest.raises(ValueError, match="symlink|reparse"):
+        load_complete_manifest(path)
+
+
+def test_single_handle_reader_detects_same_size_in_place_rewrite(tmp_path: Path, monkeypatch):
+    path = tmp_path / "output.bin"
+    path.write_bytes(b"original")
+    original_read = manifest_module.os.read
+    rewritten = False
+
+    def rewrite_after_read(descriptor: int, size: int) -> bytes:
+        nonlocal rewritten
+        block = original_read(descriptor, size)
+        if block and not rewritten:
+            rewritten = True
+            path.write_bytes(b"changed!")
+        return block
+
+    monkeypatch.setattr(manifest_module.os, "read", rewrite_after_read)
+
+    with pytest.raises(ValueError, match="changed while being verified"):
+        manifest_module._read_regular_file(path, "output")
 
 
 def test_load_complete_manifest_rejects_duplicate_json_keys(tmp_path: Path):

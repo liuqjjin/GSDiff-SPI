@@ -399,7 +399,7 @@ def _validate_run_identity_payload(payload: Mapping[str, object]) -> None:
     ):
         _require_sha256(field, payload[field])
     code_commit = payload["code_commit"]
-    if not isinstance(code_commit, str):
+    if type(code_commit) is not str:
         raise TypeError("code_commit must be a string")
     if _COMMIT_PATTERN.fullmatch(code_commit) is None:
         raise ValueError(
@@ -457,7 +457,7 @@ def build_run_identity(
         raise ValueError("clean execution must not provide source_tree_hash")
     else:
         normalized_source_hash = None
-    if not isinstance(code_commit, str):
+    if type(code_commit) is not str:
         raise TypeError("code_commit must be a string")
     if _COMMIT_PATTERN.fullmatch(code_commit) is None:
         raise ValueError(
