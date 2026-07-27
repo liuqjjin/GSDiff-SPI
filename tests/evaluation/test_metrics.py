@@ -246,6 +246,20 @@ def test_extreme_finite_inputs_are_rejected_before_arithmetic_or_json_write(
     assert not metrics_path.exists()
 
 
+def test_legacy_accepts_huge_finite_constants_while_primary_rejects():
+    huge = np.full((2, 8, 9), 1e100, dtype=np.float64)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        legacy = evaluate_video_legacy_per_frame(huge, huge)
+        with pytest.raises(ValueError, match="safe evaluability bound"):
+            evaluate_video_global_affine(huge, huge)
+
+    assert legacy["psnr_legacy_per_frame_minmax"] == 60.0
+    assert legacy["per_frame_psnr_legacy_per_frame_minmax"] == [60.0, 60.0]
+    json.dumps(legacy, allow_nan=False)
+
+
 def test_common_evaluate_video_remains_legacy_compatible():
     frame = np.linspace(0.0, 1.0, 8 * 9).reshape(8, 9)
     gt = np.stack([frame, frame])

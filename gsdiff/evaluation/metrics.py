@@ -50,12 +50,6 @@ def _as_float64_video(array: np.ndarray, name: str) -> np.ndarray:
     result = array.astype(np.float64, copy=False)
     if not np.all(np.isfinite(result)):
         raise ValueError(f"{name} must contain only finite values")
-    safe_bound = _safe_input_abs_bound(result.size)
-    if float(np.max(np.abs(result))) > safe_bound:
-        raise ValueError(
-            f"{name} magnitude exceeds the safe evaluability bound "
-            f"{safe_bound:.17g}"
-        )
     return result
 
 
@@ -69,6 +63,24 @@ def _validated_pair(
             f"gt and recon must have the same shape [T,H,W], got "
             f"{gt64.shape} and {recon64.shape}"
         )
+    return gt64, recon64
+
+
+def _require_primary_evaluable(array: np.ndarray, name: str) -> None:
+    safe_bound = _safe_input_abs_bound(array.size)
+    if float(np.max(np.abs(array))) > safe_bound:
+        raise ValueError(
+            f"{name} magnitude exceeds the safe evaluability bound "
+            f"{safe_bound:.17g}"
+        )
+
+
+def _validated_primary_pair(
+    gt: np.ndarray, recon: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    gt64, recon64 = _validated_pair(gt, recon)
+    _require_primary_evaluable(gt64, "gt")
+    _require_primary_evaluable(recon64, "recon")
     return gt64, recon64
 
 
@@ -116,7 +128,7 @@ def fit_global_affine(
     nonnegative_slope: bool = True,
 ) -> tuple[float, float]:
     """Fit one least-squares ``slope * recon + intercept`` for a full video."""
-    gt64, recon64 = _validated_pair(gt, recon)
+    gt64, recon64 = _validated_primary_pair(gt, recon)
     if not isinstance(nonnegative_slope, (bool, np.bool_)):
         raise TypeError("nonnegative_slope must be a boolean")
 
@@ -158,6 +170,7 @@ def apply_global_affine(
 ) -> np.ndarray:
     """Apply and clip a global affine calibration, returning float64."""
     recon64 = _as_float64_video(recon, "recon")
+    _require_primary_evaluable(recon64, "recon")
     if not np.isscalar(slope) or not np.isreal(slope):
         raise TypeError("slope must be a real scalar")
     if not np.isscalar(intercept) or not np.isreal(intercept):
@@ -209,7 +222,7 @@ def evaluate_video_global_affine(
     gt: np.ndarray, recon: np.ndarray
 ) -> dict[str, object]:
     """Evaluate ``metrics-v1`` primary metrics and the labelled legacy PSNR."""
-    gt64, recon64 = _validated_pair(gt, recon)
+    gt64, recon64 = _validated_primary_pair(gt, recon)
     if gt64.shape[1] < _SSIM_WIN_SIZE or gt64.shape[2] < _SSIM_WIN_SIZE:
         raise ValueError(
             "SSIM requires spatial dimensions H and W >= 7; "

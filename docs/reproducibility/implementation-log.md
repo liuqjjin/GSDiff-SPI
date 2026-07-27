@@ -420,6 +420,70 @@ This permanent append-only ledger is intentionally empty of implementation recor
 - `git diff --check` → exit `0` with silent output. Successful test and
   verifier output was pristine, with no warnings or unexpected skips.
 
+## Task 8 Fix Round 2 — Preserve legacy metric input behavior (2026-07-27)
+
+- Clean independent-fix base:
+  `9ecbb511a9e9cc660b4964f95061eb778f1a6780`; prior Task 8 commits were not
+  amended.
+- Root-cause reproduction showed that Fix Round 1 placed the new primary
+  evaluability bound inside shared `_as_float64_video` validation. This
+  unintentionally narrowed the legacy compatibility evaluator: finite constant
+  GT/reconstruction arrays at `1e100`, which the historical per-frame min-max
+  formula safely maps to zero before returning 60 dB, were rejected at the
+  `1.6713148472798417e+76` primary bound.
+
+### RED and GREEN evidence
+
+- The regression was written before the fix and requires legacy evaluation of
+  `[2,8,9]` constant `1e100` arrays to return two 60-dB frames, mean 60 dB, a
+  finite strict-JSON payload, and no RuntimeWarning, while primary evaluation
+  must still reject the same input.
+- Targeted RED:
+  `D:\conda\envs\spi\python.exe -m pytest
+  tests\evaluation\test_metrics.py -q -k huge_finite_constants` → exit `1`,
+  `1 failed, 28 deselected in 0.36s`; the legacy call raised the primary
+  `safe evaluability bound` error from shared basic validation.
+- Minimal GREEN separated numeric/shape/non-empty/finite validation from
+  `_require_primary_evaluable`. The guard now runs in
+  `fit_global_affine`, `evaluate_video_global_affine`, and
+  `apply_global_affine`, but not in `evaluate_video_legacy_per_frame`.
+  Targeted large-offset/extreme/legacy magnitude tests → exit `0`,
+  `3 passed, 26 deselected in 0.82s`.
+- Final focused metrics → exit `0`, `29 passed in 1.30s`.
+
+### Compatibility and verification
+
+- Legacy `1e100` constant evaluation again returns
+  `per_frame_psnr_legacy_per_frame_minmax=[60.0,60.0]` and
+  `psnr_legacy_per_frame_minmax=60.0`, with zero warnings and a strict
+  JSON-native finite payload.
+- Primary evaluation still rejects `1e100`; fit/evaluate/writer still reject
+  `1e308` before unsafe arithmetic, and the writer leaves no partial file.
+  Large-offset centered fitting remains slope `0.99999999992292488`,
+  intercept `-9999999.9992292486`, PSNR `120.0`, and nRMSE
+  `9.2644224664486843e-10`.
+- Legacy formulas and keys, primary formulas and finite-output recursion,
+  centered fitting, writer paths, baseline logic, and JSON boundaries were
+  unchanged.
+- Accumulated CPU suite → exit `0`,
+  `214 passed, 1 deselected in 14.02s`.
+- Real CUDA suite → exit `0`,
+  `1 passed, 214 deselected in 1.11s`; exactly one executed and zero skipped.
+- Full suite → exit `0`, `215 passed in 13.45s`.
+- Strict environment verification → exit `0`, fingerprint
+  `b5d6922a9f3a9638ee8826b9a74f00998cd3ac81aa25c03de016358e0e435a56`.
+- Strict implementation-provenance verification → exit `0`; four immutable
+  inputs verified at fix base
+  `9ecbb511a9e9cc660b4964f95061eb778f1a6780`.
+- `D:\conda\envs\spi\python.exe -m pip check` → exit `0`,
+  `No broken requirements found.`
+- Primary-versus-legacy magnitude audit reported legacy `1e100` PSNR 60,
+  primary `1e100` rejection, extreme `1e308` rejection, and zero warnings.
+  Key/JSON audit preserved one metrics-writer call, no partial file, no
+  method-child legacy import, and all existing root labels/aliases.
+- `git diff --check` → exit `0` with silent output. Successful test and
+  verifier output was pristine, with no warnings or unexpected skips.
+
 ## Task 3 Fix Round 1 — Clarify theta-TV objective (2026-07-27)
 
 - Fix base and clean starting HEAD:
