@@ -1592,3 +1592,166 @@ This permanent append-only ledger is intentionally empty of implementation recor
   `blind_method_child` production references.
 - `git diff --check` → exit `0`, silent. All test and verifier output was
   pristine, with no warnings, compatibility failures, or unexpected skips.
+
+## Task 10 — Add canonical experiment identities (2026-07-27)
+
+- Started from clean exact HEAD
+  `a4211fe372476afb9a48a672b9589c47810d7aa4` on
+  `debug/admm-vs-sgd`. The existing runtime/environment fingerprint API and
+  its tests were preserved; Task 10 added identity and source-tree primitives
+  in the same module.
+- `RunIdentity` stores only canonical immutable UTF-8 JSON bytes, their exact
+  SHA-256, and the derived display ID. Direct construction and the builder
+  share the complete exact-field semantic validator, so compatibility
+  execution, missing/extra fields, invalid IDs/hashes/types, incoherent
+  dirty/source state, noncanonical bytes, a mismatched payload hash, or a
+  mismatched display ID cannot bypass the blind enforcement handoff.
+- The only accepted execution class is exact `blind_method_child`. IDs use
+  ASCII `^[a-z0-9][a-z0-9_-]*$`; SHA-256 and Git commit strings use exact
+  lowercase 64- and 40-hex forms. Resolved configuration mappings are
+  recursively copied/normalized, and strict canonical JSON rejects NaN and
+  infinities. Each `payload()` call returns a newly decoded recursively
+  read-only tree.
+- `git_state()` returns full commit, symbolic branch or null, complete dirty
+  status, and baseline
+  `c03420784bc92b4e9b9eef8330cbd9571ebebc68`.
+- `source-tree-v1` is the SHA-256 of its domain prefix, HEAD, and sorted UTF-8
+  repo-relative path records. Every record independently frames the direct Git
+  index view and the working view with status, regular/executable mode,
+  unsigned 64-bit content length, and raw content SHA-256. This distinguishes
+  staged content after a working-tree restore and staged deletion after a
+  working-file rebuild without Git rename or text-diff heuristics.
+- Source roots are the sole tracked/untracked allowlist. Ignored untracked
+  source inside a root is included without consulting `.gitignore`.
+  Filesystem/Git canonical spelling prevents Windows case aliases from
+  creating a second identity. The documented exact component/paper-prefix
+  exclusions omit artifacts, results, caches, environments, `_trash`, and
+  generated paper outputs without excluding neighbors such as
+  `artifacts.py`. Symlinks, junctions/reparse points, Git symlinks, submodules,
+  and other non-regular modes fail closed.
+
+### TDD and adversarial evidence
+
+- Initial complete RED before production edits:
+  `D:\conda\envs\spi\python.exe -m pytest
+  tests\experiments\test_identity.py -q` → exit `1`,
+  `81 failed in 4.69s`; every failure was an expected absent Task 10 helper.
+- Canonical/hash/RunIdentity/git-state layer first reached
+  `66 passed, 1 failed, 14 deselected`; the single dirty-plus-missing-hash
+  state incorrectly raised the generic SHA type error. Explicit state
+  validation produced `67 passed, 14 deselected`.
+- Source-tree implementation first produced `69 passed, 12 failed`; all
+  failures shared one missing `stat` import. The next run was
+  `80 passed, 1 failed`, exposing a removed empty source-root directory after
+  deletion. HEAD/index-aware missing-root validation produced
+  `81 passed in 9.87s`.
+- Read-only nested configuration plus immutable direct-construction tests were
+  RED at `2 failed, 81 deselected`, then GREEN at
+  `2 passed, 81 deselected`.
+- Staged-index-only content, staged deletion plus rebuilt file, Git modes
+  `120000/160000`, and internal reparse tests were RED at
+  `5 failed, 83 deselected`; the dual-view framing and fail-closed mode policy
+  made the same group `5 passed, 83 deselected`.
+- Direct compatibility, unknown-field, missing-field, and both dirty/source
+  bypasses were RED at `5 failed, 88 deselected`, then GREEN at
+  `5 passed, 88 deselected` after the shared payload validator.
+- A real Windows `SRC` versus `src` root alias was RED with two different
+  hashes. Filesystem/Git canonical spelling made the targeted rerun
+  `1 passed`; the test also proves staged-index-only content remains visible
+  through the alias. Final focused identity suite:
+  `94 passed in 16.10s`.
+
+### Verification
+
+- Identity plus existing runtime/environment-lock focused suites:
+  `113 passed in 18.11s`.
+- Accumulated CPU suite → exit `0`,
+  `470 passed, 1 deselected in 35.86s`.
+- Fresh real CUDA suite → exit `0`,
+  `1 passed, 470 deselected in 1.15s`; JUnit verification reported
+  `tests=1 failures=0 errors=0 skipped=0`.
+- Full suite → exit `0`, `471 passed in 36.81s`.
+- `compileall` completed silently with exit `0`.
+- Strict environment verification → exit `0`, fingerprint
+  `b5d6922a9f3a9638ee8826b9a74f00998cd3ac81aa25c03de016358e0e435a56`.
+- Strict implementation-provenance verification → exit `0`; four immutable
+  inputs verified at Task 10 base
+  `a4211fe372476afb9a48a672b9589c47810d7aa4`.
+- `D:\conda\envs\spi\python.exe -m pip check` → exit `0`,
+  `No broken requirements found.`
+- Live dirty-state audit returned the exact base commit, branch
+  `debug/admm-vs-sgd`, `dirty=true`, the required baseline, and source-tree
+  hash `0e5245882bf1ba49404bdc17f4e3fbd3b28ab17ca1469c2f9297e506f0276095`
+  for `gsdiff`, `scripts`, and `train.py`.
+- The checked-in JUnit verifier's current CLI uses an ISO-8601
+  `--created-after-utc` value plus `--max-skips 0`; this superseded the older
+  plan command spelling while preserving the required fresh, nonzero,
+  zero-skip gate.
+- `git diff --check` → exit `0`, silent. Test and verifier output was pristine
+  with no warnings, compatibility failures, or unexpected skips.
+
+## Task 10 pre-commit adversarial hardening (2026-07-27)
+
+- Windows source-root spelling RED: the same physical `src`/`SRC` directory
+  produced different hashes, and the alias lost staged-only index content.
+  Filesystem-canonical spelling made the alias equal to the canonical clean
+  hash while preserving the staged-only difference; targeted GREEN:
+  `1 passed in 1.60s`.
+- Git-for-Windows locale RED: Chinese `测试仓库` and non-BMP `repo😀` roots
+  were decoded through cp936 and failed before hashing; Unicode branches
+  `分支` and `feature😀` were likewise at risk of mojibake. Both cases failed
+  in the targeted RED. Raw Git bytes, empty raw `--show-prefix`, strict ASCII
+  structural fields, and strict UTF-8 paths/branches produced
+  `2 passed, 94 deselected`.
+- Missing-root RED: Unicode `casefold()` incorrectly mapped nonexistent
+  `src/straße` to a staged-deleted exact Git root `src/strasse`. Missing roots
+  now require one exact Git prefix; targeted GREEN: `1 passed`.
+- Direct-constructor equality-spoof RED proved non-string mutable objects could
+  impersonate the expected payload SHA and display ID. Exact built-in string
+  checks close that boundary.
+- Worktree-root RED proved `.git` metadata could be hashed as if it were a
+  worktree. The combined `.git`/bare/linked-worktree group first reported
+  `1 failed, 2 passed`; requiring raw
+  `--is-inside-work-tree == true` plus empty raw prefix made the group
+  `3 passed, 97 deselected`.
+- Pre-construction blind-boundary RED used a `str` subclass overriding
+  inequality to pass `compatibility_unblinded` into a sentinel
+  `RunIdentity`; the test reported `1 failed`. One shared exact-built-in-string
+  execution-class validator now rejects it before construction; targeted
+  GREEN: `1 passed`.
+- Refreshed independent pre-commit review reported zero blocker, zero major,
+  and zero minor findings.
+
+### Superseding final Task 10 verification
+
+- Final identity focused suite: `101 passed in 20.55s`.
+- Identity plus existing runtime/environment-lock focused suites:
+  `120 passed in 22.73s`.
+- Accumulated CPU suite → exit `0`,
+  `477 passed, 1 deselected in 40.77s`.
+- Fresh real CUDA suite → exit `0`,
+  `1 passed, 477 deselected in 1.24s`; JUnit verification reported
+  `tests=1 failures=0 errors=0 skipped=0`.
+- Full suite → exit `0`, `478 passed in 41.66s`.
+- `compileall` completed silently with exit `0`.
+- Strict environment verification → exit `0`, fingerprint
+  `b5d6922a9f3a9638ee8826b9a74f00998cd3ac81aa25c03de016358e0e435a56`.
+- Strict implementation-provenance verification → exit `0`; four immutable
+  inputs verified at Task 10 base
+  `a4211fe372476afb9a48a672b9589c47810d7aa4`.
+- `D:\conda\envs\spi\python.exe -m pip check` → exit `0`,
+  `No broken requirements found.`
+- Final live dirty-state audit returned exact base commit, branch
+  `debug/admm-vs-sgd`, `dirty=true`, the required baseline, and source-tree
+  hash `c8a826a79091d7c8be0cd63dad0ba5c16202a31ef60263fa9695640036c93c6c`
+  for `gsdiff`, `scripts`, and `train.py`.
+
+### Commit-boundary re-verification
+
+- Immediately before exact-scope staging,
+  `D:\conda\envs\spi\python.exe -m pytest -q` completed with exit `0`:
+  `478 passed in 40.63s`.
+- `D:\conda\envs\spi\python.exe -m compileall -q gsdiff tests` completed
+  silently with exit `0`.
+- `D:\conda\envs\spi\python.exe -m pip check` completed with exit `0`:
+  `No broken requirements found.`

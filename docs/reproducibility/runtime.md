@@ -90,6 +90,108 @@ current fingerprint. A self-consistent edited payload still fails when any
 dependency, Python ABI field, numerical environment value, platform, PyTorch
 build, CUDA driver, or GPU device differs.
 
+## Canonical experiment identities
+
+`build_run_identity()` accepts only
+`execution_class="blind_method_child"`. Compatibility execution with
+child-visible truth, a missing class, and unknown classes fail before identity
+construction. Scientific-contract, method, target, motion, metric, asset, and
+checkpoint names match ASCII `^[a-z0-9][a-z0-9_-]*$`. Identity-bearing SHA-256
+values are exactly 64 lowercase hexadecimal characters, and the Git commit is
+exactly 40. Seeds and dirty flags use exact integer and boolean types.
+
+Resolved configurations are recursively copied into ordinary JSON mappings and
+arrays before compact, sorted-key UTF-8 serialization. NaN and infinities are
+rejected. The run identity stores only those immutable canonical bytes; their
+SHA-256 is the full storage identity. `RunIdentity.payload()` decodes a new
+recursively read-only view for each manifest consumer. Direct dataclass
+construction revalidates the complete field set, canonical bytes, blind
+execution class, IDs, hashes, dirty/source pairing, payload hash, and display
+ID, so it cannot bypass the builder gate.
+
+A clean identity requires `dirty_worktree=false` and a null source-tree hash.
+A diagnostic dirty identity requires `dirty_worktree=true` and a valid
+source-tree SHA-256. Publication campaigns reject dirty execution, and later
+aggregation/promotion code must not treat diagnostic runs as locked evidence.
+`git_state()` reports the full commit, symbolic branch (or null when detached),
+complete Git dirtiness including untracked files, and evidence baseline
+`c03420784bc92b4e9b9eef8330cbd9571ebebc68`.
+
+### `source-tree-v1` framing
+
+`source_tree_sha256()` requires one or more lexical source roots inside the
+resolved Git worktree root. Those roots are the only allowlist for both tracked
+and untracked paths. An ignored untracked file inside a root is included; the
+implementation deliberately does not consult `.gitignore`. HEAD paths, index
+paths, and scanned working files outside the roots do not enter the hash.
+Existing roots are canonicalized to their resolved filesystem spelling; a
+missing root that represents staged deletion is accepted only under its unique
+exact Git path prefix. Existing Windows case aliases therefore use filesystem
+proof, while nonexistent Unicode lookalikes fail closed rather than relying on
+over-broad case folding. This prevents one physical directory from creating a
+second identity or losing the index view.
+
+Git subprocess output is captured as bytes. Commit and mode fields use strict
+ASCII; Git paths and symbolic branch names use strict UTF-8. Worktree-root
+validation requires raw `git rev-parse --is-inside-work-tree` to equal `true`
+and the raw `--show-prefix` result to be empty. This accepts a linked-worktree
+root while rejecting its `.git` metadata directory and bare repositories, and
+does not round-trip the absolute root through the host locale. Chinese and
+non-BMP repository roots and branch names therefore retain their exact values.
+
+The hash input begins with `source-tree-v1`, a NUL byte, the 40-byte ASCII HEAD
+commit, and a NUL byte. Records then follow in bytewise-sorted UTF-8
+repo-relative path order. Each record contains:
+
+1. an unsigned 64-bit big-endian path-byte length and the path bytes;
+2. an index view with status `P` (present), `D` (HEAD path deleted from the
+   index), or `U` (untracked), followed by mode `R`, `X`, or `-`, unsigned
+   64-bit content length, and the 32 raw SHA-256 bytes; and
+3. a working view with status `P` or `D` and the same mode, length, and digest
+   framing.
+
+Absent content uses mode `-`, zero length, and 32 zero bytes. Index content is
+read directly from the staged Git blob, while working content is read as
+binary bytes. Consequently staged content remains identity-bearing even if the
+working file is restored to HEAD, staged deletion remains identity-bearing if
+the working file is recreated, and unstaged edits remain independently
+identity-bearing. Renames are the old deleted path plus the new added path;
+there is no rename or text-diff heuristic. Index modes must be regular
+`100644` or executable `100755`. POSIX working executable bits come from the
+filesystem; Windows uses the Git index mode. Symlinks, junctions, other
+reparse points, submodules, and other non-regular Git modes fail closed before
+content traversal.
+
+The exclusion policy is literal, not glob- or substring-based. Any exact path
+component in this set excludes that subtree:
+
+```text
+.git
+artifacts
+results
+_trash
+__pycache__
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.cache
+.tox
+.nox
+.hypothesis
+.ipynb_checkpoints
+.venv
+venv
+env
+ENV
+__pypackages__
+.pixi
+```
+
+Generated paper outputs are excluded only under the exact repo-root prefixes
+`paper/figure_data`, `paper/figures`, `paper/tables`, `paper/build`, and
+`paper/generated`. A source file such as `gsdiff/data/artifacts.py` is
+therefore included.
+
 ## Test evidence gates
 
 CPU numerical tests use the deterministic autouse seed fixture. CUDA tests
