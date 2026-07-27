@@ -728,7 +728,7 @@ def _collect_source_inputs(
 ) -> tuple[
     Path,
     bytes,
-    dict[str, str],
+    dict[str, tuple[str, str]],
     dict[str, tuple[str, str]],
     set[str],
     set[str],

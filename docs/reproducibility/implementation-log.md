@@ -1907,3 +1907,29 @@ This permanent append-only ledger is intentionally empty of implementation recor
   hash `10e466bd45a96deb59cefe3a64588877761371431ab1295bf58d2fcbee1faca0`
   for `gsdiff`, `scripts`, and `train.py`.
 - `git diff --check` completed silently with exit `0`.
+
+## Task 10 Fix Round 3 — Correct source input annotation (2026-07-27)
+
+- Fix Round 3 started from exact reviewed commit
+  `8d44c28cede13beeb7df7e6f814c748a19ab0b71` with parent
+  `cde16b25aa9fb98fe97fa0f0b110d555211f0707` and a clean tracked worktree.
+- Fix Round 2 re-review resolved every behavioral finding and left one minor
+  static-contract mismatch. `_collect_source_inputs()` returned HEAD entries
+  shaped as `(mode, object_id)` pairs while its third tuple member annotation
+  still advertised plain strings.
+- A focused `typing.get_type_hints` regression was RED at
+  `1 failed, 110 deselected in 0.10s`, observing
+  `dict[str, str] != dict[str, tuple[str, str]]`.
+- Changing only that obsolete third tuple member annotation produced
+  `1 passed, 110 deselected in 0.05s`. Runtime source collection, framing,
+  hashes, identity semantics, and public APIs were unchanged.
+- Final focused identity suite:
+  `111 passed in 32.56s`.
+- Identity plus existing runtime/environment-lock compatibility suites:
+  `130 passed in 34.16s`.
+- `D:\conda\envs\spi\python.exe -m compileall -q gsdiff scripts train.py`
+  completed silently with exit `0`.
+- `git diff --check` completed silently with exit `0`.
+- CUDA and the full suite were not repeated for this annotation-only repair;
+  the prior Fix Round 2 real-CUDA/JUnit and full-suite gates remain the latest
+  behavioral evidence. No final Task 10 closure was written.

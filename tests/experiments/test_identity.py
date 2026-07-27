@@ -8,6 +8,7 @@ import stat
 import subprocess
 from types import MappingProxyType
 from dataclasses import FrozenInstanceError
+from typing import get_args, get_type_hints
 
 import pytest
 
@@ -87,6 +88,12 @@ def _make_directory_link(link: Path, target: Path) -> None:
         capture_output=True,
         text=True,
     )
+
+
+def test_source_input_head_entry_annotation_matches_parser_output():
+    return_hint = get_type_hints(identity._collect_source_inputs)["return"]
+
+    assert get_args(return_hint)[2] == dict[str, tuple[str, str]]
 
 
 def test_sha256_file_matches_standard_vector_and_detects_mutation(tmp_path: Path):
