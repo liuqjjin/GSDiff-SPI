@@ -200,3 +200,75 @@ This permanent append-only ledger is intentionally empty of implementation recor
 - After staging exactly the five Fix Round 1 files, both
   `git diff --cached --check` and `git diff --check` → exit `0` with silent
   output.
+
+## Task 2 — Correct weighted 3D-TV adjoint (2026-07-27)
+
+- Prior approved commit and clean starting HEAD:
+  `e14f847cc5b81d3adee11a31dfdeb0552d3b80a6` on
+  `debug/admm-vs-sgd`.
+- Root cause: the temporal forward gradient was scaled by `alpha`, but both
+  duplicated temporal divergence blocks were not. The existing video
+  `[T,H,W]` and dual-field `[T,H,W,3]` conventions matched the task brief.
+
+### TDD RED/GREEN
+
+- Added the deterministic float64 weighted-adjoint test with
+  boundary-compatible dual fields before the helpers existed.
+- Exact RED command:
+  `D:\conda\envs\spi\python.exe -m pytest
+  tests/prior/test_tv3d.py::test_weighted_gradient_divergence_are_negative_adjoint
+  -q` → exit `1` during collection with the expected
+  `ImportError: cannot import name '_divergence3d'`; one collection error and
+  no collectors.
+- Added only `_gradient3d` and `_divergence3d`, with `alpha` applied to the
+  temporal component of each operator and one-sided zero-flux boundaries.
+- Exact initial GREEN command, identical to RED → exit `0`,
+  `5 passed in 0.04s`.
+- Added the float64 `alpha=0` framewise proximal equivalence test. Its first
+  isolated run passed (`1 passed in 0.05s`) because the old 2D and 3D paths
+  used matching float32 dual buffers and promoted only the returned tensors.
+- Refactored both 3D divergence sites and the 3D forward-gradient site to call
+  the helpers, removed the duplicate temporal divergence, and changed only the
+  relevant 2D/3D Chambolle buffers to input-derived `new_zeros`.
+- Final focused command:
+  `D:\conda\envs\spi\python.exe -m pytest tests/prior/test_tv3d.py -q` →
+  exit `0`, `6 passed in 0.07s`.
+
+### Numerical evidence
+
+- Deterministic float64 weighted-adjoint relative errors were:
+  `alpha=0`: `2.36821363826887335e-16`;
+  `alpha=0.05`: `8.41102715057286788e-16`;
+  `alpha=0.3`: `1.29726451974729065e-16`;
+  `alpha=1`: `1.33563412971027626e-15`;
+  `alpha=2`: `5.65907821739121724e-16`.
+  The maximum was `1.33563412971027626e-15`, below `1e-10`.
+- For `alpha=0`, the framewise 2D and 3D proximal outputs had maximum absolute
+  error `0.0`; both outputs preserved `torch.float64`.
+
+### Verification
+
+- Accumulated CPU suite:
+  `D:\conda\envs\spi\python.exe -m pytest -m "not cuda" -q` → exit `0`,
+  `67 passed, 1 deselected in 11.10s`.
+- Real CUDA suite after extending the existing 4x7x3 Gaussian+SE(2) smoke with
+  a tiny corrected `TVPrior3D.proximal` call:
+  `D:\conda\envs\spi\python.exe -m pytest -m cuda -q` → exit `0`,
+  `1 passed, 67 deselected in 0.50s`; one CUDA test executed and zero skipped.
+- Strict environment verifier:
+  `D:\conda\envs\spi\python.exe
+  scripts\reproducibility\verify_environment_lock.py --strict` → exit `0`,
+  fingerprint
+  `b5d6922a9f3a9638ee8826b9a74f00998cd3ac81aa25c03de016358e0e435a56`.
+- Strict implementation-provenance verifier:
+  `D:\conda\envs\spi\python.exe
+  scripts\reproducibility\verify_implementation_provenance.py --strict` →
+  exit `0`; four immutable inputs verified at current commit
+  `e14f847cc5b81d3adee11a31dfdeb0552d3b80a6`.
+- One full suite before commit:
+  `D:\conda\envs\spi\python.exe -m pytest -q` → exit `0`,
+  `68 passed in 11.49s`.
+- `D:\conda\envs\spi\python.exe -m pip check` → exit `0`,
+  `No broken requirements found.`
+- `git diff --check` → exit `0` with silent output. All test and verifier
+  output was pristine, with no warnings or unexpected skips.

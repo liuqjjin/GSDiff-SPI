@@ -7,6 +7,28 @@
 import torch
 
 
+def _gradient3d(video: torch.Tensor, alpha: float) -> torch.Tensor:
+    T, H, W = video.shape
+    grad = video.new_zeros(T, H, W, 3)
+    grad[:-1, :, :, 0] = float(alpha) * (video[1:] - video[:-1])
+    grad[:, :-1, :, 1] = video[:, 1:] - video[:, :-1]
+    grad[:, :, :-1, 2] = video[:, :, 1:] - video[:, :, :-1]
+    return grad
+
+
+def _divergence3d(field: torch.Tensor, alpha: float) -> torch.Tensor:
+    T, H, W, _ = field.shape
+    div = field.new_zeros(T, H, W)
+    a = float(alpha)
+    div[1:] += a * (field[1:, :, :, 0] - field[:-1, :, :, 0])
+    div[0] += a * field[0, :, :, 0]
+    div[:, 1:] += field[:, 1:, :, 1] - field[:, :-1, :, 1]
+    div[:, 0] += field[:, 0, :, 1]
+    div[:, :, 1:] += field[:, :, 1:, 2] - field[:, :, :-1, 2]
+    div[:, :, 0] += field[:, :, 0, 2]
+    return div
+
+
 class TVPrior:
 
     def __init__(self, max_iter=50):
@@ -16,18 +38,18 @@ class TVPrior:
     def _chambolle(img, weight, max_iter=50):
         """TV denoising of a 2D image via Chambolle dual projection.
         img: [H,W], weight: scalar → denoised [H,W]."""
-        H, W = img.shape; dev = img.device
-        p = torch.zeros(H, W, 2, device=dev)
+        H, W = img.shape
+        p = img.new_zeros(H, W, 2)
         tau = 1.0 / 8.0
         for _ in range(max_iter):
-            div_p = torch.zeros(H, W, device=dev)
+            div_p = img.new_zeros(H, W)
             div_p[1:] += p[1:, :, 0] - p[:-1, :, 0]
             div_p[0]  += p[0, :, 0]
             div_p[:, 1:] += p[:, 1:, 1] - p[:, :-1, 1]
             div_p[:, 0]  += p[:, 0, 1]
 
             x = img + weight * div_p
-            g = torch.zeros(H, W, 2, device=dev)
+            g = img.new_zeros(H, W, 2)
             g[:-1, :, 0] = x[1:] - x[:-1]
             g[:, :-1, 1] = x[:, 1:] - x[:, :-1]
 
@@ -35,7 +57,7 @@ class TVPrior:
             norm = torch.sqrt(pn[..., 0]**2 + pn[..., 1]**2).clamp(min=1.0)
             p = pn / norm.unsqueeze(-1)
 
-        div_p = torch.zeros(H, W, device=dev)
+        div_p = img.new_zeros(H, W)
         div_p[1:] += p[1:, :, 0] - p[:-1, :, 0]
         div_p[0]  += p[0, :, 0]
         div_p[:, 1:] += p[:, 1:, 1] - p[:, :-1, 1]
@@ -82,29 +104,19 @@ class TVPrior3D(TVPrior):
         Step size: tau = 1 / (8 + 4·α²)  derived from ||K_weighted||² ≤ 8+4α²
         """
         T, H, W = video.shape
-        dev = video.device
         # Dual variable: component 0=temporal, 1=vertical, 2=horizontal
-        p = torch.zeros(T, H, W, 3, device=dev)
+        p = video.new_zeros(T, H, W, 3)
         alpha = float(temporal_weight)
         tau = 1.0 / (8.0 + 4.0 * alpha * alpha)  # step size
 
         for _ in range(max_iter):
             # ── divergence of p (adjoint of gradient) ──
-            div_p = torch.zeros(T, H, W, device=dev)
-            div_p[1:,  :,  :] += p[1:, :, :, 0] - p[:-1, :, :, 0]
-            div_p[0,   :,  :] += p[0, :, :, 0]
-            div_p[:,  1:,  :] += p[:, 1:, :, 1] - p[:, :-1, :, 1]
-            div_p[:,   0,  :] += p[:, 0, :, 1]
-            div_p[:,  :, 1:]  += p[:, :, 1:, 2] - p[:, :, :-1, 2]
-            div_p[:,  :,  0]  += p[:, :, 0, 2]
+            div_p = _divergence3d(p, alpha)
 
             x = video + weight * div_p
 
             # ── forward gradient of x ──
-            g = torch.zeros(T, H, W, 3, device=dev)
-            g[:-1, :, :, 0] = alpha * (x[1:] - x[:-1])   # temporal
-            g[:,  :-1, :, 1] = x[:, 1:] - x[:, :-1]       # vertical
-            g[:,  :, :-1, 2] = x[:, :, 1:] - x[:, :, :-1] # horizontal
+            g = _gradient3d(x, alpha)
 
             pn = p + tau * g / weight
             # isotropic projection onto unit ball
@@ -114,13 +126,7 @@ class TVPrior3D(TVPrior):
             p = pn / norm.unsqueeze(-1)
 
         # final divergence for the output
-        div_p = torch.zeros(T, H, W, device=dev)
-        div_p[1:,  :,  :] += p[1:, :, :, 0] - p[:-1, :, :, 0]
-        div_p[0,   :,  :] += p[0, :, :, 0]
-        div_p[:,  1:,  :] += p[:, 1:, :, 1] - p[:, :-1, :, 1]
-        div_p[:,   0,  :] += p[:, 0, :, 1]
-        div_p[:,  :, 1:]  += p[:, :, 1:, 2] - p[:, :, :-1, 2]
-        div_p[:,  :,  0]  += p[:, :, 0, 2]
+        div_p = _divergence3d(p, alpha)
 
         return video + weight * div_p
 

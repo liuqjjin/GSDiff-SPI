@@ -5,6 +5,7 @@ import torch
 
 from gsdiff.forward import SPIForwardModel
 from gsdiff.motion import SE2Motion
+from gsdiff.prior.tv import TVPrior3D
 from gsdiff.scene import GaussianScene2D
 
 
@@ -38,3 +39,11 @@ def test_tiny_gaussian_se2_forward_and_backward_on_cuda():
     assert all(gradient is not None for gradient in gradients)
     assert all(gradient.is_cuda for gradient in gradients)
     assert all(torch.isfinite(gradient).all() for gradient in gradients)
+
+    tv_input = torch.rand(2, 1, 3, 5, device=device, dtype=torch.float64)
+    tv_output = TVPrior3D(max_iter=2, temporal_weight=0.3).proximal(
+        tv_input, weight=0.08
+    )
+    assert torch.isfinite(tv_output).all()
+    assert tv_output.device == tv_input.device
+    assert tv_output.dtype == tv_input.dtype
