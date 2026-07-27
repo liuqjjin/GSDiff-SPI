@@ -580,6 +580,54 @@ def test_git_state_ignores_ignored_untracked_input_outside_source_roots(
 
 
 @pytest.mark.parametrize(
+    ("set_flag", "clear_flag"),
+    [
+        ("--assume-unchanged", "--no-assume-unchanged"),
+        ("--skip-worktree", "--no-skip-worktree"),
+    ],
+)
+def test_git_state_detects_flag_hidden_source_content_and_presence(
+    git_repo: Path,
+    set_flag: str,
+    clear_flag: str,
+):
+    roots = [Path("src")]
+    source = git_repo / "src" / "main.py"
+    original = source.read_bytes()
+    clean_hash = identity.source_tree_sha256(git_repo, roots)
+
+    _git(git_repo, "update-index", set_flag, "src/main.py")
+    assert _git(
+        git_repo, "status", "--porcelain=v1", "--untracked-files=all"
+    ) == ""
+    assert identity.source_tree_sha256(git_repo, roots) == clean_hash
+    assert identity.git_state(git_repo, roots)["dirty"] is False
+
+    source.write_text("VALUE = 999\n", encoding="utf-8")
+    assert _git(
+        git_repo, "status", "--porcelain=v1", "--untracked-files=all"
+    ) == ""
+    assert identity.source_tree_sha256(git_repo, roots) != clean_hash
+    assert identity.git_state(git_repo, roots)["dirty"] is True
+
+    source.write_bytes(original)
+    assert identity.source_tree_sha256(git_repo, roots) == clean_hash
+    assert identity.git_state(git_repo, roots)["dirty"] is False
+
+    source.unlink()
+    assert _git(
+        git_repo, "status", "--porcelain=v1", "--untracked-files=all"
+    ) == ""
+    assert identity.source_tree_sha256(git_repo, roots) != clean_hash
+    assert identity.git_state(git_repo, roots)["dirty"] is True
+
+    source.write_bytes(original)
+    _git(git_repo, "update-index", clear_flag, "src/main.py")
+    assert identity.source_tree_sha256(git_repo, roots) == clean_hash
+    assert identity.git_state(git_repo, roots)["dirty"] is False
+
+
+@pytest.mark.parametrize(
     ("repo_name", "branch_name"),
     [("测试仓库", "分支"), ("repo😀", "feature😀")],
 )

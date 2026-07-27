@@ -1829,3 +1829,81 @@ This permanent append-only ledger is intentionally empty of implementation recor
   hash `f1391109e6db65336782c469631be12cac0757c86d88ddc810c8e4948445468d`
   for `gsdiff`, `scripts`, and `train.py`.
 - `git diff --check` completed silently with exit `0`.
+
+## Task 10 Fix Round 2 — Detect hidden tracked source changes (2026-07-27)
+
+- Fix Round 2 started from exact reviewed commit
+  `cde16b25aa9fb98fe97fa0f0b110d555211f0707` with parent
+  `c5b75d30cf7942f863d98c1f783e539737cdef4c` and a clean worktree.
+- Fix Round 1 re-review resolved the Windows root-spelling and read-only
+  payload findings. One major remained: Git porcelain suppresses working
+  changes behind `assume-unchanged` and `skip-worktree`, so tracked
+  identity-bearing source could change while `git_state()` returned clean.
+
+### Corrective source-state comparison
+
+- Source-aware cleanliness no longer enumerates Git flags or relies on
+  porcelain. The existing `source-tree-v1` framing was factored into one
+  snapshot hasher with two inputs:
+  - the actual snapshot retains the exact prior HEAD domain, allowlisted path
+    order, direct index blob/mode frames, and scanned working
+    content/presence/mode frames;
+  - the deterministic clean-HEAD snapshot uses the same domain, paths, and
+    frame boundaries, but contains only allowlisted HEAD paths and places each
+    HEAD blob and mode in both the index and working frames.
+- `source_tree_sha256()` still returns the actual snapshot hash, so run
+  identity semantics and diagnostic dirty hashing are unchanged.
+  `git_state()` preserves conventional whole-repository porcelain dirtiness
+  and additionally requires the actual and clean-HEAD source hashes to match.
+- Index flags alone are not identity-bearing: an unchanged flagged file
+  remains scientifically clean. Any tracked index blob/mode difference,
+  working content or presence difference, ignored untracked input, or POSIX
+  working executable-mode difference changes the framed snapshot and is
+  dirty even when status refresh is suppressed. This includes the
+  `core.filemode=false` POSIX case without consulting that setting.
+- HEAD tree parsing now retains each regular blob object ID so the clean
+  reference consumes direct immutable Git object bytes rather than working
+  files or status heuristics.
+
+### RED/GREEN evidence
+
+- A real-Git parameterized RED for `--assume-unchanged` and
+  `--skip-worktree` reported
+  `2 failed, 108 deselected in 6.98s`. In both cases porcelain was empty and
+  `source_tree_sha256()` changed after the hidden working edit, while
+  `git_state()` incorrectly returned `dirty=false`.
+- The first corrective GREEN was
+  `2 passed, 108 deselected in 6.20s`. Both cases prove: setting the flag
+  without changing source remains clean; hidden content and hidden deletion
+  are dirty; byte restoration returns to the exact clean hash; and clearing
+  the flag after restoration remains clean.
+- After the no-behavior readability refactor, the same group remained GREEN:
+  `2 passed, 108 deselected in 5.50s`.
+- Final focused identity suite:
+  `110 passed in 30.04s`.
+- Identity plus existing runtime/environment-lock compatibility suites:
+  `129 passed in 31.18s`.
+
+### Fix Round 2 verification
+
+- Accumulated CPU suite → exit `0`,
+  `486 passed, 1 deselected in 50.87s`.
+- Fresh real CUDA suite → exit `0`,
+  `1 passed, 486 deselected in 1.17s`; the checked-in JUnit verifier reported
+  `tests=1 failures=0 errors=0 skipped=0`.
+- Full suite → exit `0`, `487 passed in 52.39s`.
+- `D:\conda\envs\spi\python.exe -m compileall -q gsdiff scripts train.py`
+  completed silently with exit `0`.
+- Strict environment verification → exit `0`, fingerprint
+  `b5d6922a9f3a9638ee8826b9a74f00998cd3ac81aa25c03de016358e0e435a56`.
+- Strict implementation-provenance verification → exit `0`; four immutable
+  inputs verified at current commit
+  `cde16b25aa9fb98fe97fa0f0b110d555211f0707`.
+- `D:\conda\envs\spi\python.exe -m pip check` → exit `0`,
+  `No broken requirements found.`
+- Live source-aware audit returned exact commit
+  `cde16b25aa9fb98fe97fa0f0b110d555211f0707`, branch
+  `debug/admm-vs-sgd`, `dirty=true`, the required baseline, and source-tree
+  hash `10e466bd45a96deb59cefe3a64588877761371431ab1295bf58d2fcbee1faca0`
+  for `gsdiff`, `scripts`, and `train.py`.
+- `git diff --check` completed silently with exit `0`.

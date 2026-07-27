@@ -379,9 +379,9 @@ def git_state(
     (
         resolved_repo,
         head,
-        head_modes,
+        head_entries,
         index_entries,
-        _tracked_paths,
+        tracked_paths,
         scanned_files,
     ) = _collect_source_inputs(repo, source_roots)
     commit = head.decode(
@@ -406,14 +406,28 @@ def git_state(
         check=True,
         capture_output=True,
     ).stdout
-    all_tracked_paths = head_modes.keys() | index_entries.keys()
-    has_untracked_source_input = any(
-        relative not in all_tracked_paths for relative in scanned_files
+    actual_source_hash = _source_snapshot_sha256(
+        resolved_repo,
+        head,
+        head_entries,
+        index_entries,
+        tracked_paths,
+        scanned_files,
+        clean_head=False,
+    )
+    clean_source_hash = _source_snapshot_sha256(
+        resolved_repo,
+        head,
+        head_entries,
+        index_entries,
+        tracked_paths,
+        scanned_files,
+        clean_head=True,
     )
     return {
         "commit": commit,
         "branch": branch,
-        "dirty": bool(status) or has_untracked_source_input,
+        "dirty": bool(status) or actual_source_hash != clean_source_hash,
         "baseline": _GIT_BASELINE,
     }
 
@@ -455,20 +469,26 @@ def _validate_git_path(raw_path: bytes) -> str:
     return relative
 
 
-def _parse_tree_records(payload: bytes) -> dict[str, str]:
-    modes: dict[str, str] = {}
+def _parse_tree_records(payload: bytes) -> dict[str, tuple[str, str]]:
+    entries: dict[str, tuple[str, str]] = {}
     for record in payload.split(b"\0"):
         if not record:
             continue
         try:
             metadata, raw_path = record.split(b"\t", 1)
-            raw_mode, _object_type, _object_id = metadata.split(b" ", 2)
+            raw_mode, raw_object_type, raw_object_id = metadata.split(b" ", 2)
             mode = raw_mode.decode("ascii", errors="strict")
+            object_type = raw_object_type.decode("ascii", errors="strict")
+            object_id = raw_object_id.decode("ascii", errors="strict")
         except (UnicodeDecodeError, ValueError) as error:
             raise ValueError("malformed Git tree record") from error
+        if object_type not in ("blob", "commit"):
+            raise ValueError(f"unsupported Git tree object type: {object_type!r}")
         relative = _validate_git_path(raw_path)
-        modes[relative] = mode
-    return modes
+        if relative in entries:
+            raise ValueError(f"duplicate Git tree path: {relative!r}")
+        entries[relative] = (mode, object_id)
+    return entries
 
 
 def _parse_index_records(payload: bytes) -> dict[str, tuple[str, str]]:
@@ -730,13 +750,13 @@ def _collect_source_inputs(
     if _COMMIT_PATTERN.fullmatch(head_text) is None:
         raise ValueError("Git HEAD must be a full lowercase commit")
 
-    head_modes = _parse_tree_records(
+    head_entries = _parse_tree_records(
         _git_bytes(resolved_repo, "ls-tree", "-r", "-z", "HEAD")
     )
     index_entries = _parse_index_records(
         _git_bytes(resolved_repo, "ls-files", "--stage", "-z")
     )
-    all_tracked_paths = head_modes.keys() | index_entries.keys()
+    all_tracked_paths = head_entries.keys() | index_entries.keys()
     roots, root_relatives = _normalize_source_roots(
         resolved_repo, source_roots, set(all_tracked_paths)
     )
@@ -747,11 +767,12 @@ def _collect_source_inputs(
         and not _is_excluded_source_path(relative)
     }
     for relative in tracked_paths:
-        head_mode = head_modes.get(relative)
+        head_entry = head_entries.get(relative)
         index_entry = index_entries.get(relative)
-        if head_mode is not None and head_mode not in ("100644", "100755"):
+        if head_entry is not None and head_entry[0] not in ("100644", "100755"):
             raise ValueError(
-                f"non-regular Git mode {head_mode} for source path {relative!r}"
+                f"non-regular Git mode {head_entry[0]} "
+                f"for source path {relative!r}"
             )
         if index_entry is not None and index_entry[0] not in ("100644", "100755"):
             raise ValueError(
@@ -772,7 +793,7 @@ def _collect_source_inputs(
     return (
         resolved_repo,
         head,
-        head_modes,
+        head_entries,
         index_entries,
         tracked_paths,
         scanned_files,
@@ -782,14 +803,19 @@ def _collect_source_inputs(
 def _effective_executable_mode(
     path: Path,
     relative: str,
-    head_modes: Mapping[str, str],
+    head_entries: Mapping[str, tuple[str, str]],
     index_entries: Mapping[str, tuple[str, str]],
 ) -> bool:
     index_entry = index_entries.get(relative)
     if os.name == "nt":
-        return (
-            index_entry[0] if index_entry is not None else head_modes.get(relative)
-        ) == "100755"
+        head_entry = head_entries.get(relative)
+        if index_entry is not None:
+            effective_mode = index_entry[0]
+        elif head_entry is not None:
+            effective_mode = head_entry[0]
+        else:
+            effective_mode = None
+        return effective_mode == "100755"
     return bool(path.stat().st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH))
 
 
@@ -810,17 +836,21 @@ def _update_source_snapshot_frame(
     digest.update(hashlib.sha256(content).digest())
 
 
-def source_tree_sha256(repo: Path, source_roots: Sequence[Path]) -> str:
-    (
-        resolved_repo,
-        head,
-        head_modes,
-        index_entries,
-        tracked_paths,
-        scanned_files,
-    ) = _collect_source_inputs(repo, source_roots)
-    effective_paths = tracked_paths | scanned_files
-
+def _source_snapshot_sha256(
+    resolved_repo: Path,
+    head: bytes,
+    head_entries: Mapping[str, tuple[str, str]],
+    index_entries: Mapping[str, tuple[str, str]],
+    tracked_paths: set[str],
+    scanned_files: set[str],
+    *,
+    clean_head: bool,
+) -> str:
+    effective_paths = (
+        tracked_paths & head_entries.keys()
+        if clean_head
+        else tracked_paths | scanned_files
+    )
     digest = hashlib.sha256()
     digest.update(_SOURCE_TREE_MAGIC)
     digest.update(head)
@@ -831,13 +861,29 @@ def source_tree_sha256(repo: Path, source_roots: Sequence[Path]) -> str:
     ):
         raw_path = relative.encode("utf-8", errors="strict")
         path = resolved_repo.joinpath(*relative.split("/"))
+        digest.update(len(raw_path).to_bytes(8, "big"))
+        digest.update(raw_path)
+        if clean_head:
+            head_mode, object_id = head_entries[relative]
+            if object_id not in index_blob_cache:
+                index_blob_cache[object_id] = _git_bytes(
+                    resolved_repo, "cat-file", "blob", object_id
+                )
+            content = index_blob_cache[object_id]
+            executable = head_mode == "100755"
+            _update_source_snapshot_frame(
+                digest, b"P", executable, content
+            )
+            _update_source_snapshot_frame(
+                digest, b"P", executable, content
+            )
+            continue
+
         path_stat = _lstat(path)
         is_present_file = False
         if path_stat is not None:
             resolved = _resolve_inside_repo(resolved_repo, path)
             is_present_file = resolved.is_file()
-        digest.update(len(raw_path).to_bytes(8, "big"))
-        digest.update(raw_path)
         index_entry = index_entries.get(relative)
         if index_entry is not None:
             index_mode, object_id = index_entry
@@ -851,19 +897,39 @@ def source_tree_sha256(repo: Path, source_roots: Sequence[Path]) -> str:
                 index_mode == "100755",
                 index_blob_cache[object_id],
             )
-        elif relative in head_modes:
+        elif relative in head_entries:
             _update_source_snapshot_frame(digest, b"D", None, None)
         else:
             _update_source_snapshot_frame(digest, b"U", None, None)
         if is_present_file:
             content = path.read_bytes()
             executable = _effective_executable_mode(
-                path, relative, head_modes, index_entries
+                path, relative, head_entries, index_entries
             )
             _update_source_snapshot_frame(digest, b"P", executable, content)
         else:
             _update_source_snapshot_frame(digest, b"D", None, None)
     return digest.hexdigest()
+
+
+def source_tree_sha256(repo: Path, source_roots: Sequence[Path]) -> str:
+    (
+        resolved_repo,
+        head,
+        head_entries,
+        index_entries,
+        tracked_paths,
+        scanned_files,
+    ) = _collect_source_inputs(repo, source_roots)
+    return _source_snapshot_sha256(
+        resolved_repo,
+        head,
+        head_entries,
+        index_entries,
+        tracked_paths,
+        scanned_files,
+        clean_head=False,
+    )
 
 
 def collect_runtime_metadata() -> dict[str, object]:

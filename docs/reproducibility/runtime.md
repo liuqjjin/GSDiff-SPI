@@ -119,10 +119,17 @@ aggregation/promotion code must not treat diagnostic runs as locked evidence.
 `source_tree_sha256()`. It reports the full commit, symbolic branch (or null
 when detached), and evidence baseline
 `c03420784bc92b4e9b9eef8330cbd9571ebebc68`. Its dirty flag preserves
-whole-repository Git dirtiness for tracked and ordinary untracked files, and
-additionally treats ignored untracked regular inputs inside the validated
-source roots as dirty. Ignored files outside the roots and exact literal
-exclusions inside them do not independently dirty the worktree.
+whole-repository Git dirtiness for tracked and ordinary untracked files.
+Source-aware dirtiness compares the exact actual `source-tree-v1` snapshot
+against a deterministic clean-HEAD snapshot built with the same allowlist,
+path ordering, and index/working frame format. The clean snapshot contains
+only allowlisted HEAD paths and places the HEAD blob and mode in both frames.
+Therefore ignored untracked source, staged index differences, working content
+or presence differences hidden by `assume-unchanged` or `skip-worktree`, and
+POSIX executable-bit differences hidden by `core.filemode=false` are dirty.
+Setting an index flag without changing the effective source remains clean.
+Ignored files outside the roots and exact literal exclusions inside them do
+not independently dirty the worktree.
 
 ### `source-tree-v1` framing
 
