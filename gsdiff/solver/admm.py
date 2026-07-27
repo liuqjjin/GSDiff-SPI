@@ -17,6 +17,11 @@ g(z) = λ · TV(z)                          — video-domain regularization
 import torch, torch.nn.functional as F
 
 from gsdiff.prior.tv import anisotropic_tv_mean
+from gsdiff.solver.gradients import (
+    active_parameters,
+    clip_grad_groups,
+    cosine_multiplier,
+)
 
 
 def zscore(y):
@@ -78,15 +83,22 @@ class ADMMSolver:
         self.u = torch.zeros(T, 1, H, W, device=device)
 
         # Persistent optimizer (warm-start across ADMM iterations)
-        sp = list(fwd.scene.parameters())
-        mp = list(fwd.motion.parameters())
-        self.optimizer = torch.optim.Adam([
-            {"params": sp, "lr": lr_scene},
-            {"params": mp, "lr": lr_motion}])
+        self._scene_params = list(fwd.scene.parameters())
+        self._motion_params = list(fwd.motion.parameters())
+        sp = active_parameters(self._scene_params)
+        mp = active_parameters(self._motion_params)
+        groups = []
+        if sp:
+            groups.append({"params": sp, "lr": lr_scene})
+        if mp:
+            groups.append({"params": mp, "lr": lr_motion})
+        self.optimizer = torch.optim.Adam(groups)
         # CosineAnnealing over ALL steps (warmup + ADMM), matches SGD behaviour
         total_steps = n_outer * n_inner
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=total_steps, eta_min=lr_scene * 0.1)
+        self.scheduler = torch.optim.lr_scheduler.LambdaLR(
+            self.optimizer,
+            lr_lambda=lambda step: cosine_multiplier(step, total_steps),
+        )
 
     # ------------------------------------------------------------------
     def _data_loss(self, y_pred):
@@ -110,8 +122,9 @@ class ADMMSolver:
             # During warmup: skip consistency term so velocity can converge freely
             loss_c = 0.0 if in_warmup else 0.5 * self.rho * F.mse_loss(video, target_vid)
             (loss_d + loss_tv + loss_c).backward()
-            torch.nn.utils.clip_grad_norm_(
-                list(self.fwd.parameters()), 5.0)
+            clip_grad_groups(
+                [self._scene_params, self._motion_params], 5.0
+            )
             self.optimizer.step()
             self.scheduler.step()
 

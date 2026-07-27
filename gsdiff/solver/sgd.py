@@ -11,6 +11,12 @@ rendered video, backpropagated through the rendering pipeline.
 import torch, torch.nn.functional as F
 
 from gsdiff.prior.tv import anisotropic_tv_mean
+from gsdiff.solver.gradients import (
+    active_parameters,
+    clip_grad_groups,
+    cosine_multiplier,
+    freeze_parameters,
+)
 
 
 def zscore(y):
@@ -71,15 +77,22 @@ class SGDSolver:
         self.motion_warmup = motion_warmup   # steps of scene-frozen motion-only optim
         self._step = 0
         self._scene_params = list(fwd.scene.parameters())
+        self._motion_params = list(fwd.motion.parameters())
 
-        sp = list(fwd.scene.parameters())
-        mp = list(fwd.motion.parameters())
-        groups = [{"params": sp, "lr": lr_scene}]
-        if not freeze_motion:
+        if freeze_motion:
+            freeze_parameters(self._motion_params)
+        sp = active_parameters(self._scene_params)
+        mp = active_parameters(self._motion_params)
+        groups = []
+        if sp:
+            groups.append({"params": sp, "lr": lr_scene})
+        if mp:
             groups.append({"params": mp, "lr": lr_motion})
         self.optimizer = torch.optim.Adam(groups)
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=n_steps, eta_min=lr_scene * 0.1)
+        self.scheduler = torch.optim.lr_scheduler.LambdaLR(
+            self.optimizer,
+            lr_lambda=lambda step: cosine_multiplier(step, n_steps),
+        )
 
     # ------------------------------------------------------------------
     def _data_loss(self, y_pred):
@@ -111,8 +124,9 @@ class SGDSolver:
             for p in self._scene_params:
                 if p.grad is not None:
                     p.grad.zero_()
-        torch.nn.utils.clip_grad_norm_(
-            list(self.fwd.scene.parameters()) + list(self.fwd.motion.parameters()), 5.0)
+        clip_grad_groups(
+            [self._scene_params, self._motion_params], 5.0
+        )
         self.optimizer.step()
         self.scheduler.step()
         self._step += 1

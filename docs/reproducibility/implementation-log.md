@@ -510,3 +510,103 @@ This permanent append-only ledger is intentionally empty of implementation recor
   `No broken requirements found.`
 - `git diff --check` → exit `0` with silent output. All test and verifier
   output was pristine, with no warnings or unexpected skips.
+
+## Task 5 — Isolate solver parameter groups (2026-07-27)
+
+- Prior approved commit and clean starting HEAD:
+  `08e0e629d8ce6075f246a5ec405ad87d06078f1b` on
+  `debug/admm-vs-sgd`.
+- Constructor/caller inspection found no solver optimizer/scheduler
+  `state_dict` persistence or documented parameter-group index contract.
+  Training checkpoints save scene and motion module state separately. Active
+  optimizer groups therefore retain stable scene-then-motion order while
+  frozen or empty logical groups are omitted.
+- The differentiable CPU fixture uses one float64 scene scalar and one float64
+  motion scalar, exposes `.scene`, `.motion`, inherited `.parameters()`,
+  `.H`, `.W`, `render_video`, and the real solver forward signature. Its
+  prediction and video depend on both scalars, and changing the dormant motion
+  derivative scale from `1` to `1e6` leaves the initial forward value
+  unchanged.
+
+### Three-phase TDD evidence
+
+- Phase A frozen-parameter RED:
+  `D:\conda\envs\spi\python.exe -m pytest
+  tests\solver\test_sgd_parameters.py -q` → exit `1`,
+  `2 failed in 1.34s`. Frozen motion still had `requires_grad=True`, and the
+  scale-`1` versus scale-`1e6` scene updates had different bytes
+  (`185fecab749368bf` versus `cbcdc2f3637a68bf`) because the inactive motion
+  gradient entered global clipping.
+- The minimal Phase A implementation added `freeze_parameters` and
+  `active_parameters`, stored explicit scene/motion parameter lists, froze and
+  cleared motion before optimizer construction, and built SGD groups only
+  from active parameters. Identical focused GREEN → exit `0`,
+  `2 passed in 1.27s`. The final one-step scene value was
+  `-0.002999999880000003` with identical bytes `185fecab749368bf` for both
+  dormant motion derivative scales; motion had `requires_grad=False` and
+  `grad=None`.
+- Phase B group-clipping RED:
+  `D:\conda\envs\spi\python.exe -m pytest
+  tests\solver\test_sgd_parameters.py
+  tests\solver\test_gradient_groups.py -q` → exit `1`,
+  `4 failed, 5 passed in 1.20s`. `clip_grad_groups` was absent; both real SGD
+  and ADMM update paths reduced the invariant scene gradient from
+  `0.2499999964644661` to `2.4999999999946876e-06` when only the motion
+  derivative changed from `1` to `1e6`; ADMM also retained an empty motion
+  optimizer group.
+- The minimal Phase B implementation clips each nonempty active logical group
+  independently and routes both solvers through stored
+  `[scene, motion]` lists. ADMM now also constructs only nonempty active
+  optimizer groups. Focused GREEN → exit `0`, `9 passed in 1.09s`.
+  The direct helper returned pre-clip norms `[120.0, 5.0]` in original
+  nonempty-group order, clipped motion `[0,120]` to `[0,10]`, left scene
+  `[3,4]` unchanged, and ignored empty/frozen groups. Real SGD and ADMM both
+  retained scene gradient `0.2499999964644661`; the scale-`1e6` motion
+  gradient clipped independently to `-4.99999999999`. The SGD motion-warmup
+  regression also retained an exactly zero scene gradient and byte-identical
+  scene parameter.
+- Phase C LR-floor RED, before scheduler production changes: the same focused
+  two-file command → exit `1`, `11 failed, 9 passed in 1.26s`.
+  `cosine_multiplier` was absent. Both solvers used pre-step LR states
+  `[[0.009,0.15], [0.007813782463805517,0.1281648105374571],
+  [0.0049499999999999995,0.07544999999999998],
+  [0.0020862175361944825,0.022735189462542882]]` and ended after four
+  declared steps at the shared absolute floor `[0.0009,0.0009]`.
+- The minimal Phase C implementation added a capped, validated multiplicative
+  cosine helper and one shared `LambdaLR` function per optimizer. Focused
+  GREEN → exit `0`, `20 passed in 1.14s`. Both SGD (`4` steps) and ADMM
+  (`2 outer * 2 inner`) use multiplier states
+  `[1.0, 0.8681980515339464, 0.55, 0.23180194846605365, 0.1]`
+  and LR states
+  `[[0.009,0.15], [0.007813782463805517,0.13022970773009196],
+  [0.00495,0.0825], [0.0020862175361944825,0.03477029226990805],
+  [0.0009,0.015]]`. Optimizer step one uses the base LR; optimizer step four
+  uses the preceding scheduled LR, and its immediately following scheduler
+  call sets the exact per-group 10% floors with `last_epoch == 4`. No extra
+  optimizer or scheduler step is required.
+
+### Verification
+
+- Focused Task 5 suite → exit `0`, `20 passed in 1.14s`.
+- Accumulated CPU suite:
+  `D:\conda\envs\spi\python.exe -m pytest -m "not cuda" -q` → exit `0`,
+  `134 passed, 1 deselected in 18.31s`.
+- Real CUDA suite:
+  `D:\conda\envs\spi\python.exe -m pytest -m cuda -q` → exit `0`,
+  `1 passed, 134 deselected in 0.93s`; exactly one CUDA test executed and
+  zero skipped.
+- Full suite:
+  `D:\conda\envs\spi\python.exe -m pytest -q` → exit `0`,
+  `135 passed in 14.26s`.
+- Strict environment verification → exit `0`, fingerprint
+  `b5d6922a9f3a9638ee8826b9a74f00998cd3ac81aa25c03de016358e0e435a56`.
+- Strict implementation-provenance verification → exit `0`; four immutable
+  inputs verified at the pre-Task commit
+  `08e0e629d8ce6075f246a5ec405ad87d06078f1b`.
+- `D:\conda\envs\spi\python.exe -m pip check` → exit `0`,
+  `No broken requirements found.`
+- A targeted solver search found no remaining flattened/global clipping call
+  outside the single `clip_grad_groups` implementation and no
+  `CosineAnnealingLR` or `eta_min` absolute-floor path. `git diff --check` →
+  exit `0` with silent output. All test and verifier output was pristine,
+  with no warnings or unexpected skips.
