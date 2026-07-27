@@ -1,0 +1,181 @@
+schema_version: experiment-protocol-v1
+document_kind: scientific-contracts-registry
+contracts:
+  - id: gsdiff-pilot-v1
+    sha256: 0bb074dfdb8deb6b0c39aae3f780ad610316d6075b127b4a3440934c8f41abc1
+    content:
+      purpose: pilot-smoke
+      generator:
+        id: gsdiff-corrected-sim
+        version: generator-v1
+        motion_type: custom_se2
+        normalized_time: [0, 1]
+      targets:
+        tank: assets/tank.png
+        digit5: char:5
+        letterR: char:R
+        usaf: assets/usaf_tar_small.png
+        cx_camera: assets/cx_camera.png
+        cx_clutter: assets/cx_clutter.png
+        cx_coins: assets/cx_coins.png
+        cx_text: assets/cx_text.png
+      motions:
+        trans:
+          velocity: [8, 8]
+          acceleration: [0, 0]
+          omega: 0
+          beta: 0
+        rot:
+          velocity: [0, 0]
+          acceleration: [0, 0]
+          omega: 0.4
+          beta: 0
+        transrot:
+          velocity: [8, 8]
+          acceleration: [0, 0]
+          omega: 0.3
+          beta: 0
+        accel:
+          velocity: [6, 6]
+          acceleration: [3, 3]
+          omega: 0.2
+          beta: 0.1
+      acquisition:
+        pattern_family: bernoulli
+        pattern_values: [0, 1]
+        pattern_order: stratified
+        time_assignment: uniform
+        holdout_pattern_family: uniform-random
+      rng:
+        bit_generator: PCG64
+        seed_sequence: SeedSequence(entropy=seed, spawn_key=(stream_id,))
+        streams:
+          train-pattern: 0
+          train-noise: 1
+          holdout-pattern: 2
+          holdout-noise: 3
+      noise:
+        calibration_id: detector-absolute-v1
+        mode: detector-absolute
+        reference: corresponding-bernoulli-reference-cell
+        sigma_formula: sqrt(var(y_reference,ddof=0))*10**(-snr_db/20)
+        reuse: [train, holdout, alternate-pattern]
+  - id: gsdiff-sim-v1
+    sha256: 47b6b33643d3388092d785bd62b26deae27bdc62fec7f9b6d179d3f664ed3993
+    content:
+      purpose: corrected-simulation
+      generator:
+        id: gsdiff-corrected-sim
+        version: generator-v1
+        motion_type: custom_se2
+        normalized_time: [0, 1]
+      targets:
+        tank: assets/tank.png
+        digit5: char:5
+        letterR: char:R
+        usaf: assets/usaf_tar_small.png
+        cx_camera: assets/cx_camera.png
+        cx_clutter: assets/cx_clutter.png
+        cx_coins: assets/cx_coins.png
+        cx_text: assets/cx_text.png
+      motions:
+        trans:
+          velocity: [8, 8]
+          acceleration: [0, 0]
+          omega: 0
+          beta: 0
+        rot:
+          velocity: [0, 0]
+          acceleration: [0, 0]
+          omega: 0.4
+          beta: 0
+        transrot:
+          velocity: [8, 8]
+          acceleration: [0, 0]
+          omega: 0.3
+          beta: 0
+        accel:
+          velocity: [6, 6]
+          acceleration: [3, 3]
+          omega: 0.2
+          beta: 0.1
+      acquisition:
+        pattern_family: bernoulli
+        pattern_values: [0, 1]
+        pattern_order: stratified
+        time_assignment: uniform
+        holdout_pattern_family: uniform-random
+      rng:
+        bit_generator: PCG64
+        seed_sequence: SeedSequence(entropy=seed, spawn_key=(stream_id,))
+        streams:
+          train-pattern: 0
+          train-noise: 1
+          holdout-pattern: 2
+          holdout-noise: 3
+      noise:
+        calibration_id: detector-absolute-v1
+        mode: detector-absolute
+        reference: corresponding-bernoulli-reference-cell
+        sigma_formula: sqrt(var(y_reference,ddof=0))*10**(-snr_db/20)
+        reuse: [train, holdout, alternate-pattern]
+  - id: gsdiff-ablation-v1
+    sha256: 0a8a3c140032a00bdc21ff0ae99f6a36c87785a8b5b97f8f5494894e51e05fab
+    content:
+      purpose: controlled-ablation
+      generator:
+        id: gsdiff-corrected-sim
+        version: generator-v1
+        motion_type: custom_se2
+        normalized_time: [0, 1]
+      targets:
+        tank: assets/tank.png
+        digit5: char:5
+        letterR: char:R
+        usaf: assets/usaf_tar_small.png
+        cx_camera: assets/cx_camera.png
+        cx_clutter: assets/cx_clutter.png
+        cx_coins: assets/cx_coins.png
+        cx_text: assets/cx_text.png
+      motions:
+        trans:
+          velocity: [8, 8]
+          acceleration: [0, 0]
+          omega: 0
+          beta: 0
+        rot:
+          velocity: [0, 0]
+          acceleration: [0, 0]
+          omega: 0.4
+          beta: 0
+        transrot:
+          velocity: [8, 8]
+          acceleration: [0, 0]
+          omega: 0.3
+          beta: 0
+        accel:
+          velocity: [6, 6]
+          acceleration: [3, 3]
+          omega: 0.2
+          beta: 0.1
+      acquisition:
+        pattern_family: bernoulli
+        pattern_values: [0, 1]
+        pattern_order: stratified
+        time_assignment: uniform
+        holdout_pattern_family: uniform-random
+      rng:
+        bit_generator: PCG64
+        seed_sequence: SeedSequence(entropy=seed, spawn_key=(stream_id,))
+        streams:
+          train-pattern: 0
+          train-noise: 1
+          holdout-pattern: 2
+          holdout-noise: 3
+      noise:
+        calibration_id: detector-absolute-v1
+        mode: detector-absolute
+        reference: corresponding-bernoulli-reference-cell
+        sigma_formula: sqrt(var(y_reference,ddof=0))*10**(-snr_db/20)
+        reuse: [train, holdout, alternate-pattern]
+protocol_sha256: f09dc87b56fb70e8ac389015691b72cf499c891e321178cdeace13e7ee800af5

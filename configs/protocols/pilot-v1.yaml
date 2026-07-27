@@ -1,0 +1,55 @@
+schema_version: experiment-protocol-v1
+document_kind: campaign
+campaign_id: pilot-v1
+execution_ready: false
+execution_profile: pilot-smoke-v1
+method_budgets: null
+scientific_contract_id: gsdiff-pilot-v1
+scientific_contract_sha256: 0bb074dfdb8deb6b0c39aae3f780ad610316d6075b127b4a3440934c8f41abc1
+metric_version: metrics-v1
+acquisition_configs:
+  base:
+    image_size: [32, 32]
+    num_frames: 4
+    train_measurements: 128
+    holdout_measurements: 16
+    pattern_family: bernoulli
+    pattern_values: [0, 1]
+    pattern_order: stratified
+    time_assignment: uniform
+    holdout_pattern_family: uniform-random
+    snr_db: 25
+    noise_calibration_id: detector-absolute-v1
+matrix:
+  targets: [tank]
+  motions: [transrot]
+  seeds: [7]
+  methods:
+    - dgi
+    - static_cs
+    - perframe_cs
+    - tv3d
+    - monin
+    - gidc3dtv
+    - recinr
+    - siren
+    - recinr_se2
+    - gsdiff_tv
+    - gsdiff_diffusion
+  acquisition_config_ids: [base]
+  method_config_ids:
+    dgi: default
+    static_cs: default
+    perframe_cs: default
+    tv3d: default
+    monin: default
+    gidc3dtv: default
+    recinr: default
+    siren: default
+    recinr_se2: default
+    gsdiff_tv: default
+    gsdiff_diffusion: default
+expected_runs: 11
+expected_datasets: 1
+campaign_sha256: c33e4a225f9c3246f1c8a8f1813295eb497fe02c4898b0035d2f7c78831fd356
+protocol_sha256: 514555268190b5cca7366eb16be61d2cc00035e042aa17bfab7f0c71d0b1a11c

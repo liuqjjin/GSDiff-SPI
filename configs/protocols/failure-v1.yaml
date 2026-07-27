@@ -1,0 +1,98 @@
+schema_version: experiment-protocol-v1
+document_kind: campaign
+campaign_id: failure-v1
+execution_ready: false
+execution_profile: failure-budget-v1
+method_budgets: null
+scientific_contract_id: gsdiff-sim-v1
+scientific_contract_sha256: 47b6b33643d3388092d785bd62b26deae27bdc62fec7f9b6d179d3f664ed3993
+metric_version: metrics-v1
+acquisition_configs:
+  m320:
+    image_size: [64, 64]
+    num_frames: 20
+    train_measurements: 320
+    holdout_measurements: 250
+    pattern_family: bernoulli
+    pattern_values: [0, 1]
+    pattern_order: stratified
+    time_assignment: uniform
+    holdout_pattern_family: uniform-random
+    snr_db: 25
+    noise_calibration_id: detector-absolute-v1
+  m640:
+    image_size: [64, 64]
+    num_frames: 20
+    train_measurements: 640
+    holdout_measurements: 250
+    pattern_family: bernoulli
+    pattern_values: [0, 1]
+    pattern_order: stratified
+    time_assignment: uniform
+    holdout_pattern_family: uniform-random
+    snr_db: 25
+    noise_calibration_id: detector-absolute-v1
+  m1280:
+    image_size: [64, 64]
+    num_frames: 20
+    train_measurements: 1280
+    holdout_measurements: 250
+    pattern_family: bernoulli
+    pattern_values: [0, 1]
+    pattern_order: stratified
+    time_assignment: uniform
+    holdout_pattern_family: uniform-random
+    snr_db: 25
+    noise_calibration_id: detector-absolute-v1
+  m2560:
+    image_size: [64, 64]
+    num_frames: 20
+    train_measurements: 2560
+    holdout_measurements: 250
+    pattern_family: bernoulli
+    pattern_values: [0, 1]
+    pattern_order: stratified
+    time_assignment: uniform
+    holdout_pattern_family: uniform-random
+    snr_db: 25
+    noise_calibration_id: detector-absolute-v1
+  m3840:
+    image_size: [64, 64]
+    num_frames: 20
+    train_measurements: 3840
+    holdout_measurements: 250
+    pattern_family: bernoulli
+    pattern_values: [0, 1]
+    pattern_order: stratified
+    time_assignment: uniform
+    holdout_pattern_family: uniform-random
+    snr_db: 25
+    noise_calibration_id: detector-absolute-v1
+  m5120:
+    image_size: [64, 64]
+    num_frames: 20
+    train_measurements: 5120
+    holdout_measurements: 250
+    pattern_family: bernoulli
+    pattern_values: [0, 1]
+    pattern_order: stratified
+    time_assignment: uniform
+    holdout_pattern_family: uniform-random
+    snr_db: 25
+    noise_calibration_id: detector-absolute-v1
+matrix:
+  targets: [cx_coins, cx_text]
+  motions: [transrot]
+  seeds: [7, 11, 42]
+  methods: [dgi, tv3d, recinr_se2, gsdiff_tv, gsdiff_diffusion]
+  acquisition_config_ids: [m320, m640, m1280, m2560, m3840, m5120]
+  method_config_ids:
+    dgi: default
+    tv3d: default
+    recinr_se2: default
+    gsdiff_tv: default
+    gsdiff_diffusion: default
+expected_runs: 180
+expected_datasets: 36
+campaign_sha256: ea52cacdbc51b0bebef1d9673201e65bb67e4ad70c8d72b2e93430e14ad05d78
+protocol_sha256: 4742d2fca1d80d12a9e984d2ef611a991679e132d5daf3b6ae5925cae392a3e2

@@ -1,0 +1,55 @@
+schema_version: experiment-protocol-v1
+document_kind: campaign
+campaign_id: supplement-grid-v1
+execution_ready: false
+execution_profile: supplement-full-v1
+method_budgets: null
+scientific_contract_id: gsdiff-sim-v1
+scientific_contract_sha256: 47b6b33643d3388092d785bd62b26deae27bdc62fec7f9b6d179d3f664ed3993
+metric_version: metrics-v1
+acquisition_configs:
+  base:
+    image_size: [64, 64]
+    num_frames: 20
+    train_measurements: 2560
+    holdout_measurements: 250
+    pattern_family: bernoulli
+    pattern_values: [0, 1]
+    pattern_order: stratified
+    time_assignment: uniform
+    holdout_pattern_family: uniform-random
+    snr_db: 25
+    noise_calibration_id: detector-absolute-v1
+matrix:
+  targets: [tank, digit5, letterR, usaf]
+  motions: [trans, rot, transrot, accel]
+  seeds: [7, 11, 42]
+  methods:
+    - dgi
+    - static_cs
+    - perframe_cs
+    - tv3d
+    - monin
+    - gidc3dtv
+    - recinr
+    - siren
+    - recinr_se2
+    - gsdiff_tv
+    - gsdiff_diffusion
+  acquisition_config_ids: [base]
+  method_config_ids:
+    dgi: default
+    static_cs: default
+    perframe_cs: default
+    tv3d: default
+    monin: default
+    gidc3dtv: default
+    recinr: default
+    siren: default
+    recinr_se2: default
+    gsdiff_tv: default
+    gsdiff_diffusion: default
+expected_runs: 528
+expected_datasets: 48
+campaign_sha256: 90f08b5c8d2d7cd263a9264e22a13c978a632428cf5a4bba8445ff09cd454da3
+protocol_sha256: 2b21d26febf21732d982c94384c3f6ad331795f2c5c51b58a727fd83d4f57659

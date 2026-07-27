@@ -1,0 +1,69 @@
+schema_version: experiment-protocol-v1
+document_kind: campaign
+campaign_id: primary-v1
+execution_ready: false
+execution_profile: primary-full-v1
+method_budgets: null
+scientific_contract_id: gsdiff-sim-v1
+scientific_contract_sha256: 47b6b33643d3388092d785bd62b26deae27bdc62fec7f9b6d179d3f664ed3993
+metric_version: metrics-v1
+acquisition_configs:
+  base:
+    image_size: [64, 64]
+    num_frames: 20
+    train_measurements: 2560
+    holdout_measurements: 250
+    pattern_family: bernoulli
+    pattern_values: [0, 1]
+    pattern_order: stratified
+    time_assignment: uniform
+    holdout_pattern_family: uniform-random
+    snr_db: 25
+    noise_calibration_id: detector-absolute-v1
+matrix:
+  targets: [tank, digit5, usaf]
+  motions: [trans, rot, transrot]
+  seeds: [7, 11, 42, 73, 101]
+  methods:
+    - dgi
+    - static_cs
+    - perframe_cs
+    - tv3d
+    - monin
+    - gidc3dtv
+    - recinr
+    - siren
+    - recinr_se2
+    - gsdiff_tv
+    - gsdiff_diffusion
+  acquisition_config_ids: [base]
+  method_config_ids:
+    dgi: default
+    static_cs: default
+    perframe_cs: default
+    tv3d: default
+    monin: default
+    gidc3dtv: default
+    recinr: default
+    siren: default
+    recinr_se2: default
+    gsdiff_tv: default
+    gsdiff_diffusion: default
+expected_runs: 495
+expected_datasets: 45
+campaign_sha256: e9b333d29ddaaf1d3ba4042c91822f18a9e21e244ff15904c3867bab07dd7cc6
+confirmation_rule:
+  rule_id: primary-confirmation-v1
+  scientific_contract_id: gsdiff-sim-v1
+  method: gsdiff_tv
+  comparator: recinr_se2
+  metric: psnr_global_affine
+  targets: [tank, digit5, usaf]
+  motions: [trans, rot, transrot]
+  seeds: [73, 101]
+  minimum_effect_db: 0.0
+  require_each_seed_mean_delta_strictly_greater_than_minimum: true
+  require_complete_finite_pairs_per_seed: 9
+  require_method_failure_count_not_greater_than_comparator: true
+  inferential_significance_claim: false
+protocol_sha256: 0bb4e3bb916daf1a3e5e8700198da693fbd50e5a9fb443db4abc59c276e265af

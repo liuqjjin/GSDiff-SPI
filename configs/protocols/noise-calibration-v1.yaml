@@ -1,0 +1,10 @@
+schema_version: experiment-protocol-v1
+document_kind: noise-calibration-registry
+calibrations:
+  - id: detector-absolute-v1
+    mode: detector-absolute
+    reference: corresponding-bernoulli-reference-cell
+    variance_ddof: 0
+    sigma_formula: sqrt(var(y_reference,ddof=0))*10**(-snr_db/20)
+    reuse: [train, holdout, alternate-pattern]
+protocol_sha256: 694cd12708208c043b97d0f264daca2cddb86aff3e47a2928db9db617cba0663

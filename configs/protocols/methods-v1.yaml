@@ -1,0 +1,22 @@
+schema_version: experiment-protocol-v1
+document_kind: methods-registry
+methods:
+  - {id: dgi, lane: analytic}
+  - {id: static_cs, lane: static}
+  - {id: perframe_cs, lane: per-frame}
+  - {id: tv3d, lane: tv}
+  - {id: monin, lane: motion-estimation}
+  - {id: gidc3dtv, lane: deep-image-prior}
+  - {id: recinr, lane: native-baseline}
+  - {id: siren, lane: implicit-neural}
+  - {id: recinr_se2, lane: se2-inr}
+  - {id: gsdiff_tv, lane: tv}
+  - {id: gsdiff_diffusion, lane: diffusion}
+primary_method: gsdiff_tv
+secondary_diffusion_method: gsdiff_diffusion
+confirmation_pair:
+  method: gsdiff_tv
+  comparator: recinr_se2
+compatibility_aliases:
+  gsdiff_diff: gsdiff_diffusion
+protocol_sha256: 97112c9b5f21c0df9d3de6ef7c454a05cc0adc29f90402cc9f2cf7e9fa7e7d6a

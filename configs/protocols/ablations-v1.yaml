@@ -1,0 +1,127 @@
+schema_version: experiment-protocol-v1
+document_kind: ablation
+scientific_contract_id: gsdiff-ablation-v1
+scientific_contract_sha256: 0a8a3c140032a00bdc21ff0ae99f6a36c87785a8b5b97f8f5494894e51e05fab
+metric_version: metrics-v1
+execution_ready: false
+execution_profile: ablation-selection-v1
+method_budgets: null
+selection_anchors:
+  - {target: tank, motion: trans}
+  - {target: digit5, motion: rot}
+  - {target: usaf, motion: transrot}
+selection_seeds: [7, 11, 42]
+forbidden_confirmation_seeds: [73, 101]
+axes:
+  representation: [gaussian, siren, grid, recinr_se2]
+  solver: [sgd, hqs, admm]
+  prior: [tv2d, tv3d_corrected, diffusion]
+  motion_warmup_fraction: [0, 0.1, 0.2, 0.4]
+  temporal_tv_weight: [0, 0.05, 0.1, 0.3]
+  train_measurements: [640, 1280, 1920, 2560, 3840, 5120]
+  snr_db: [15, 20, 25, 30]
+  pattern: [bernoulli, gaussian, hadamard_natural, fourier]
+  motion_fit: [matched, translation_only, rotation_only]
+  gaussian_count: [250, 500, 1000, 1500]
+semantic_anchor:
+  representation: gaussian
+  solver: admm
+  prior: tv3d_corrected
+  motion_warmup_fraction: 0.2
+  temporal_tv_weight: 0.1
+  gaussian_count: 1000
+joint_shortlist:
+  - id: j1
+    representation: recinr_se2
+    solver: hqs
+    prior: diffusion
+    motion_warmup_fraction: 0.2
+    temporal_tv_weight: 0.1
+    gaussian_count: null
+    method: gsdiff_diffusion
+    method_config_id: ablation-j1-v1
+  - id: j2
+    representation: grid
+    solver: admm
+    prior: diffusion
+    motion_warmup_fraction: 0.2
+    temporal_tv_weight: 0.1
+    gaussian_count: null
+    method: gsdiff_diffusion
+    method_config_id: ablation-j2-v1
+  - id: j3
+    representation: siren
+    solver: sgd
+    prior: tv3d_corrected
+    motion_warmup_fraction: 0.1
+    temporal_tv_weight: 0.05
+    gaussian_count: null
+    method: gsdiff_tv
+    method_config_id: ablation-j3-v1
+  - id: j4
+    representation: gaussian
+    solver: hqs
+    prior: tv2d
+    motion_warmup_fraction: 0.1
+    temporal_tv_weight: 0.05
+    gaussian_count: 1500
+    method: gsdiff_tv
+    method_config_id: ablation-j4-v1
+  - id: j5
+    representation: recinr_se2
+    solver: sgd
+    prior: tv2d
+    motion_warmup_fraction: 0.4
+    temporal_tv_weight: 0.3
+    gaussian_count: null
+    method: gsdiff_tv
+    method_config_id: ablation-j5-v1
+  - id: j6
+    representation: grid
+    solver: hqs
+    prior: tv3d_corrected
+    motion_warmup_fraction: 0.4
+    temporal_tv_weight: 0.05
+    gaussian_count: null
+    method: gsdiff_tv
+    method_config_id: ablation-j6-v1
+method_config_ids:
+  j1: ablation-j1-v1
+  j2: ablation-j2-v1
+  j3: ablation-j3-v1
+  j4: ablation-j4-v1
+  j5: ablation-j5-v1
+  j6: ablation-j6-v1
+resolver:
+  hqs: {solver: admm, mode: hqs}
+  tv2d: {method: gsdiff_tv, lane: tv}
+  tv3d_corrected: {method: gsdiff_tv, lane: tv}
+  diffusion: {method: gsdiff_diffusion, lane: diffusion}
+  recinr: {method: recinr, lane: native-baseline}
+selection_rule:
+  objective: heldout_normalized_l2
+  objective_formula: "l2(pred-y)/max(l2(y),1e-12)"
+  aggregation: unweighted_mean_over_3_anchors_x_3_seeds
+  required_complete_cells: 9
+  residual_tie_relative_tolerance: 0.005
+  convergence:
+    required_history_samples: 21
+    final_window_samples: 3
+    minimum_relative_improvement_from_initial: 0.01
+    maximum_final_window_to_best_ratio: 1.05
+    require_all_finite: true
+  compute_cap:
+    wall_time_seconds_per_run: 1800
+    peak_vram_bytes: 15032385536
+    on_exceed: ineligible-retain-artifacts
+  tie_break_order: [median_runtime_seconds, peak_vram_bytes, config_id]
+workflow_counts:
+  one_factor_unique_configurations: 17
+  joint_shortlist_configurations: 6
+  decision_cells: 207
+  post_freeze_replay_cells: 207
+  stress_configurations: 14
+  stress_cells: 126
+  publication_commit_cells: 333
+  total_before_retries: 540
+protocol_sha256: 3552a0314e2f99dda88e568699f8c5299fd88e4322b035a9f7918780af1ed847
