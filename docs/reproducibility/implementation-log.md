@@ -105,3 +105,98 @@ This permanent append-only ledger is intentionally empty of implementation recor
 - Test output was pristine: no warnings, unexpected skips, or hidden noise.
 - After staging exactly the Task 1 scope, both `git diff --check` and
   `git diff --cached --check` → exit `0` with silent output.
+
+## Task 1 Fix Round 1 — Harden reproducibility verifiers (2026-07-27)
+
+- Fix base and clean starting HEAD:
+  `d82362257824ae8f6f6f0664a203820f1c2843c9`; Task 0 and the original Task 1
+  commit were not amended or rewritten.
+- Scope: close coordinated-substitution gaps in strict implementation
+  provenance; make JUnit inspection namespace- and nested-suite-safe; use
+  integer nanosecond freshness with conservative exact-boundary rejection.
+- `implementation-provenance.json`, the four immutable documents, and
+  `environment-lock.json` were not edited. The environment fingerprint remains
+  `b5d6922a9f3a9638ee8826b9a74f00998cd3ac81aa25c03de016358e0e435a56`.
+
+### Provenance RED/GREEN
+
+- Added coordinated immutable-path/hash substitution; exact legacy, design,
+  start, and plan commit substitution; missing/forged `in_place`,
+  linked-worktree, and submodule facts; and controlled temporary-Git-history
+  cases for both Task-0 direct parents and terminal-to-current ancestry.
+- Initial command:
+  `D:\conda\envs\spi\python.exe -m pytest
+  tests/reproducibility/test_implementation_provenance.py -q` → exit `1`,
+  `14 failed, 8 passed in 11.43s`. One coordinated-path fixture initially used
+  a file absent from the selected baseline tree and therefore failed for the
+  wrong setup reason; it was replaced with four tracked files before
+  production hardening. Its isolated rerun then failed correctly because the
+  old verifier accepted the coordinated substitution.
+- Root cause: every purported anchor came from the untrusted provenance JSON;
+  the verifier checked only internal consistency and broad ancestry.
+- Minimal hardening anchors the exact four paths/hashes, exact legacy/design/
+  start/plan commits, first Task-0 commit and parent, Task-0 terminal commit and
+  parent, terminal-to-current ancestry, `in_place` decision, recorded normal
+  checkout facts, actual non-linked/non-submodule state, and the recorded
+  worktree path/head/branch relationship.
+- Focused GREEN, same file command → exit `0`,
+  `22 passed in 9.74s`. The real immutable provenance passed; no genuine
+  recorded-state mismatch was exposed.
+
+### JUnit RED/GREEN
+
+- Added fully namespaced passing XML; namespace-qualified failure, error, and
+  skip fail-open cases; nested child-suite and aggregate declaration cases;
+  and exact/±1 nanosecond freshness boundaries.
+- RED command:
+  `D:\conda\envs\spi\python.exe -m pytest
+  tests/reproducibility/test_pytest_junit_verifier.py -q` → exit `1`,
+  `9 failed, 11 passed in 0.23s`.
+- Root cause: raw qualified tags were compared to unqualified literals,
+  declarations were checked only at a flat aggregate level, and floating-point
+  `st_mtime` was converted through microsecond `datetime`.
+- Minimal hardening compares XML local names, counts outcome-bearing testcases,
+  validates every suite recursively plus any aggregate root against its own
+  descendant testcase reality, parses 1–9 fractional UTC digits to integer
+  epoch nanoseconds, compares against `st_mtime_ns`, and requires
+  `mtime_ns > created_after_utc_ns`.
+- Focused GREEN, same file command → exit `0`,
+  `20 passed in 0.19s`.
+- Combined strict-verifier unit suites:
+  `D:\conda\envs\spi\python.exe -m pytest
+  tests/reproducibility/test_implementation_provenance.py
+  tests/reproducibility/test_pytest_junit_verifier.py -q` → exit `0`,
+  `42 passed in 9.91s`.
+
+### Fix Round 1 verification
+
+- `D:\conda\envs\spi\python.exe -m pytest -m "not cuda" -q` → exit `0`,
+  `61 passed, 1 deselected in 10.78s`.
+- `D:\conda\envs\spi\python.exe -m pytest -m cuda -q` → exit `0`,
+  `1 passed, 61 deselected in 0.48s`; one CUDA test executed and zero skipped.
+- `D:\conda\envs\spi\python.exe
+  scripts\reproducibility\verify_environment_lock.py --strict` → exit `0`,
+  strict verification passed with unchanged fingerprint
+  `b5d6922a9f3a9638ee8826b9a74f00998cd3ac81aa25c03de016358e0e435a56`.
+- `D:\conda\envs\spi\python.exe
+  scripts\reproducibility\verify_implementation_provenance.py --strict` →
+  exit `0`; all four exact immutable inputs and exact Task-0/Git/worktree
+  relationships verified at current commit
+  `d82362257824ae8f6f6f0664a203820f1c2843c9`.
+- Fresh JUnit boundary:
+  `2026-07-27T04:49:26.969501800Z`.
+  `D:\conda\envs\spi\python.exe -m pytest -q
+  --junitxml=.superpowers\sdd\2026-07-27-gsdiff-correctness-reproducibility\task-1-fix-round-1-junit.xml`
+  → exit `0`, `62 passed in 11.11s`.
+- `D:\conda\envs\spi\python.exe
+  scripts\reproducibility\verify_pytest_junit.py
+  .superpowers\sdd\2026-07-27-gsdiff-correctness-reproducibility\task-1-fix-round-1-junit.xml
+  --created-after-utc 2026-07-27T04:49:26.969501800Z` → exit `0`,
+  `tests=62 failures=0 errors=0 skipped=0`.
+- `D:\conda\envs\spi\python.exe -m pip check` → exit `0`,
+  `No broken requirements found.`
+- `git diff --check` → exit `0` with silent output. Test and verifier output
+  was pristine: no warnings, unexpected skips, or hidden noise.
+- After staging exactly the five Fix Round 1 files, both
+  `git diff --cached --check` and `git diff --check` → exit `0` with silent
+  output.

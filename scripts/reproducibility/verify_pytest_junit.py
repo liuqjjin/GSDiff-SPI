@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 from pathlib import Path
+import re
 import sys
 from typing import Sequence
 import xml.etree.ElementTree as ElementTree
@@ -12,19 +13,59 @@ class JUnitVerificationError(RuntimeError):
     pass
 
 
-def parse_utc(value: str) -> datetime:
-    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+_UTC_PATTERN = re.compile(
+    r"^(?P<date>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})"
+    r"(?:\.(?P<fraction>\d{1,9}))?"
+    r"(?P<zone>Z|[+-]\d{2}:\d{2})$"
+)
+_NANOSECONDS_PER_SECOND = 1_000_000_000
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def parse_utc(value: str) -> int:
+    match = _UTC_PATTERN.fullmatch(value)
+    if match is None:
+        raise argparse.ArgumentTypeError(
+            "--created-after-utc must be an ISO-8601 timestamp with up to "
+            "nine fractional digits"
+        )
+    zone = "+00:00" if match.group("zone") == "Z" else match.group("zone")
     try:
-        parsed = datetime.fromisoformat(normalized)
+        parsed = datetime.fromisoformat(match.group("date") + zone)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(
             "--created-after-utc must be an ISO-8601 timestamp"
         ) from exc
-    if parsed.tzinfo is None:
-        raise argparse.ArgumentTypeError(
-            "--created-after-utc must include a UTC offset or Z"
+    delta = parsed.astimezone(timezone.utc) - _EPOCH
+    whole_seconds = delta.days * 86_400 + delta.seconds
+    fraction_ns = int((match.group("fraction") or "").ljust(9, "0"))
+    return whole_seconds * _NANOSECONDS_PER_SECOND + fraction_ns
+
+
+def _boundary_nanoseconds(value: datetime | int) -> int:
+    if isinstance(value, bool):
+        raise JUnitVerificationError(
+            "created_after_utc must be a timezone-aware datetime or integer nanoseconds"
         )
-    return parsed.astimezone(timezone.utc)
+    if isinstance(value, int):
+        return value
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        raise JUnitVerificationError("created_after_utc must be timezone-aware")
+    delta = value.astimezone(timezone.utc) - _EPOCH
+    return (
+        (delta.days * 86_400 + delta.seconds) * _NANOSECONDS_PER_SECOND
+        + delta.microseconds * 1_000
+    )
+
+
+def _format_utc_nanoseconds(value: int) -> str:
+    seconds, nanoseconds = divmod(value, _NANOSECONDS_PER_SECOND)
+    whole = datetime.fromtimestamp(seconds, timezone.utc)
+    return whole.strftime("%Y-%m-%dT%H:%M:%S") + f".{nanoseconds:09d}Z"
+
+
+def _local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
 
 
 def _declared_count(element: ElementTree.Element, name: str) -> int | None:
@@ -42,72 +83,93 @@ def _declared_count(element: ElementTree.Element, name: str) -> int | None:
     return value
 
 
+def _observed_counts(testcases: list[ElementTree.Element]) -> dict[str, int]:
+    def has_outcome(testcase: ElementTree.Element, outcome: str) -> bool:
+        return any(
+            element is not testcase and _local_name(element.tag) == outcome
+            for element in testcase.iter()
+        )
+
+    return {
+        "errors": sum(has_outcome(case, "error") for case in testcases),
+        "failures": sum(has_outcome(case, "failure") for case in testcases),
+        "skipped": sum(has_outcome(case, "skipped") for case in testcases),
+        "tests": len(testcases),
+    }
+
+
+def _descendant_testcases(element: ElementTree.Element) -> list[ElementTree.Element]:
+    return [
+        descendant
+        for descendant in element.iter()
+        if _local_name(descendant.tag) == "testcase"
+    ]
+
+
+def _validate_declared_counts(
+    element: ElementTree.Element, observed: dict[str, int]
+) -> None:
+    label = element.get("name") or _local_name(element.tag)
+    for name, observed_value in observed.items():
+        declared = _declared_count(element, name)
+        if declared is not None and declared != observed_value:
+            raise JUnitVerificationError(
+                f"JUnit {label!r} {name} count mismatch: "
+                f"declared {declared}, observed {observed_value}"
+            )
+
+
 def verify_pytest_junit(
     report_path: Path | str,
     *,
-    created_after_utc: datetime,
+    created_after_utc: datetime | int,
     max_skips: int = 0,
 ) -> dict[str, int]:
     path = Path(report_path)
     if not path.is_file():
         raise JUnitVerificationError(f"JUnit report does not exist: {path}")
-    if created_after_utc.tzinfo is None:
-        raise JUnitVerificationError("created_after_utc must be timezone-aware")
     if max_skips < 0:
         raise JUnitVerificationError("max_skips must be non-negative")
-    modified = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
-    boundary = created_after_utc.astimezone(timezone.utc)
-    if modified < boundary:
+    modified_ns = path.stat().st_mtime_ns
+    boundary_ns = _boundary_nanoseconds(created_after_utc)
+    if modified_ns <= boundary_ns:
         raise JUnitVerificationError(
-            f"JUnit report is stale: modified {modified.isoformat()} "
-            f"before {boundary.isoformat()}"
+            f"JUnit report is stale: modified {_format_utc_nanoseconds(modified_ns)} "
+            f"is not after {_format_utc_nanoseconds(boundary_ns)}"
         )
 
     try:
         root = ElementTree.parse(path).getroot()
     except (OSError, ElementTree.ParseError) as exc:
         raise JUnitVerificationError(f"JUnit report is not valid XML: {path}") from exc
-    if root.tag not in {"testsuite", "testsuites"}:
+    root_name = _local_name(root.tag)
+    if root_name not in {"testsuite", "testsuites"}:
         raise JUnitVerificationError(f"unexpected JUnit root element: {root.tag}")
 
-    testcases = root.findall(".//testcase")
-    tests = len(testcases)
-    failures = sum(len(case.findall("./failure")) for case in testcases)
-    errors = sum(len(case.findall("./error")) for case in testcases)
-    skipped = sum(len(case.findall("./skipped")) for case in testcases)
-    observed = {
-        "errors": errors,
-        "failures": failures,
-        "skipped": skipped,
-        "tests": tests,
-    }
+    observed = _observed_counts(_descendant_testcases(root))
+    if root_name == "testsuites":
+        _validate_declared_counts(root, observed)
+    for suite in (
+        element for element in root.iter() if _local_name(element.tag) == "testsuite"
+    ):
+        _validate_declared_counts(
+            suite, _observed_counts(_descendant_testcases(suite))
+        )
 
-    declared_source = root
-    if root.tag == "testsuites" and not any(root.get(name) for name in observed):
-        suites = root.findall("./testsuite")
-        declared = {
-            name: sum(_declared_count(suite, name) or 0 for suite in suites)
-            for name in observed
-        }
-    else:
-        declared = {
-            name: _declared_count(declared_source, name) for name in observed
-        }
-    for name, value in declared.items():
-        if value is not None and value != observed[name]:
-            raise JUnitVerificationError(
-                f"JUnit {name} count mismatch: declared {value}, observed {observed[name]}"
-            )
-
-    if tests == 0:
+    if observed["tests"] == 0:
         raise JUnitVerificationError("JUnit report contains zero tests")
-    if failures:
-        raise JUnitVerificationError(f"JUnit report contains {failures} failure(s)")
-    if errors:
-        raise JUnitVerificationError(f"JUnit report contains {errors} error(s)")
-    if skipped > max_skips:
+    if observed["failures"]:
         raise JUnitVerificationError(
-            f"JUnit report contains {skipped} skipped test(s), maximum is {max_skips}"
+            f"JUnit report contains {observed['failures']} failure(s)"
+        )
+    if observed["errors"]:
+        raise JUnitVerificationError(
+            f"JUnit report contains {observed['errors']} error(s)"
+        )
+    if observed["skipped"] > max_skips:
+        raise JUnitVerificationError(
+            f"JUnit report contains {observed['skipped']} skipped test(s), "
+            f"maximum is {max_skips}"
         )
     return observed
 
