@@ -149,24 +149,12 @@ def build_scene(kind="siren", **kw):
 class INRForwardModel(SPIForwardModel):
     """Same interface as SPIForwardModel; render_video uses the inverse SE(2) warp."""
 
-    def _pixel_grid(self, dev):
-        gy, gx = torch.meshgrid(torch.arange(self.H, device=dev, dtype=torch.float32),
-                                torch.arange(self.W, device=dev, dtype=torch.float32),
-                                indexing="ij")
-        return torch.stack([gy.reshape(-1), gx.reshape(-1)], -1)     # [N,2] (y,x)
-
     def render_video(self, t_grid):
-        dev = t_grid.device
         c = self.motion.center                                       # [2]
-        A_t = self.motion._A(t_grid)                                 # [T,2,2]
-        d_t = self.motion._displacement(t_grid)                     # [T,2]
-        A_inv = torch.linalg.inv(A_t)                                # [T,2,2]
-        U = self._pixel_grid(dev)                                    # [N,2]
-        rel = U.unsqueeze(0) - c - d_t.unsqueeze(1)                  # [T,N,2]
-        mu = torch.einsum("tij,tnj->tni", A_inv, rel) + c            # [T,N,2]
+        mu = self._inverse_warp_grid(t_grid)                          # [T,N,2]
         x_norm = normalize_pixel_coordinates(mu, c, self.H, self.W)  # [-1,1], (y,x)
         T = t_grid.shape[0]
-        inside = (x_norm.abs() <= 1.0).all(dim=-1).view(T, self.H, self.W)
+        inside = self._source_fov_mask(mu).view(T, self.H, self.W)
         queried = self.scene.query(x_norm.reshape(-1, 2)).view(T, self.H, self.W)
         inten = queried * inside.to(queried.dtype)
         return inten.unsqueeze(1)                                    # [T,1,H,W]
@@ -174,4 +162,8 @@ class INRForwardModel(SPIForwardModel):
     def norm_grid(self, dev):
         """Identity-warp normalized grid for DGI pre-fit."""
         return normalize_pixel_coordinates(
-            self._pixel_grid(dev), self.motion.center, self.H, self.W)
+            self._pixel_grid(dev, self.motion.center.dtype),
+            self.motion.center,
+            self.H,
+            self.W,
+        )

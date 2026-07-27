@@ -21,14 +21,12 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 from gsdiff.data import (
     ReconstructionOutput,
+    dgi_reconstruct,
     generate_spi_data,
     load_acquisition_data,
-    load_evaluation_truth,
     method_execution_policy,
     write_method_child_outputs,
 )
-from gsdiff.baselines import cs, monin, gidc, recinr, tv3d
-from gsdiff.baselines.common import dgi_image, evaluate_video
 
 ALL = ["dgi", "static_cs", "perframe_cs", "tv3d", "monin", "gidc3dtv", "recinr"]
 
@@ -117,6 +115,8 @@ def main(argv=None):
         )
         data = acquisition
         if truth_path is not None:
+            from gsdiff.data import load_evaluation_truth
+
             truth = load_evaluation_truth(
                 truth_path,
                 expected_dataset_identity_sha256=(
@@ -137,12 +137,17 @@ def main(argv=None):
         raise ValueError(
             "blind run_baselines currently supports one dgi method child"
         )
+    if not blind_method_child:
+        from gsdiff.baselines import cs, gidc, monin, recinr, tv3d
+        from gsdiff.baselines.common import dgi_image
 
     def record(name, recon, info=None):
         nonlocal raw_result
         if blind_method_child:
             raw_result = (name, np.asarray(recon), info or {})
             return
+        from gsdiff.baselines.common import evaluate_video
+
         psnrs, mean_p = evaluate_video(data.gt_frames, recon)
         row = {"mean_psnr": mean_p, "per_frame_psnr": psnrs}
         if info:
@@ -156,7 +161,13 @@ def main(argv=None):
 
     t0 = time.time()
     if "dgi" in args.baselines:
-        dgi = dgi_image(data.patterns, data.measurements).cpu().numpy()
+        if blind_method_child:
+            dgi = np.asarray(
+                dgi_reconstruct(data.patterns, data.measurements),
+                dtype=np.float32,
+            )
+        else:
+            dgi = dgi_image(data.patterns, data.measurements).cpu().numpy()
         record("dgi", np.repeat(dgi[None], data.T, 0))
     if "static_cs" in args.baselines:
         recon, info = cs.static_tvcs(data, device=dev); record("static_cs", recon, info)

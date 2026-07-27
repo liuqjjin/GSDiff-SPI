@@ -18,9 +18,9 @@ import torch, torch.nn.functional as F
 
 from gsdiff.prior.tv import anisotropic_tv_mean
 from gsdiff.solver.gradients import (
+    _consumed_cosine_multiplier,
     active_parameters,
     clip_grad_groups,
-    cosine_multiplier,
 )
 
 
@@ -97,7 +97,9 @@ class ADMMSolver:
         total_steps = n_outer * n_inner
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(
             self.optimizer,
-            lr_lambda=lambda step: cosine_multiplier(step, total_steps),
+            lr_lambda=lambda step: _consumed_cosine_multiplier(
+                step, total_steps
+            ),
         )
 
     # ------------------------------------------------------------------

@@ -15,9 +15,16 @@ Conventions (verified against the baseline specs, 2026-07):
 import numpy as np
 import torch
 
-from ..evaluation.metrics import evaluate_video_legacy_per_frame
 from ..prior.tv import TVPrior
 from ..data.dgi import dgi_reconstruct
+
+
+def __getattr__(name):
+    if name != "evaluate_video":
+        raise AttributeError(name)
+    from ._evaluation import evaluate_video
+
+    return evaluate_video
 
 
 # ── Linear forward operator ──────────────────────────────────
@@ -101,18 +108,6 @@ def dgi_image(patterns, measurements):
     return torch.as_tensor(dgi_reconstruct(pat, y), dtype=torch.float32)
 
 
-# ── Comparison-neutral evaluation (identical to train.evaluate) ──
-def evaluate_video(gt_frames, recon):
-    """Compatibility adapter for legacy per-frame min-max PSNR."""
-    gt = gt_frames.cpu().numpy() if torch.is_tensor(gt_frames) else np.asarray(gt_frames)
-    rc = recon.cpu().numpy() if torch.is_tensor(recon) else np.asarray(recon)
-    result = evaluate_video_legacy_per_frame(gt, rc)
-    return (
-        result["per_frame_psnr_legacy_per_frame_minmax"],
-        result["psnr_legacy_per_frame_minmax"],
-    )
-
-
 # ── GT-free hyperparameter selection ─────────────────────────
 def _zscore_np(a):
     a = np.asarray(a, dtype=np.float64)
@@ -144,7 +139,12 @@ def select_by_holdout(candidates, run_fn, eval_patterns, eval_measurements,
     for c in candidates:
         recon = run_fn(c)
         res = holdout_residual(recon, eval_patterns, eval_measurements, eval_frame_idx)
-        psnr = evaluate_video(gt_frames, recon)[1] if gt_frames is not None else None
+        if gt_frames is None:
+            psnr = None
+        else:
+            from ._evaluation import evaluate_video
+
+            psnr = evaluate_video(gt_frames, recon)[1]
         table.append((c, res, psnr))
         if res < best_res:
             best, best_recon, best_res = c, recon, res

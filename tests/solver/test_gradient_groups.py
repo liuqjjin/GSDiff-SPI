@@ -152,6 +152,7 @@ def test_admm_omits_empty_logical_groups_without_reordering(
         dummy_admm_inputs,
         lr_scene=0.009,
         lr_motion=0.15,
+        n_outer=2,
     )
     empty_motion = _DifferentiableForward()
     empty_motion.motion = nn.Module()
@@ -160,6 +161,7 @@ def test_admm_omits_empty_logical_groups_without_reordering(
         fwd=empty_motion,
         lr_scene=0.009,
         lr_motion=0.15,
+        n_outer=2,
     )
 
     assert [group["lr"] for group in joint.optimizer.param_groups] == [
@@ -214,9 +216,8 @@ def test_admm_parameter_groups_follow_exact_four_step_lr_schedule(
     )
     expected = [
         [0.009, 0.15],
-        [0.007813782463805517, 0.13022970773009196],
-        [0.00495, 0.0825],
-        [0.0020862175361944825, 0.03477029226990805],
+        [0.006975, 0.11625],
+        [0.002925, 0.04875],
         [0.0009, 0.015],
     ]
     used_lrs = []
@@ -232,7 +233,39 @@ def test_admm_parameter_groups_follow_exact_four_step_lr_schedule(
         handle.remove()
 
     final_lrs = [group["lr"] for group in solver.optimizer.param_groups]
-    for actual, wanted in zip(used_lrs, expected[:-1], strict=True):
+    assert len(used_lrs) == len(expected)
+    for actual, wanted in zip(used_lrs, expected, strict=True):
         assert actual == pytest.approx(wanted)
     assert final_lrs == pytest.approx(expected[-1])
     assert solver.scheduler.last_epoch == 4
+
+
+def test_admm_single_update_consumes_final_lr_ratio(
+    dummy_admm_inputs,
+):
+    solver = make_admm_solver(
+        dummy_admm_inputs,
+        lr_scene=0.009,
+        lr_motion=0.15,
+        n_inner=1,
+        n_outer=1,
+        n_warmup=1,
+    )
+    used_lrs = []
+
+    def capture_lrs(optimizer, args, kwargs):
+        used_lrs.append([group["lr"] for group in optimizer.param_groups])
+
+    handle = solver.optimizer.register_step_pre_hook(capture_lrs)
+    try:
+        solver.step()
+    finally:
+        handle.remove()
+
+    assert len(used_lrs) == 1
+    assert used_lrs[0] == pytest.approx([0.0009, 0.015])
+    assert solver.scheduler.base_lrs == pytest.approx([0.009, 0.15])
+    assert [group["lr"] for group in solver.optimizer.param_groups] == (
+        pytest.approx([0.0009, 0.015])
+    )
+    assert solver.scheduler.last_epoch == 1

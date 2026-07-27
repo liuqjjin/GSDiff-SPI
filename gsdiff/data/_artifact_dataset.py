@@ -17,12 +17,12 @@ from ._artifact_identity import (
     validate_array_descriptor,
     validate_exact_keys,
     validate_exact_int,
-    validate_finite_number,
     validate_generation_config,
     validate_index_array,
     validate_real_finite_array,
     validate_sha256,
     validate_time_grid,
+    validate_path_free_opaque_id,
 )
 from ._artifact_io import (
     METADATA_MEMBER,
@@ -35,7 +35,6 @@ from ._artifact_models import EvaluationTruth, SPIAcquisitionData
 
 
 ACQUISITION_SCHEMA = "measurements-v1"
-TRUTH_SCHEMA = "evaluation-truth-v1"
 
 
 def _acquisition_arrays(
@@ -123,12 +122,9 @@ def _validate_acquisition_shapes(data: SPIAcquisitionData) -> None:
 def _validate_acquisition_identity(data: SPIAcquisitionData) -> None:
     validate_sha256(data.dataset_identity_sha256, "dataset identity")
     validate_sha256(data.target_asset_sha256, "target asset hash")
-    if type(data.generator_code_version) is not str or not (
-        data.generator_code_version.strip()
-    ):
-        raise ArtifactValidationError(
-            "generator_code_version must be a non-empty string"
-        )
+    validate_path_free_opaque_id(
+        data.generator_code_version, "generator_code_version"
+    )
     validate_exact_int(data.seed, "seed")
     for name in (
         "pattern_family",
@@ -250,10 +246,9 @@ def split_spi_data(
 ) -> tuple[SPIAcquisitionData, EvaluationTruth]:
     config = validate_generation_config(resolved_generation_config)
     validate_sha256(target_asset_sha256, "target asset hash")
-    if type(generator_code_version) is not str or not generator_code_version.strip():
-        raise ArtifactValidationError(
-            "generator_code_version must be a non-empty string"
-        )
+    validate_path_free_opaque_id(
+        generator_code_version, "generator_code_version"
+    )
     source_dimensions = []
     for name in ("H", "W", "T", "K"):
         value = getattr(data, name)
@@ -411,6 +406,8 @@ def split_spi_data(
         evaluator_metadata={},
     )
     _validate_acquisition_identity(acquisition)
+    from ._artifact_truth import _validate_truth
+
     _validate_truth(truth)
     return acquisition, truth
 
@@ -568,187 +565,4 @@ def load_acquisition_data(
         motion_parameters=metadata["motion_parameters"],
     )
     _validate_acquisition_identity(data)
-    return data
-
-
-_TRUTH_ARRAY_NAMES = {
-    "canonical_image",
-    "gt_frames",
-    "translation_trajectory",
-    "rotation_trajectory",
-    "gt_velocity",
-    "gt_acceleration",
-}
-_TRUTH_METADATA_KEYS = {
-    "array_descriptors",
-    "dataset_identity_sha256",
-    "dataset_identity_spec",
-    "dimensions",
-    "evaluator_metadata",
-    "gt_beta",
-    "gt_omega",
-    "motion_model",
-    "schema",
-}
-
-
-def _truth_arrays(data: EvaluationTruth) -> Mapping[str, np.ndarray]:
-    return {name: getattr(data, name) for name in _TRUTH_ARRAY_NAMES}
-
-
-def _validate_truth(data: EvaluationTruth) -> None:
-    validate_sha256(data.dataset_identity_sha256, "dataset identity")
-    expected_identity = sha256_bytes(canonical_json_bytes(data.dataset_identity_spec))
-    if data.dataset_identity_sha256 != expected_identity:
-        raise ArtifactValidationError("dataset identity mismatch")
-    config = validate_acquisition_identity_spec(data.dataset_identity_spec)
-    for name in ("H", "W", "T"):
-        validate_exact_int(getattr(data, name), f"truth {name}", minimum=1)
-    if (data.H, data.W, data.T) != (
-        config["H"],
-        config["W"],
-        config["T"],
-    ):
-        raise ArtifactValidationError(
-            "truth dimensions disagree with dataset identity"
-        )
-    expected_shapes = {
-        "canonical_image": (data.H, data.W),
-        "gt_frames": (data.T, data.H, data.W),
-        "translation_trajectory": (data.T, 2),
-        "rotation_trajectory": (data.T,),
-        "gt_velocity": (2,),
-        "gt_acceleration": (2,),
-    }
-    for name, shape in expected_shapes.items():
-        array = getattr(data, name)
-        if array.shape != shape:
-            raise ArtifactValidationError(
-                f"{name} shape must be {shape}, got {array.shape}"
-            )
-        validate_real_finite_array(array, name, shape=shape)
-
-    motion = config["motion"]
-    motion_parameters = motion["parameters"]
-    if data.motion_model != motion["model"]:
-        raise ArtifactValidationError(
-            "truth motion model disagrees with dataset identity"
-        )
-    gt_omega = validate_finite_number(data.gt_omega, "truth gt_omega")
-    gt_beta = validate_finite_number(data.gt_beta, "truth gt_beta")
-    if (
-        gt_omega != motion_parameters["omega"]
-        or gt_beta != motion_parameters["beta"]
-    ):
-        raise ArtifactValidationError(
-            "truth angular motion disagrees with dataset identity"
-        )
-    expected_velocity = np.asarray(
-        motion_parameters["velocity"], dtype=data.gt_velocity.dtype
-    )
-    expected_acceleration = np.asarray(
-        motion_parameters["acceleration"], dtype=data.gt_acceleration.dtype
-    )
-    if not np.array_equal(data.gt_velocity, expected_velocity) or not (
-        np.array_equal(data.gt_acceleration, expected_acceleration)
-    ):
-        raise ArtifactValidationError(
-            "truth linear motion disagrees with dataset identity"
-        )
-    time_grid = np.linspace(0.0, 1.0, data.T).astype(np.float32).astype(
-        np.float64
-    )
-    expected_translation = (
-        time_grid[:, None]
-        * np.asarray(motion_parameters["velocity"], dtype=np.float64)
-        + time_grid[:, None] ** 2
-        * np.asarray(motion_parameters["acceleration"], dtype=np.float64)
-    ).astype(data.translation_trajectory.dtype)
-    expected_rotation = (
-        time_grid * float(motion_parameters["omega"])
-        + time_grid**2 * float(motion_parameters["beta"])
-    ).astype(data.rotation_trajectory.dtype)
-    if not np.array_equal(
-        data.translation_trajectory, expected_translation
-    ) or not np.array_equal(data.rotation_trajectory, expected_rotation):
-        raise ArtifactValidationError(
-            "truth trajectories disagree with dataset identity"
-        )
-
-
-def save_evaluation_truth(data: EvaluationTruth, path: Path) -> str:
-    _validate_truth(data)
-    arrays = _truth_arrays(data)
-    metadata = {
-        "schema": TRUTH_SCHEMA,
-        "dataset_identity_sha256": data.dataset_identity_sha256,
-        "dataset_identity_spec": data.dataset_identity_spec,
-        "dimensions": {"H": data.H, "W": data.W, "T": data.T},
-        "gt_omega": data.gt_omega,
-        "gt_beta": data.gt_beta,
-        "motion_model": data.motion_model,
-        "evaluator_metadata": data.evaluator_metadata,
-        "array_descriptors": {
-            name: array_descriptor(array) for name, array in arrays.items()
-        },
-    }
-    return write_npz(Path(path), arrays=arrays, metadata=metadata)
-
-
-def load_evaluation_truth(
-    path: Path,
-    *,
-    expected_dataset_identity_sha256: str,
-) -> EvaluationTruth:
-    validate_sha256(
-        expected_dataset_identity_sha256, "expected dataset identity"
-    )
-    members = read_npz_members(Path(path))
-    metadata = decode_metadata(members)
-    validate_exact_keys(metadata, _TRUTH_METADATA_KEYS, "truth metadata")
-    if metadata["schema"] != TRUTH_SCHEMA:
-        raise ArtifactValidationError("truth schema mismatch")
-    if metadata["dataset_identity_sha256"] != expected_dataset_identity_sha256:
-        raise ArtifactValidationError("truth dataset identity mismatch")
-    expected_members = {METADATA_MEMBER} | {
-        f"{name}.npy" for name in _TRUTH_ARRAY_NAMES
-    }
-    if set(members) != expected_members:
-        raise ArtifactValidationError("missing or extra truth ZIP member")
-    arrays = {
-        name: load_array_member(members, name)
-        for name in _TRUTH_ARRAY_NAMES
-    }
-    descriptors = metadata["array_descriptors"]
-    if not isinstance(descriptors, Mapping):
-        raise ArtifactValidationError("array_descriptors must be an object")
-    validate_exact_keys(descriptors, _TRUTH_ARRAY_NAMES, "truth descriptors")
-    for name, array in arrays.items():
-        validate_array_descriptor(name, array, descriptors[name])
-    dimensions = metadata["dimensions"]
-    if not isinstance(dimensions, Mapping):
-        raise ArtifactValidationError("dimensions must be an object")
-    validate_exact_keys(dimensions, {"H", "W", "T"}, "truth dimensions")
-    for name in ("H", "W", "T"):
-        validate_exact_int(dimensions[name], f"truth dimensions.{name}", minimum=1)
-    validate_finite_number(metadata["gt_omega"], "truth gt_omega")
-    validate_finite_number(metadata["gt_beta"], "truth gt_beta")
-    data = EvaluationTruth(
-        dataset_identity_sha256=metadata["dataset_identity_sha256"],
-        dataset_identity_spec=metadata["dataset_identity_spec"],
-        canonical_image=arrays["canonical_image"],
-        gt_frames=arrays["gt_frames"],
-        translation_trajectory=arrays["translation_trajectory"],
-        rotation_trajectory=arrays["rotation_trajectory"],
-        gt_velocity=arrays["gt_velocity"],
-        gt_acceleration=arrays["gt_acceleration"],
-        gt_omega=metadata["gt_omega"],
-        gt_beta=metadata["gt_beta"],
-        motion_model=metadata["motion_model"],
-        H=dimensions["H"],
-        W=dimensions["W"],
-        T=dimensions["T"],
-        evaluator_metadata=metadata["evaluator_metadata"],
-    )
-    _validate_truth(data)
     return data

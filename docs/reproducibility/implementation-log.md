@@ -2002,3 +2002,136 @@ This permanent append-only ledger is intentionally empty of implementation recor
 This closes the Task 10 implementation ledger only. It does not claim the
 separate final plan-completion gate, which remains to be run after this
 immutable closure commit.
+
+## Correctness whole-plan Fix Round 1 — Close review gaps (2026-07-27)
+
+- Fix Round 1 started from exact reviewed closure
+  `106ffb21422f1bb19beabbb6ef8acc355498c627` on
+  `debug/admm-vs-sgd` with a clean tracked worktree.
+- The immutable plan, review, and corrective brief were not edited. This
+  entry records corrective implementation evidence only; it does not write a
+  new final closure before the whole-plan reviewer re-reviews the round.
+
+### Consumed learning-rate endpoints
+
+- Private scheduler adaptation now maps the `N` learning rates actually
+  consumed immediately before `optimizer.step()` onto both inclusive cosine
+  endpoints. The first of multiple updates consumes the base LR, the last
+  consumes `base_lr * final_ratio`, and the defined `N=1` case consumes the
+  final ratio.
+- Both SGD and ADMM use the consumed-update mapping while retaining separate
+  scene/motion base rates, group ordering, frozen/empty-group behavior, and
+  the unchanged public `cosine_multiplier(step, total_steps, final_ratio)`
+  contract.
+- The four named SGD/ADMM consumed-LR regressions were RED:
+  `4 failed`. For four updates, the prior second scene/motion rates were
+  `[0.007813782463805517, 0.13022970773009196]` instead of
+  `[0.006975, 0.11625]`; for one update, the prior rates were
+  `[0.009, 0.15]` instead of `[0.0009, 0.015]`.
+- The completed solver-focused group was GREEN:
+  `22 passed in 1.70s`.
+
+### Gaussian inverse-domain FOV and INR dtype
+
+- `SPIForwardModel` now constructs its physical pixel grid at the
+  participating device/dtype, computes
+  `A(t)^-1 * (U - center - displacement) + center`, and applies an inclusive
+  canonical-domain mask for
+  `[0, H - 1] x [0, W - 1]` to Gaussian frames.
+- `INRForwardModel` reuses the same inverse-domain grid and mask rather than a
+  hard-coded float32 grid, so `.double()` and active-device propagation occur
+  before the scene is sampled.
+- The wide-Gaussian zero-FOV, exact-boundary, nontrivial affine inverse-mask,
+  and real rectangular double-SIREN regressions were RED:
+  `4 failed`. The unmasked wide Gaussian had `1436 / 2048` nonzero pixels
+  with maximum `0.44345`; the exact-boundary case leaked into
+  `746 / 2016` forbidden pixels; the affine support disagreed with the
+  independent inverse; and INR recorded float32 after `.double()`.
+- The three Gaussian regressions were GREEN:
+  `3 passed in 0.39s`. The complete rectangular suite was GREEN:
+  `37 passed`. The required geometry, numerical-gradient, and measurement
+  group was GREEN:
+  `51 passed in 2.07s`.
+
+### Blind child import boundary
+
+- The real entry modules no longer bind truth loaders or legacy/global
+  evaluator callables at top level. Blind DGI uses its reconstruction
+  primitive directly, while truth loading and evaluator imports occur only
+  inside explicit-truth or legacy evaluation paths.
+- Data/artifact and baseline package facades retain their prior public exports
+  through lazy resolution. Truth serialization is physically isolated in
+  `_artifact_truth.py`, and the compatibility evaluator is isolated in
+  `_evaluation.py`, eliminating unconditional evaluator/truth imports from
+  blind package graphs.
+- The initial static plus fresh-process boundary regression was RED:
+  `2 failed`, finding all three forbidden entry bindings,
+  `gsdiff.evaluation.metrics` imported, and facade truth-loader bindings.
+  A hardened process-wide scan was subsequently RED:
+  `1 failed`, finding a remaining
+  `gsdiff.data._artifact_dataset.load_evaluation_truth` binding.
+- After physical isolation, the hardened fresh-process, explicit-truth, and
+  round-trip group was GREEN:
+  `3 passed in 20.34s`. The independent boundary/compatibility review was
+  GREEN:
+  `5 passed in 19.07s`. The required artifacts plus evaluator suite was
+  GREEN:
+  `380 passed in 26.55s`.
+
+### Path-free acquisition semantics
+
+- Finite schema fields now use exact allowlists for supported pattern, noise,
+  motion, and holdout identifiers. Generator code version uses an exact-str,
+  ASCII, 1–128-character opaque logical-ID grammar and rejects traversal,
+  reserved truth/evaluator/capability tokens, and path/URI forms.
+- Validation converges across split construction, direct coherent save,
+  identity-spec validation, and load. Regressions cover drive, UNC, POSIX,
+  traversal, file/HTTP(S), evaluator/truth/`gt`, Unicode, coercible
+  non-strings, length/character boundaries, every supported finite value,
+  known generator IDs, and an opaque 40-hex commit ID.
+- The complete cross-product validator regression was RED:
+  `157 failed, 194 deselected in 5.81s`.
+- The same group was GREEN:
+  `157 passed, 194 deselected in 2.53s`; the allowlist acceptance group was
+  GREEN:
+  `30 passed, 321 deselected in 0.48s`.
+
+### Diffusion documentation
+
+- Only the stale operational sentence was corrected: skipping
+  `set_n_steps()` leaves `_n_steps = None`, and `proximal()` raises
+  `RuntimeError` rather than silently running a one-step schedule. The
+  requirement for `train.py` to initialize the schedule before the first
+  z-step remains intact.
+
+### Final verification for this corrective round
+
+- Solver focused suite → exit `0`,
+  `22 passed in 1.70s`.
+- Geometry, numerical-gradient, and measurement focused suite → exit `0`,
+  `51 passed in 2.07s`.
+- Artifacts and evaluation focused suite → exit `0`,
+  `380 passed in 26.55s`.
+- Accumulated non-CUDA suite → exit `0`,
+  `681 passed, 1 deselected in 84.36s`.
+- Fresh real-CUDA suite, started at
+  `2026-07-27T14:05:39.2200243Z` → exit `0`,
+  `1 passed, 681 deselected in 1.20s`. The checked-in JUnit verifier reported
+  `tests=1 failures=0 errors=0 skipped=0` for
+  `gsdiff-cuda-fix1-097dc58d31154015b7be720605c5961c.xml`.
+- `D:\conda\envs\spi\python.exe -m compileall -q gsdiff scripts train.py`
+  completed silently with exit `0`.
+- Strict environment verification → exit `0`, fingerprint
+  `b5d6922a9f3a9638ee8826b9a74f00998cd3ac81aa25c03de016358e0e435a56`.
+- Strict implementation-provenance verification → exit `0`; four immutable
+  inputs verified at reviewed closure
+  `106ffb21422f1bb19beabbb6ef8acc355498c627`.
+- `D:\conda\envs\spi\python.exe -m pip check` → exit `0`,
+  `No broken requirements found.`
+- `git diff --check` completed silently with exit `0`.
+- Independent read-only implementation reviews found no actionable gap in
+  the semantic validator/trust paths, blind import boundary, consumed LR
+  mapping, Gaussian inverse-FOV physics, or INR dtype propagation.
+
+Fix Round 1 is ready for the required whole-plan re-review. No new final
+plan-completion closure is claimed here.

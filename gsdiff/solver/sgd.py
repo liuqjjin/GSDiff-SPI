@@ -12,9 +12,9 @@ import torch, torch.nn.functional as F
 
 from gsdiff.prior.tv import anisotropic_tv_mean
 from gsdiff.solver.gradients import (
+    _consumed_cosine_multiplier,
     active_parameters,
     clip_grad_groups,
-    cosine_multiplier,
     freeze_parameters,
 )
 
@@ -91,7 +91,9 @@ class SGDSolver:
         self.optimizer = torch.optim.Adam(groups)
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(
             self.optimizer,
-            lr_lambda=lambda step: cosine_multiplier(step, n_steps),
+            lr_lambda=lambda step: _consumed_cosine_multiplier(
+                step, n_steps
+            ),
         )
 
     # ------------------------------------------------------------------

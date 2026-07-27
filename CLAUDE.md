@@ -528,7 +528,8 @@ and the independent z-score loss are all verified correct.
   independent log-linear annealing schedule (`sigma_start → sigma_end`) described in §7.2.
 - **`set_n_steps` must be called before the first ADMM step.** `train.py` does this with
   `n_zsteps = num_outer − admm_n_warmup` immediately after constructing `DiffusionPrior`.
-  Forgetting this leaves `_n_steps = 1`, so σ jumps to `sigma_end` after a single call.
+  Skipping `set_n_steps()` leaves `_n_steps = None` and `proximal()` raises `RuntimeError`; it no
+  longer silently runs a one-step schedule.
 - **σ is clamped into the training range** `[σ_min, σ_max]` of `NoiseSchedule` so the network is
   never queried out-of-distribution. If you want larger σ values, retrain the UNet with a larger
   `sigma_max` in `configs/diffusion_prior.yaml` *before* changing `sigma_start`.

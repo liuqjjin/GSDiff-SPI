@@ -54,3 +54,14 @@ def cosine_multiplier(
     return final_ratio + (1.0 - final_ratio) * 0.5 * (
         1.0 + math.cos(math.pi * phase)
     )
+
+
+def _consumed_cosine_multiplier(
+    update_index: int,
+    update_count: int,
+    final_ratio: float = 0.1,
+) -> float:
+    """Map actual optimizer updates onto both cosine endpoints."""
+    if update_count == 1:
+        return cosine_multiplier(1, 1, final_ratio)
+    return cosine_multiplier(update_index, update_count - 1, final_ratio)

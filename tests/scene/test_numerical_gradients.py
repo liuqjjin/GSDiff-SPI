@@ -69,7 +69,7 @@ def test_forward_render_grid_and_identity_follow_double_video_path():
 
     assert video.dtype == torch.float64
     _assert_float64_cpu_creations(
-        recorder, ["eye"] + ["arange", "arange"] * 3
+        recorder, ["eye", "arange", "arange"] + ["arange", "arange"] * 3
     )
 
 

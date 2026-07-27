@@ -15,10 +15,6 @@ import numpy as np, torch, yaml
 
 from gsdiff.utils import (set_seed, get_device, ensure_dir, normalize_01,
                            psnr_fn, to_native, save_gif, _to_ns)
-from gsdiff.evaluation.metrics import (
-    evaluate_video_global_affine,
-    evaluate_video_legacy_per_frame,
-)
 from gsdiff.scene import GaussianScene2D
 from gsdiff.motion import SE2Motion
 from gsdiff.forward import SPIForwardModel
@@ -29,7 +25,6 @@ from gsdiff.data import (
     dgi_reconstruct,
     generate_spi_data,
     load_acquisition_data,
-    load_evaluation_truth,
     method_execution_policy,
     write_method_child_outputs,
 )
@@ -48,6 +43,10 @@ def parse_args(argv=None):
 
 def evaluate(gt_frames, recon_np, label=""):
     """Compatibility adapter for explicitly labelled legacy PSNR."""
+    from gsdiff.evaluation.metrics import (
+        evaluate_video_legacy_per_frame,
+    )
+
     result = evaluate_video_legacy_per_frame(gt_frames, recon_np)
     psnrs = result["per_frame_psnr_legacy_per_frame_minmax"]
     m = result["psnr_legacy_per_frame_minmax"]
@@ -86,6 +85,8 @@ def _write_results_json(path, results, history):
 
 def _write_metrics_json(path, gt_frames, recon_np):
     """Evaluate the final video once and persist the primary metrics payload."""
+    from gsdiff.evaluation.metrics import evaluate_video_global_affine
+
     payload = evaluate_video_global_affine(gt_frames, recon_np)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, allow_nan=False)
@@ -233,6 +234,8 @@ def main(argv=None):
         )
         data = acquisition
         if truth_path is not None:
+            from gsdiff.data import load_evaluation_truth
+
             truth = load_evaluation_truth(
                 truth_path,
                 expected_dataset_identity_sha256=(

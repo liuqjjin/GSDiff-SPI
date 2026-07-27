@@ -37,6 +37,37 @@ from gsdiff.data.simulation import generate_spi_data
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 AUTHORITATIVE_PYTHON = Path(r"D:\conda\envs\spi\python.exe")
+SEMANTIC_STRING_FIELDS = (
+    "pattern_family",
+    "noise_convention",
+    "motion_model",
+    "holdout_pattern_family",
+    "generator_code_version",
+)
+FORBIDDEN_SEMANTIC_STRINGS = (
+    r"C:\private\payload.npz",
+    r"\\server\share\payload.npz",
+    "/private/payload.npz",
+    "../private/payload.npz",
+    "file:///private/payload.npz",
+    "http://example.invalid/payload",
+    "https://example.invalid/payload",
+    "evaluator-v1",
+    "truth-v1",
+    "gt-v1",
+)
+FORBIDDEN_SEMANTIC_IDS = (
+    "windows-drive",
+    "unc",
+    "posix-absolute",
+    "relative-traversal",
+    "file-uri",
+    "http-uri",
+    "https-uri",
+    "evaluator-token",
+    "truth-token",
+    "gt-segment",
+)
 
 
 def _tiny_source(*, seed=7, shape="L", holdout_count=6, T=3):
@@ -217,6 +248,64 @@ def _set_nested(mapping, path, value):
     for key in path[:-1]:
         cursor = cursor[key]
     cursor[path[-1]] = value
+
+
+def _set_config_semantic(config, field, value):
+    if field == "pattern_family":
+        config["pattern"]["family"] = value
+    elif field == "noise_convention":
+        config["noise"]["convention"] = value
+    elif field == "motion_model":
+        config["motion"]["model"] = value
+    elif field == "holdout_pattern_family":
+        config["holdout"]["pattern_family"] = value
+    elif field != "generator_code_version":
+        raise AssertionError(f"unknown semantic field: {field}")
+
+
+def _set_identity_semantic(spec, field, value):
+    if field == "generator_code_version":
+        spec["generator_code_version"] = value
+    elif field == "pattern_family":
+        spec["pattern_family"] = value
+    elif field == "noise_convention":
+        spec["noise"]["convention"] = value
+    elif field == "motion_model":
+        spec["motion"]["model"] = value
+
+
+def _coherent_semantic_acquisition(acquisition, field, value):
+    config = _mutable_json(acquisition.resolved_generation_config)
+    identity_spec = _mutable_json(acquisition.dataset_identity_spec)
+    _set_config_semantic(config, field, value)
+    _set_config_semantic(
+        identity_spec["resolved_generation_config"], field, value
+    )
+    _set_identity_semantic(identity_spec, field, value)
+    replacements = {
+        "dataset_identity_spec": identity_spec,
+        "dataset_identity_sha256": hashlib.sha256(
+            _canonical_json_bytes(identity_spec)
+        ).hexdigest(),
+        "resolved_generation_config": config,
+    }
+    if field != "holdout_pattern_family":
+        replacements[field] = value
+    return dataclasses.replace(acquisition, **replacements)
+
+
+def _set_metadata_semantic(metadata, field, value):
+    _set_config_semantic(
+        metadata["resolved_generation_config"], field, value
+    )
+    identity_spec = metadata["dataset_identity_spec"]
+    _set_config_semantic(
+        identity_spec["resolved_generation_config"], field, value
+    )
+    _set_identity_semantic(identity_spec, field, value)
+    if field != "holdout_pattern_family":
+        metadata[field] = value
+    _refresh_metadata_identity(metadata)
 
 
 def _raw_output(acquisition):
@@ -747,6 +836,253 @@ def test_target_schema_rejects_malicious_char_ids_and_unknown_kinds(
             data,
             resolved_generation_config=config,
             generator_code_version="gsdiff-simulation-test-v1",
+            target_asset_sha256=target_hash,
+        )
+
+
+@pytest.mark.parametrize(
+    "field",
+    SEMANTIC_STRING_FIELDS,
+)
+@pytest.mark.parametrize(
+    "value",
+    FORBIDDEN_SEMANTIC_STRINGS,
+    ids=FORBIDDEN_SEMANTIC_IDS,
+)
+def test_split_rejects_path_or_capability_semantic_strings(field, value):
+    data, config, target_hash = _tiny_source()
+    generator_code_version = "gsdiff-simulation-test-v1"
+    if field == "generator_code_version":
+        generator_code_version = value
+    else:
+        _set_config_semantic(config, field, value)
+
+    with pytest.raises(ArtifactValidationError):
+        split_spi_data(
+            data,
+            resolved_generation_config=config,
+            generator_code_version=generator_code_version,
+            target_asset_sha256=target_hash,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "valid_value"),
+    [
+        ("pattern_family", "bernoulli"),
+        ("noise_convention", "detector-absolute"),
+        ("motion_model", "custom_se2"),
+        ("holdout_pattern_family", "uniform-random"),
+        ("generator_code_version", "gsdiff-simulation-test-v1"),
+    ],
+)
+def test_semantic_strings_reject_coercible_non_exact_string_types(
+    field, valid_value
+):
+    data, config, target_hash = _tiny_source()
+    changed = np.str_(valid_value)
+    generator_code_version = "gsdiff-simulation-test-v1"
+    if field == "generator_code_version":
+        generator_code_version = changed
+    else:
+        _set_config_semantic(config, field, changed)
+
+    with pytest.raises(ArtifactValidationError):
+        split_spi_data(
+            data,
+            resolved_generation_config=config,
+            generator_code_version=generator_code_version,
+            target_asset_sha256=target_hash,
+        )
+
+
+@pytest.mark.parametrize(
+    "field",
+    SEMANTIC_STRING_FIELDS,
+)
+@pytest.mark.parametrize(
+    "forbidden",
+    FORBIDDEN_SEMANTIC_STRINGS,
+    ids=FORBIDDEN_SEMANTIC_IDS,
+)
+def test_save_rejects_coherent_forbidden_semantics_before_writing(
+    tmp_path, field, forbidden
+):
+    acquisition, _ = _tiny_pair()
+    tampered = _coherent_semantic_acquisition(
+        acquisition, field, forbidden
+    )
+    destination = tmp_path / "measurements.npz"
+
+    with pytest.raises(ArtifactValidationError):
+        save_acquisition_data(tampered, destination)
+
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize(
+    "field",
+    SEMANTIC_STRING_FIELDS,
+)
+@pytest.mark.parametrize(
+    "forbidden",
+    FORBIDDEN_SEMANTIC_STRINGS,
+    ids=FORBIDDEN_SEMANTIC_IDS,
+)
+def test_loader_rejects_identity_coherent_forbidden_semantics(
+    tmp_path, field, forbidden
+):
+    acquisition, _ = _tiny_pair()
+    source = tmp_path / "source.npz"
+    forged = tmp_path / "forged.npz"
+    save_acquisition_data(acquisition, source)
+    _rewrite_npz(
+        source,
+        forged,
+        lambda members: _replace_metadata(
+            members,
+                lambda metadata: _set_metadata_semantic(
+                    metadata,
+                    field,
+                    forbidden,
+                ),
+        ),
+    )
+
+    with pytest.raises(ArtifactValidationError):
+        load_acquisition_data(forged)
+
+
+@pytest.mark.parametrize(
+    ("field", "allowed"),
+    [
+        *[
+            ("pattern_family", value)
+            for value in (
+                "bernoulli",
+                "gaussian",
+                "random",
+                "hadamard",
+                "hadamard_cc",
+                "hadamard_walsh",
+                "hadamard_natural",
+                "fourier",
+                "s_matrix",
+                "s_matrix_m",
+            )
+        ],
+        ("noise_convention", "ac-variance-snr"),
+        ("noise_convention", "detector-absolute"),
+        *[
+            ("motion_model", value)
+            for value in (
+                "translation",
+                "rotation",
+                "shear",
+                "swirl",
+                "translation_and_rotation",
+                "custom_se2",
+            )
+        ],
+        ("holdout_pattern_family", "uniform-random"),
+    ],
+)
+def test_generation_config_accepts_supported_semantic_ids(field, allowed):
+    from gsdiff.data._artifact_identity import validate_generation_config
+
+    _, config, _ = _tiny_source()
+    _set_config_semantic(config, field, allowed)
+
+    validated = validate_generation_config(config)
+
+    if field == "holdout_pattern_family":
+        assert validated["holdout"]["pattern_family"] == allowed
+    elif field == "pattern_family":
+        assert validated["pattern"]["family"] == allowed
+    elif field == "noise_convention":
+        assert validated["noise"]["convention"] == allowed
+    else:
+        assert validated["motion"]["model"] == allowed
+
+
+@pytest.mark.parametrize(
+    "generator_code_version",
+    [
+        "gsdiff-simulation-test-v1",
+        "gsdiff-simulation-v1",
+        "gsdiff-sim-v1",
+    ],
+)
+def test_generator_code_version_accepts_path_free_opaque_ids(
+    generator_code_version,
+):
+    data, config, target_hash = _tiny_source()
+
+    acquisition, _ = split_spi_data(
+        data,
+        resolved_generation_config=config,
+        generator_code_version=generator_code_version,
+        target_asset_sha256=target_hash,
+    )
+
+    assert acquisition.generator_code_version == generator_code_version
+
+
+@pytest.mark.parametrize(
+    "generator_code_version",
+    [
+        "a",
+        "a" * 128,
+        "0123456789abcdef0123456789abcdef01234567",
+    ],
+    ids=["minimum-length", "maximum-length", "git-commit"],
+)
+def test_generator_code_version_accepts_opaque_id_boundaries(
+    generator_code_version,
+):
+    data, config, target_hash = _tiny_source()
+
+    acquisition, _ = split_spi_data(
+        data,
+        resolved_generation_config=config,
+        generator_code_version=generator_code_version,
+        target_asset_sha256=target_hash,
+    )
+
+    assert acquisition.generator_code_version == generator_code_version
+
+
+@pytest.mark.parametrize(
+    "generator_code_version",
+    [
+        "éclair",
+        ".version",
+        "_version",
+        "-version",
+        "version with space",
+        "a" * 129,
+        "safe..id",
+    ],
+    ids=[
+        "non-ascii",
+        "leading-dot",
+        "leading-underscore",
+        "leading-hyphen",
+        "whitespace",
+        "too-long",
+        "traversal-token",
+    ],
+)
+def test_generator_code_version_rejects_non_opaque_ids(
+    generator_code_version,
+):
+    data, config, target_hash = _tiny_source()
+
+    with pytest.raises(ArtifactValidationError):
+        split_spi_data(
+            data,
+            resolved_generation_config=config,
+            generator_code_version=generator_code_version,
             target_asset_sha256=target_hash,
         )
 
@@ -1986,6 +2322,199 @@ def test_explicit_truth_compatibility_paths_are_unblinded_and_not_promotable(
         "promotion_eligible": False,
     }
     assert not (baseline_output / "method-info.json").exists()
+
+
+def test_method_child_entry_modules_have_no_top_level_evaluator_capabilities():
+    import train
+    import scripts.run_baselines as run_baselines
+
+    forbidden_names = {
+        "evaluate_video",
+        "evaluate_video_global_affine",
+        "evaluate_video_legacy_per_frame",
+        "load_evaluation_truth",
+    }
+    for module in (train, run_baselines):
+        assert forbidden_names.isdisjoint(module.__dict__)
+        metric_callables = {
+            name
+            for name, value in module.__dict__.items()
+            if callable(value)
+            and getattr(value, "__module__", None)
+            == "gsdiff.evaluation.metrics"
+        }
+        assert metric_callables == set()
+
+
+def test_fresh_blind_entry_processes_keep_evaluator_import_graph_closed(
+    tmp_path,
+):
+    acquisition, _ = _tiny_pair()
+    child_cwd = tmp_path / "blind-child"
+    child_cwd.mkdir()
+    measurements_path = child_cwd / "measurements.npz"
+    save_acquisition_data(acquisition, measurements_path)
+
+    probe_path = tmp_path / "blind_import_probe.py"
+    probe_path.write_text(
+        "\n".join(
+            [
+                "import json",
+                "from pathlib import Path",
+                "import runpy",
+                "import sys",
+                "",
+                "entry_path = Path(sys.argv[1])",
+                "audit_path = Path(sys.argv[2])",
+                "entry_args = sys.argv[3:]",
+                "sys.argv = [str(entry_path), *entry_args]",
+                "namespace = runpy.run_path(str(entry_path), run_name='__main__')",
+                "forbidden = {",
+                "    'evaluate_video',",
+                "    'evaluate_video_global_affine',",
+                "    'evaluate_video_legacy_per_frame',",
+                "    'load_evaluation_truth',",
+                "}",
+                "entry_bound = sorted(forbidden.intersection(namespace))",
+                "package_bound = {}",
+                "process_bound = {}",
+                "for module_name in (",
+                "    'gsdiff.data',",
+                "    'gsdiff.data.artifacts',",
+                "    'gsdiff.baselines',",
+                "    'gsdiff.baselines.common',",
+                "):",
+                "    module = sys.modules.get(module_name)",
+                "    if module is not None:",
+                "        names = sorted(forbidden.intersection(module.__dict__))",
+                "        if names:",
+                "            package_bound[module_name] = names",
+                "for module_name, module in tuple(sys.modules.items()):",
+                "    if module is None or not (",
+                "        module_name == 'gsdiff'",
+                "        or module_name.startswith('gsdiff.')",
+                "    ):",
+                "        continue",
+                "    names = sorted(forbidden.intersection(module.__dict__))",
+                "    if names:",
+                "        process_bound[module_name] = names",
+                "audit = {",
+                "    'entry_bound': entry_bound,",
+                "    'package_bound': package_bound,",
+                "    'process_bound': process_bound,",
+                "    'metrics_module_loaded': (",
+                "        'gsdiff.evaluation.metrics' in sys.modules",
+                "    ),",
+                "}",
+                "audit_path.write_text(",
+                "    json.dumps(audit, sort_keys=True), encoding='utf-8'",
+                ")",
+                "if (",
+                "    entry_bound",
+                "    or package_bound",
+                "    or process_bound",
+                "    or audit['metrics_module_loaded']",
+                "):",
+                "    raise SystemExit(86)",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    child_env = {
+        "PATH": os.environ["PATH"],
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONPATH": str(REPO_ROOT),
+        "SYSTEMROOT": os.environ["SYSTEMROOT"],
+    }
+    cases = []
+    for scene_type in ("gaussian", "grid", "recinr_se2"):
+        output_dir = tmp_path / f"train-{scene_type}-output"
+        config_path = tmp_path / f"train-{scene_type}.yaml"
+        _write_entry_config(config_path, acquisition, output_dir)
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        config["scene"]["type"] = scene_type
+        config_path.write_text(
+            yaml.safe_dump(config, sort_keys=True), encoding="utf-8"
+        )
+        cases.append(
+            (
+                f"train-{scene_type}",
+                REPO_ROOT / "train.py",
+                [
+                    "--config",
+                    str(config_path),
+                    "--measurements-path",
+                    "measurements.npz",
+                    "--output-dir",
+                    str(output_dir),
+                    "--device",
+                    "cpu",
+                ],
+                output_dir,
+            )
+        )
+
+    baseline_output = tmp_path / "baseline-dgi-output"
+    baseline_config = tmp_path / "baseline-dgi.yaml"
+    _write_entry_config(baseline_config, acquisition, baseline_output)
+    cases.append(
+        (
+            "baseline-dgi",
+            REPO_ROOT / "scripts" / "run_baselines.py",
+            [
+                "--config",
+                str(baseline_config),
+                "--name",
+                "blind-import-probe",
+                "--baselines",
+                "dgi",
+                "--device",
+                "cpu",
+                "--measurements-path",
+                "measurements.npz",
+                "--output-dir",
+                str(baseline_output),
+            ],
+            baseline_output,
+        )
+    )
+
+    for case_name, entry_path, entry_args, output_dir in cases:
+        audit_path = tmp_path / f"{case_name}-audit.json"
+        command = [
+            str(AUTHORITATIVE_PYTHON),
+            str(probe_path),
+            str(entry_path),
+            str(audit_path),
+            *entry_args,
+        ]
+        completed = subprocess.run(
+            command,
+            cwd=child_cwd,
+            env=child_env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=60,
+        )
+
+        audit = json.loads(audit_path.read_text(encoding="utf-8"))
+        assert completed.returncode == 0, (
+            case_name,
+            audit,
+            completed.stdout,
+            completed.stderr,
+        )
+        assert audit == {
+            "entry_bound": [],
+            "metrics_module_loaded": False,
+            "package_bound": {},
+            "process_bound": {},
+        }
+        _assert_blind_output_is_measurement_only(
+            output_dir, acquisition.dataset_identity_sha256
+        )
 
 
 def test_real_method_child_subprocess_has_no_truth_capability(tmp_path):

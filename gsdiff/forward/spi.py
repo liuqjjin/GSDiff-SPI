@@ -17,6 +17,40 @@ class SPIForwardModel(nn.Module):
             f"Unknown time_assignment_mode: {time_assignment_mode}"
         self.time_assignment_mode = time_assignment_mode
 
+    def _pixel_grid(self, device, dtype):
+        gy, gx = torch.meshgrid(
+            torch.arange(self.H, device=device, dtype=dtype),
+            torch.arange(self.W, device=device, dtype=dtype),
+            indexing="ij",
+        )
+        return torch.stack((gy.reshape(-1), gx.reshape(-1)), dim=-1)
+
+    def _inverse_warp_grid(self, t_grid):
+        """Map output pixels back into the finite canonical image domain."""
+        transform = self.motion._A(t_grid)
+        displacement = self.motion._displacement(t_grid)
+        coordinates = self._pixel_grid(transform.device, transform.dtype)
+        relative = (
+            coordinates.unsqueeze(0)
+            - self.motion.center
+            - displacement.unsqueeze(1)
+        )
+        return (
+            torch.einsum(
+                "tij,tnj->tni", torch.linalg.inv(transform), relative
+            )
+            + self.motion.center
+        )
+
+    def _source_fov_mask(self, canonical_coordinates):
+        bounds = canonical_coordinates.new_tensor(
+            [[0.0, 0.0], [self.H - 1.0, self.W - 1.0]]
+        )
+        return (
+            (canonical_coordinates >= bounds[0])
+            & (canonical_coordinates <= bounds[1])
+        ).all(dim=-1)
+
     def _render_frame(self, centers_t, Sinv_t, amps):
         """Render one frame from transformed params.
         centers_t: [M,2], Sinv_t: [M,2,2], amps: [M] → [H,W]
@@ -43,10 +77,14 @@ class SPIForwardModel(nn.Module):
             2, device=Sigma_t.device, dtype=Sigma_t.dtype
         )
         Sinv_t = torch.linalg.inv(Sigma_t + eye)                       # [T,M,2,2]
+        inside = self._source_fov_mask(
+            self._inverse_warp_grid(t_grid)
+        ).view(t_grid.shape[0], self.H, self.W)
 
         frames = []
         for t in range(t_grid.shape[0]):
-            frames.append(self._render_frame(centers_t[t], Sinv_t[t], amps))
+            frame = self._render_frame(centers_t[t], Sinv_t[t], amps)
+            frames.append(frame * inside[t].to(frame.dtype))
         return torch.stack(frames).unsqueeze(1)  # [T,1,H,W]
 
     @staticmethod

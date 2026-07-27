@@ -5,10 +5,7 @@ from typing import Mapping, Sequence
 
 import numpy as np
 
-from ._artifact_dataset import (
-    _validate_acquisition_identity,
-    _validate_truth,
-)
+from ._artifact_dataset import _validate_acquisition_identity
 from ._artifact_identity import (
     ArtifactValidationError,
     array_descriptor,
@@ -71,6 +68,8 @@ def validate_evaluation_inputs(
     acquisition: SPIAcquisitionData,
     truth: EvaluationTruth,
 ) -> None:
+    from ._artifact_truth import _validate_truth
+
     _validate_reconstruction(reconstruction)
     _validate_acquisition_identity(acquisition)
     _validate_truth(truth)

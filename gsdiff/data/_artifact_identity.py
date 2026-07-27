@@ -11,7 +11,7 @@ import numpy as np
 
 
 _HEX_DIGITS = frozenset("0123456789abcdef")
-_TARGET_DESCRIPTOR_PATTERN = re.compile(
+_OPAQUE_LOGICAL_ID_PATTERN = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z", re.ASCII
 )
 _BUILTIN_CHAR_TARGET_PATTERN = re.compile(r"char:[A-Za-z0-9]\Z", re.ASCII)
@@ -27,6 +27,34 @@ _TARGET_DESCRIPTOR_RESERVED_TOKENS = (
     "normalized",
 )
 _TARGET_DESCRIPTOR_RESERVED_SEGMENTS = frozenset({"gt"})
+_PATTERN_FAMILIES = frozenset(
+    {
+        "bernoulli",
+        "gaussian",
+        "random",
+        "hadamard",
+        "hadamard_cc",
+        "hadamard_walsh",
+        "hadamard_natural",
+        "fourier",
+        "s_matrix",
+        "s_matrix_m",
+    }
+)
+_NOISE_CONVENTIONS = frozenset(
+    {"ac-variance-snr", "detector-absolute"}
+)
+_MOTION_MODELS = frozenset(
+    {
+        "translation",
+        "rotation",
+        "shear",
+        "swirl",
+        "translation_and_rotation",
+        "custom_se2",
+    }
+)
+_HOLDOUT_PATTERN_FAMILIES = frozenset({"uniform-random"})
 
 
 class ArtifactValidationError(ValueError):
@@ -249,6 +277,38 @@ def _validate_nonempty_string(value: object, field: str) -> str:
     return value
 
 
+def validate_path_free_opaque_id(value: object, field: str) -> str:
+    identifier = _validate_nonempty_string(value, field)
+    identifier_lower = identifier.lower()
+    if (
+        _OPAQUE_LOGICAL_ID_PATTERN.fullmatch(identifier) is None
+        or ".." in identifier
+        or any(
+            token in identifier_lower
+            for token in _TARGET_DESCRIPTOR_RESERVED_TOKENS
+        )
+        or any(
+            segment in _TARGET_DESCRIPTOR_RESERVED_SEGMENTS
+            for segment in re.split(r"[._-]+", identifier_lower)
+        )
+    ):
+        raise ArtifactValidationError(
+            f"{field} must be a path-free opaque logical ID"
+        )
+    return identifier
+
+
+def _validate_supported_semantic_id(
+    value: object,
+    field: str,
+    supported: frozenset[str],
+) -> str:
+    identifier = _validate_nonempty_string(value, field)
+    if identifier not in supported:
+        raise ArtifactValidationError(f"{field} is unsupported")
+    return identifier
+
+
 def _validate_target_descriptor(kind: str, value: object) -> str:
     descriptor = _validate_nonempty_string(value, "target.descriptor")
     if (
@@ -256,23 +316,7 @@ def _validate_target_descriptor(kind: str, value: object) -> str:
         and _BUILTIN_CHAR_TARGET_PATTERN.fullmatch(descriptor) is not None
     ):
         return descriptor
-    descriptor_lower = descriptor.lower()
-    if (
-        _TARGET_DESCRIPTOR_PATTERN.fullmatch(descriptor) is None
-        or ".." in descriptor
-        or any(
-            token in descriptor_lower
-            for token in _TARGET_DESCRIPTOR_RESERVED_TOKENS
-        )
-        or any(
-            segment in _TARGET_DESCRIPTOR_RESERVED_SEGMENTS
-            for segment in re.split(r"[._-]+", descriptor_lower)
-        )
-    ):
-        raise ArtifactValidationError(
-            "target.descriptor must be an opaque logical target ID"
-        )
-    return descriptor
+    return validate_path_free_opaque_id(descriptor, "target.descriptor")
 
 
 def _validate_mapping(value: object, field: str) -> Mapping[str, object]:
@@ -346,8 +390,8 @@ def validate_generation_config(
         config["pattern"], "resolved_generation_config.pattern"
     )
     validate_exact_keys(pattern, {"family", "order"}, "pattern")
-    pattern_family = _validate_nonempty_string(
-        pattern["family"], "pattern.family"
+    pattern_family = _validate_supported_semantic_id(
+        pattern["family"], "pattern.family", _PATTERN_FAMILIES
     )
     pattern_order = _validate_nonempty_string(pattern["order"], "pattern.order")
     if pattern_order not in {"sequential", "stratified", "random"}:
@@ -368,8 +412,8 @@ def validate_generation_config(
         config["noise"], "resolved_generation_config.noise"
     )
     validate_exact_keys(noise, {"convention", "parameters"}, "noise")
-    noise_convention = _validate_nonempty_string(
-        noise["convention"], "noise.convention"
+    noise_convention = _validate_supported_semantic_id(
+        noise["convention"], "noise.convention", _NOISE_CONVENTIONS
     )
     noise_parameters = _validate_mapping(
         noise["parameters"], "noise.parameters"
@@ -390,7 +434,9 @@ def validate_generation_config(
         config["motion"], "resolved_generation_config.motion"
     )
     validate_exact_keys(motion, {"model", "parameters"}, "motion")
-    motion_model = _validate_nonempty_string(motion["model"], "motion.model")
+    motion_model = _validate_supported_semantic_id(
+        motion["model"], "motion.model", _MOTION_MODELS
+    )
     motion_parameters = _validate_mapping(
         motion["parameters"], "motion.parameters"
     )
@@ -448,8 +494,10 @@ def validate_generation_config(
         raise ArtifactValidationError(
             "holdout.present must equal whether holdout.count is positive"
         )
-    holdout_family = _validate_nonempty_string(
-        holdout["pattern_family"], "holdout.pattern_family"
+    holdout_family = _validate_supported_semantic_id(
+        holdout["pattern_family"],
+        "holdout.pattern_family",
+        _HOLDOUT_PATTERN_FAMILIES,
     )
     holdout_seed_offset = validate_exact_int(
         holdout["seed_offset"], "holdout.seed_offset"
@@ -551,7 +599,7 @@ def validate_acquisition_identity_spec(
     if spec["schema"] != "measurements-v1":
         raise ArtifactValidationError("dataset identity spec schema mismatch")
     config = validate_generation_config(spec["resolved_generation_config"])
-    _validate_nonempty_string(
+    validate_path_free_opaque_id(
         spec["generator_code_version"], "generator_code_version"
     )
     validate_sha256(spec["target_asset_sha256"], "target asset hash")

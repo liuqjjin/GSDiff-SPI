@@ -20,7 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .recinr_model import ReCINR, ReCINRConfig
-from .common import dgi_image, evaluate_video, holdout_residual
+from .common import dgi_image, holdout_residual
 
 
 # ── Variant (b): ReCINR's canonical REPRESENTATION + rigid SE(2) motion ──
@@ -238,6 +238,8 @@ def recinr_baseline(data, device="cuda", n_nodes=None, interp=False, seed=None, 
         if best_recon is None:                               # no snapshot taken
             best_recon = net.get_key_estimates(t_eval)[0][:, 0].cpu().numpy()
     recon, holdout = best_recon, best_val if best_val < np.inf else None
+    from ._evaluation import evaluate_video
+
     psnrs, mean_p = evaluate_video(data.gt_frames, recon)
     return recon, {"method": "recinr", "mean_psnr": mean_p, "per_frame_psnr": psnrs,
                    "holdout": holdout, "note": "ReCINR INR (vendored, random-pattern forward)"}

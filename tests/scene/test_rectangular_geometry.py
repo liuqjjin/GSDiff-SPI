@@ -26,6 +26,14 @@ class _ConstantOneScene(nn.Module):
         return self.value.expand(x_norm.shape[0]) + 0.0 * x_norm.sum(dim=-1)
 
 
+class _GridDtypeRecordingINRForwardModel(INRForwardModel):
+    def _pixel_grid(self, *args, **kwargs):
+        grid = super()._pixel_grid(*args, **kwargs)
+        self.render_grid_dtype = grid.dtype
+        self.render_grid_device = grid.device
+        return grid
+
+
 def _inr_model(scene):
     motion = SE2Motion(((H - 1) / 2.0, (W - 1) / 2.0))
     return INRForwardModel(scene, motion, H, W)
@@ -138,6 +146,32 @@ def test_real_rectangular_scenes_render_finite_video_and_gradients(kind, scene_k
     _assert_finite_gradients(model)
 
 
+def test_real_rectangular_inr_builds_double_grid_before_full_forward():
+    torch.manual_seed(0)
+    scene = build_scene("siren", H=H, W=W, hidden=8).double()
+    motion = SE2Motion(
+        ((H - 1) / 2.0, (W - 1) / 2.0)
+    ).double()
+    model = _GridDtypeRecordingINRForwardModel(
+        scene, motion, H, W
+    ).double()
+    t_grid = torch.tensor([0.0, 1.0], dtype=torch.float64)
+    patterns = torch.ones(2, H, W, dtype=torch.float64)
+    frame_idx = torch.tensor([0, 1])
+
+    measurements, video = model(patterns, frame_idx, t_grid)
+    (measurements.square().mean() + video.square().mean()).backward()
+
+    assert model.render_grid_dtype == torch.float64
+    assert model.render_grid_device == t_grid.device
+    assert measurements.dtype == torch.float64
+    assert video.dtype == torch.float64
+    assert video.shape == (2, 1, H, W)
+    assert torch.isfinite(measurements).all()
+    assert torch.isfinite(video).all()
+    _assert_finite_gradients(model)
+
+
 def test_build_scene_preserves_grid_and_lowrank_rectangular_dimensions():
     grid = build_scene("grid", H=H, W=W)
     lowrank = build_scene("lowrank", H=H, W=W, r=4)
@@ -231,16 +265,106 @@ def test_recinr_rejects_invalid_grid_size(grid_size):
 
 def test_gaussian_renderer_is_rectangular_zero_fov_and_has_finite_gradients():
     torch.manual_seed(0)
-    scene = GaussianScene2D(2, H, W, init_scale=0.1)
-    motion = SE2Motion(((H - 1) / 2.0, (W - 1) / 2.0))
-    model = SPIForwardModel(scene, motion, H, W)
+    scene = GaussianScene2D(2, H, W, init_scale=10.0).double()
+    motion = SE2Motion(
+        ((H - 1) / 2.0, (W - 1) / 2.0)
+    ).double()
+    model = SPIForwardModel(scene, motion, H, W).double()
     with torch.no_grad():
-        motion.velocity.copy_(torch.tensor([0.0, 128.0]))
+        motion.velocity.copy_(torch.tensor([0.0, 64.0], dtype=torch.float64))
 
-    video = model.render_video(torch.tensor([1.0]))
+    video = model.render_video(torch.tensor([1.0], dtype=torch.float64))
     video.sum().backward()
 
     assert video.shape == (1, 1, H, W)
+    assert video.dtype == torch.float64
     assert torch.isfinite(video).all()
     torch.testing.assert_close(video, torch.zeros_like(video))
+    _assert_finite_gradients(model)
+
+
+def test_gaussian_renderer_includes_exact_inverse_fov_boundary():
+    scene = GaussianScene2D(1, H, W, init_scale=10.0).double()
+    motion = SE2Motion(
+        ((H - 1) / 2.0, (W - 1) / 2.0)
+    ).double()
+    model = SPIForwardModel(scene, motion, H, W).double()
+    with torch.no_grad():
+        scene.centers.copy_(
+            torch.tensor(
+                [[(H - 1) / 2.0, (W - 1) / 2.0]],
+                dtype=torch.float64,
+            )
+        )
+        motion.velocity.copy_(torch.tensor([0.0, 63.0], dtype=torch.float64))
+
+    video = model.render_video(torch.tensor([1.0], dtype=torch.float64))
+
+    torch.testing.assert_close(
+        video[..., :-1], torch.zeros_like(video[..., :-1])
+    )
+    assert torch.all(video[..., -1] > 0.0)
+
+
+def test_gaussian_affine_mask_matches_independent_inverse_domain():
+    scene = GaussianScene2D(1, H, W, init_scale=100.0).double()
+    motion = SE2Motion(
+        ((H - 1) / 2.0, (W - 1) / 2.0),
+        enable_affine=True,
+    ).double()
+    model = SPIForwardModel(scene, motion, H, W).double()
+    angle = 0.31
+    velocity = torch.tensor([2.0, -3.0], dtype=torch.float64)
+    linear = torch.tensor([0.12, -0.08, 0.05], dtype=torch.float64)
+    with torch.no_grad():
+        scene.centers.copy_(
+            torch.tensor(
+                [[(H - 1) / 2.0, (W - 1) / 2.0]],
+                dtype=torch.float64,
+            )
+        )
+        motion.velocity.copy_(velocity)
+        motion.omega.copy_(torch.tensor(angle, dtype=torch.float64))
+        motion.lin.copy_(linear)
+
+    video = model.render_video(torch.tensor([1.0], dtype=torch.float64))
+
+    cosine = torch.cos(torch.tensor(angle, dtype=torch.float64))
+    sine = torch.sin(torch.tensor(angle, dtype=torch.float64))
+    rotation = torch.stack((cosine, -sine, sine, cosine)).reshape(2, 2)
+    symmetric = torch.tensor(
+        [[1.0 + linear[0], linear[2]],
+         [linear[2], 1.0 + linear[1]]],
+        dtype=torch.float64,
+    )
+    transform = rotation @ symmetric
+    gy, gx = torch.meshgrid(
+        torch.arange(H, dtype=torch.float64),
+        torch.arange(W, dtype=torch.float64),
+        indexing="ij",
+    )
+    output_coordinates = torch.stack((gy, gx), dim=-1)
+    center = torch.tensor(
+        [(H - 1) / 2.0, (W - 1) / 2.0],
+        dtype=torch.float64,
+    )
+    canonical = (
+        torch.einsum(
+            "ij,hwj->hwi",
+            torch.linalg.inv(transform),
+            output_coordinates - center - velocity,
+        )
+        + center
+    )
+    expected_inside = (
+        (canonical[..., 0] >= 0.0)
+        & (canonical[..., 0] <= H - 1)
+        & (canonical[..., 1] >= 0.0)
+        & (canonical[..., 1] <= W - 1)
+    )
+
+    assert expected_inside.any()
+    assert (~expected_inside).any()
+    assert torch.equal(video[0, 0] > 0.0, expected_inside)
+    video.sum().backward()
     _assert_finite_gradients(model)
