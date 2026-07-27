@@ -335,3 +335,36 @@ This permanent append-only ledger is intentionally empty of implementation recor
   `No broken requirements found.`
 - `git diff --check` → exit `0` with silent output. Test and verifier output
   was pristine, with no warnings or unexpected skips.
+
+## Task 3 Fix Round 1 — Clarify theta-TV objective (2026-07-27)
+
+- Fix base and clean starting HEAD:
+  `79cff5fb4949001c2bd0e676d4d5b56eb339095e`; the Task 3 commit was not
+  amended.
+- Corrected `CLAUDE.md` so `f(theta)` is unambiguously data fidelity and the
+  augmented objective and theta-step each show exactly one
+  `lambda_soft * TVtheta` term. No solver coefficient or implementation
+  changed.
+- Added review-strength coverage, not a fabricated RED: a deterministic
+  non-square float64 tensor computes the expected historical objective
+  independently as `mean(abs(dy)) + mean(abs(dx)) +
+  alpha * mean(abs(dt))`, then checks the shared helper and both compatibility
+  wrappers. Its isolated run → exit `0`, `1 passed in 0.04s`.
+- Focused Task 3 suite → exit `0`, `23 passed in 0.17s`.
+- Accumulated CPU suite → exit `0`,
+  `84 passed, 1 deselected in 12.13s`.
+- Real CUDA suite → exit `0`, `1 passed, 84 deselected in 0.51s`; one CUDA
+  test executed and zero skipped.
+- Full suite → exit `0`, `85 passed in 12.28s`.
+- Strict environment verification → exit `0`, fingerprint
+  `b5d6922a9f3a9638ee8826b9a74f00998cd3ac81aa25c03de016358e0e435a56`.
+- Strict implementation-provenance verification → exit `0`, four immutable
+  inputs verified at
+  `79cff5fb4949001c2bd0e676d4d5b56eb339095e`.
+- Targeted `CLAUDE.md` consistency inspection printed the data-fidelity
+  definition, augmented objective, explanatory definition, and theta-step,
+  then reported `theta_objective_contradiction_hits=0`.
+- `D:\conda\envs\spi\python.exe -m pip check` → exit `0`,
+  `No broken requirements found.`
+- `git diff --check` → exit `0` with silent output. All test and verifier
+  output was pristine, with no warnings or unexpected skips.

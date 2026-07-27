@@ -156,9 +156,9 @@ Auxiliary variable z (video domain), constraint R(θ) = z via augmented Lagrangi
 
 **Augmented Lagrangian (Boyd 2011 scaled form)**:
 ```
-L_ρ(θ, z, u) = f(θ) + g(z) + (ρ/2)‖R(θ) - z + u‖²
+L_ρ(θ, z, u) = f(θ) + λ_soft·TVθ(R(θ)) + g(z) + (ρ/2)‖R(θ) - z + u‖²
 ```
-where `f(θ)` = data fidelity + componentwise anisotropic mean soft TV. The prior `g(z)` is:
+where `f(θ)` is the data fidelity defined above. The prior `g(z)` is:
 - **TV mode**: `g(z) = λ·TVz(z)`, the pointwise isotropic sum solved by Chambolle dual projection.
 - **Diffusion (PnP) mode**: no explicit `g(z)` — the proximal step is *replaced* by a Gaussian
   video denoiser `D_σ(·)`, following the standard Plug-and-Play ADMM template (Venkatakrishnan

@@ -32,6 +32,28 @@ def test_solver_tv_wrappers_match_shared_anisotropic_mean(temporal_weight):
     torch.testing.assert_close(_soft_tv(x, temporal_weight), expected)
 
 
+def test_shared_regularizer_preserves_historical_ordinary_shape_formula():
+    x = torch.tensor(
+        [
+            0.0, 1.0, 4.0, 2.0, 3.0, 8.0, 5.0, 7.0,
+            2.0, 6.0, 1.0, 9.0, 4.0, 3.0, 7.0, 0.0,
+            5.0, 2.0, 8.0, 1.0, 6.0, 9.0, 3.0, 4.0,
+        ],
+        dtype=torch.float64,
+    ).reshape(3, 1, 2, 4)
+    temporal_weight = 0.3
+    expected = (
+        (x[:, :, 1:, :] - x[:, :, :-1, :]).abs().mean()
+        + (x[:, :, :, 1:] - x[:, :, :, :-1]).abs().mean()
+        + temporal_weight * (x[1:] - x[:-1]).abs().mean()
+    )
+    torch.testing.assert_close(
+        anisotropic_tv_mean(x, temporal_weight), expected
+    )
+    torch.testing.assert_close(tv_loss(x, temporal_weight), expected)
+    torch.testing.assert_close(_soft_tv(x, temporal_weight), expected)
+
+
 @pytest.mark.parametrize(
     ("shape", "temporal_weight"),
     [
