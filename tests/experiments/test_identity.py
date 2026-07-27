@@ -364,6 +364,57 @@ def test_checkpoint_hash_change_invalidates_identity():
     assert first.identity_sha256 != second.identity_sha256
 
 
+def test_logical_config_and_campaign_names_do_not_enter_run_identity():
+    resolved = {"solver": {"steps": 10}}
+    dataset = {"target": "tank", "measurements": 2560}
+    primary_logical_names = {
+        "campaign_id": "primary-v1",
+        "acquisition_config_id": "base",
+        "method_config_id": "default",
+    }
+    supplement_logical_names = {
+        "campaign_id": "supplement-grid-v1",
+        "acquisition_config_id": "renamed-base",
+        "method_config_id": "renamed-default",
+    }
+    assert primary_logical_names != supplement_logical_names
+    shared = {
+        "config_sha256": identity.resolved_config_sha256(resolved),
+        "dataset_identity_sha256": identity.resolved_config_sha256(dataset),
+    }
+
+    primary_named_config = _make_identity(**shared)
+    supplement_renamed_config = _make_identity(**shared)
+
+    assert primary_named_config.identity_sha256 == supplement_renamed_config.identity_sha256
+    assert "campaign_id" not in primary_named_config.payload()
+    assert "acquisition_config_id" not in primary_named_config.payload()
+    assert "method_config_id" not in primary_named_config.payload()
+    for unsupported, value in primary_logical_names.items():
+        with pytest.raises(TypeError, match="unexpected"):
+            identity.build_run_identity(
+                **_identity_kwargs(),
+                **{unsupported: value},
+            )
+
+
+def test_resolved_config_and_dataset_content_changes_invalidate_identity():
+    first = _make_identity(
+        config_sha256=identity.resolved_config_sha256({"steps": 10}),
+        dataset_identity_sha256=identity.resolved_config_sha256({"target": "tank"}),
+    )
+    changed_config = _make_identity(
+        config_sha256=identity.resolved_config_sha256({"steps": 11}),
+        dataset_identity_sha256=identity.resolved_config_sha256({"target": "tank"}),
+    )
+    changed_dataset = _make_identity(
+        config_sha256=identity.resolved_config_sha256({"steps": 10}),
+        dataset_identity_sha256=identity.resolved_config_sha256({"target": "digit5"}),
+    )
+
+    assert len({first.identity_sha256, changed_config.identity_sha256, changed_dataset.identity_sha256}) == 3
+
+
 @pytest.mark.parametrize(
     ("field", "replacement"),
     [
@@ -372,6 +423,11 @@ def test_checkpoint_hash_change_invalidates_identity():
         ("config_sha256", "4" * 64),
         ("dataset_identity_sha256", "5" * 64),
         ("assets_sha256", {"target": "6" * 64}),
+        ("checkpoints_sha256", {"diffusion": "6" * 64}),
+        ("method_id", "gsdiff_diffusion"),
+        ("target_id", "digit5"),
+        ("motion_id", "rotation"),
+        ("seed", 11),
         ("code_commit", "7" * 40),
         ("dependencies_sha256", "8" * 64),
         ("environment_lock_sha256", "9" * 64),
@@ -1113,6 +1169,174 @@ def test_environment_requirements_rejects_live_full_fingerprint_mismatch(
             requirements,
             environment_lock,
             live_fingerprint={**fingerprint, "gpu": "different"},
+        )
+
+
+def test_environment_requirements_compares_live_fingerprint_as_canonical_json(
+    tmp_path: Path,
+):
+    requirements = tmp_path / "requirements-lock.txt"
+    requirements.write_text("alpha==1\n", encoding="utf-8")
+    fingerprint = {
+        "installed_distributions": [{"name": "alpha", "version": "1"}],
+        "gpu": {"available": False},
+    }
+    lock = {
+        "schema_version": 1,
+        "fingerprint": fingerprint,
+        "fingerprint_sha256": identity.sha256_bytes(
+            identity.canonical_json_bytes(fingerprint)
+        ),
+    }
+    environment_lock = tmp_path / "environment-lock.json"
+    environment_lock.write_bytes(identity.canonical_json_bytes(lock))
+    python_equal_but_json_distinct = {
+        "installed_distributions": [{"name": "alpha", "version": "1"}],
+        "gpu": {"available": 0},
+    }
+    assert python_equal_but_json_distinct == fingerprint
+
+    with pytest.raises(ValueError, match="exactly"):
+        identity.verify_environment_requirements(
+            requirements,
+            environment_lock,
+            live_fingerprint=python_equal_but_json_distinct,
+        )
+
+
+def test_environment_requirements_rejects_requirement_projection_mismatch(
+    tmp_path: Path,
+):
+    requirements = tmp_path / "requirements-lock.txt"
+    requirements.write_text("alpha==2\n", encoding="utf-8")
+    fingerprint = {
+        "installed_distributions": [{"name": "alpha", "version": "1"}]
+    }
+    lock = {
+        "schema_version": 1,
+        "fingerprint": fingerprint,
+        "fingerprint_sha256": identity.sha256_bytes(
+            identity.canonical_json_bytes(fingerprint)
+        ),
+    }
+    environment_lock = tmp_path / "environment-lock.json"
+    environment_lock.write_bytes(identity.canonical_json_bytes(lock))
+
+    with pytest.raises(ValueError, match="requirements lock"):
+        identity.verify_environment_requirements(
+            requirements,
+            environment_lock,
+            live_fingerprint=fingerprint,
+        )
+
+
+@pytest.mark.parametrize("schema_version", [True, "1"])
+def test_environment_requirements_rejects_lock_schema_type_spoofs(
+    tmp_path: Path,
+    schema_version: object,
+):
+    requirements = tmp_path / "requirements-lock.txt"
+    requirements.write_text("alpha==1\n", encoding="utf-8")
+    fingerprint = {
+        "installed_distributions": [{"name": "alpha", "version": "1"}]
+    }
+    lock = {
+        "schema_version": schema_version,
+        "fingerprint": fingerprint,
+        "fingerprint_sha256": identity.sha256_bytes(
+            identity.canonical_json_bytes(fingerprint)
+        ),
+    }
+    environment_lock = tmp_path / "environment-lock.json"
+    environment_lock.write_bytes(identity.canonical_json_bytes(lock))
+
+    with pytest.raises(ValueError, match="schema version"):
+        identity.verify_environment_requirements(
+            requirements,
+            environment_lock,
+            live_fingerprint=fingerprint,
+        )
+
+
+def test_environment_requirements_rejects_stored_fingerprint_hash_mismatch(
+    tmp_path: Path,
+):
+    requirements = tmp_path / "requirements-lock.txt"
+    requirements.write_text("alpha==1\n", encoding="utf-8")
+    fingerprint = {
+        "installed_distributions": [{"name": "alpha", "version": "1"}]
+    }
+    lock = {
+        "schema_version": 1,
+        "fingerprint": fingerprint,
+        "fingerprint_sha256": "0" * 64,
+    }
+    environment_lock = tmp_path / "environment-lock.json"
+    environment_lock.write_bytes(identity.canonical_json_bytes(lock))
+
+    with pytest.raises(ValueError, match="hash mismatch"):
+        identity.verify_environment_requirements(
+            requirements,
+            environment_lock,
+            live_fingerprint=fingerprint,
+        )
+
+
+def test_requirements_projection_rejects_normalized_conflicting_versions(
+    tmp_path: Path,
+):
+    requirements = tmp_path / "requirements-lock.txt"
+    requirements.write_text(
+        "Alpha_Pkg==1\nalpha-pkg==2\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="conflicting versions"):
+        identity.requirements_dependencies_sha256(requirements)
+
+
+def test_requirements_projection_collapses_exact_normalized_duplicates(
+    tmp_path: Path,
+):
+    requirements = tmp_path / "requirements-lock.txt"
+    requirements.write_text(
+        "Alpha_Pkg==1\nalpha-pkg==1\n",
+        encoding="utf-8",
+    )
+
+    assert identity.requirements_dependencies_sha256(
+        requirements
+    ) == hashlib.sha256(
+        b'[{"name":"alpha-pkg","version":"1"}]'
+    ).hexdigest()
+
+
+def test_environment_requirements_rejects_live_mapping_subclass(
+    tmp_path: Path,
+):
+    class FingerprintSubclass(dict):
+        pass
+
+    requirements = tmp_path / "requirements-lock.txt"
+    requirements.write_text("alpha==1\n", encoding="utf-8")
+    fingerprint = {
+        "installed_distributions": [{"name": "alpha", "version": "1"}]
+    }
+    lock = {
+        "schema_version": 1,
+        "fingerprint": fingerprint,
+        "fingerprint_sha256": identity.sha256_bytes(
+            identity.canonical_json_bytes(fingerprint)
+        ),
+    }
+    environment_lock = tmp_path / "environment-lock.json"
+    environment_lock.write_bytes(identity.canonical_json_bytes(lock))
+
+    with pytest.raises(TypeError, match="unsupported JSON type"):
+        identity.verify_environment_requirements(
+            requirements,
+            environment_lock,
+            live_fingerprint=FingerprintSubclass(fingerprint),
         )
 
 

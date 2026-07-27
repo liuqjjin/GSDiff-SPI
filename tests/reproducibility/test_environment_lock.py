@@ -151,6 +151,16 @@ def test_environment_lock_rejects_invalid_payload(tmp_path):
         verifier.verify_environment_lock(path, strict=True)
 
 
+def test_environment_lock_rejects_boolean_schema_version(tmp_path):
+    lock, _ = _current_lock()
+    lock["schema_version"] = True
+    path = tmp_path / "environment-lock.json"
+    _write_lock(path, lock)
+
+    with pytest.raises(verifier.EnvironmentLockError, match="expected"):
+        verifier.verify_environment_lock(path, strict=False)
+
+
 def test_environment_lock_rejects_hash_mismatch(tmp_path):
     lock, _ = _current_lock()
     lock["fingerprint_sha256"] = "0" * 64
@@ -193,4 +203,24 @@ def test_strict_environment_lock_rejects_current_state_mismatch(
     monkeypatch.setattr(verifier, "collect_environment_fingerprint", lambda: current)
 
     with pytest.raises(verifier.EnvironmentLockError, match=field_name):
+        verifier.verify_environment_lock(path, strict=True)
+
+
+def test_strict_environment_lock_uses_canonical_json_equality(
+    tmp_path, monkeypatch
+):
+    lock, current = _current_lock()
+    lock["fingerprint"]["gpu"]["available"] = False
+    lock["fingerprint_sha256"] = _fingerprint_hash(lock["fingerprint"])
+    current["gpu"]["available"] = 0
+    assert current == lock["fingerprint"]
+    path = tmp_path / "environment-lock.json"
+    _write_lock(path, lock)
+    monkeypatch.setattr(
+        verifier,
+        "collect_environment_fingerprint",
+        lambda: current,
+    )
+
+    with pytest.raises(verifier.EnvironmentLockError, match="gpu"):
         verifier.verify_environment_lock(path, strict=True)

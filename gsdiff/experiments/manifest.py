@@ -189,6 +189,11 @@ def validate_aggregate_index(
     if record_ids != expected:
         raise ValueError("campaign index coverage must exactly equal expected identities")
     if manifest_paths is not None:
+        environment_hashes = _verify_environment_evidence(
+            requirements_lock,
+            environment_lock,
+            live_fingerprint,
+        )
         for run_identity in record_ids:
             path = manifest_paths.get(run_identity)
             if not isinstance(path, Path):
@@ -199,6 +204,7 @@ def validate_aggregate_index(
                 requirements_lock=requirements_lock,
                 environment_lock=environment_lock,
                 live_fingerprint=live_fingerprint,
+                verified_environment_hashes=environment_hashes,
             )
             if verified is None:
                 raise ValueError("campaign index requires a complete manifest")
@@ -235,6 +241,11 @@ def build_aggregate_index(
         raise TypeError("expected identities must be an exact list")
     expected = list(expected_identity_sha256s)
     records: list[dict[str, str]] = []
+    environment_hashes = _verify_environment_evidence(
+        requirements_lock,
+        environment_lock,
+        live_fingerprint,
+    )
     for run_identity in expected:
         path = manifest_paths.get(run_identity)
         if not isinstance(path, Path):
@@ -243,10 +254,22 @@ def build_aggregate_index(
             path, expected_identity_sha256=run_identity,
             requirements_lock=requirements_lock, environment_lock=environment_lock,
             live_fingerprint=live_fingerprint,
+            verified_environment_hashes=environment_hashes,
         )
         if verified is None:
             raise ValueError("campaign index requires a complete manifest")
         raw, manifest = verified
+        protocol = manifest["protocol"]
+        assert type(protocol) is dict
+        if (
+            protocol["scientific_contract_id"] != scientific_contract_id
+            or protocol["scientific_contract_sha256"]
+            != scientific_contract_sha256
+            or manifest["metric_version"] != metric_version
+        ):
+            raise ValueError(
+                "campaign index protocol or metric version disagrees with manifest"
+            )
         records.append(
             {
                 "identity_sha256": run_identity,
@@ -265,11 +288,7 @@ def build_aggregate_index(
         "expected_identity_sha256s": sorted(expected),
         "run_manifests": sorted(records, key=lambda item: item["identity_sha256"]),
     }
-    validate_aggregate_index(
-        index, manifest_paths=manifest_paths,
-        requirements_lock=requirements_lock, environment_lock=environment_lock,
-        live_fingerprint=live_fingerprint,
-    )
+    validate_aggregate_index(index)
     return index
 
 
@@ -297,6 +316,7 @@ def _load_complete_manifest_raw(
     requirements_lock: Path | None = None,
     environment_lock: Path | None = None,
     live_fingerprint: Mapping[str, object] | None = None,
+    verified_environment_hashes: Mapping[str, str] | None = None,
 ) -> tuple[bytes, dict[str, object]] | None:
     """Load a physical clean complete run directory, otherwise fail closed."""
     manifest_path = Path(path)
@@ -325,23 +345,22 @@ def _load_complete_manifest_raw(
         manifest_read.link_snapshot,
     ) not in initial_inventory:
         raise ValueError("manifest changed before run-directory verification")
-    if requirements_lock is None:
-        requirements_lock = _DEFAULT_REQUIREMENTS_LOCK
-    if environment_lock is None:
-        environment_lock = _DEFAULT_ENVIRONMENT_LOCK
-    if (requirements_lock is None) != (environment_lock is None):
-        raise ValueError("requirements_lock and environment_lock must be provided together")
-    if requirements_lock is not None and environment_lock is not None:
-        hashes = verify_environment_requirements(
-            requirements_lock, environment_lock, live_fingerprint=live_fingerprint
+    hashes = (
+        verified_environment_hashes
+        if verified_environment_hashes is not None
+        else _verify_environment_evidence(
+            requirements_lock,
+            environment_lock,
+            live_fingerprint,
         )
-        runtime = value["runtime"]
-        assert type(runtime) is dict
-        if (
-            runtime["dependencies_sha256"] != hashes["dependencies_sha256"]
-            or runtime["environment_lock_sha256"] != hashes["environment_lock_sha256"]
-        ):
-            raise ValueError("manifest runtime lock hashes do not match the strict environment")
+    )
+    runtime = value["runtime"]
+    assert type(runtime) is dict
+    if (
+        runtime["dependencies_sha256"] != hashes["dependencies_sha256"]
+        or runtime["environment_lock_sha256"] != hashes["environment_lock_sha256"]
+    ):
+        raise ValueError("manifest runtime lock hashes do not match the strict environment")
     _verify_complete_outputs(
         manifest_path,
         value,
@@ -351,6 +370,25 @@ def _load_complete_manifest_raw(
     # Task 5's atomic promotion is the writer-side boundary after this final
     # pathname check; this loader cannot lock out a mutation after it returns.
     return raw, value
+
+
+def _verify_environment_evidence(
+    requirements_lock: Path | None,
+    environment_lock: Path | None,
+    live_fingerprint: Mapping[str, object] | None,
+) -> dict[str, str]:
+    if requirements_lock is None and environment_lock is None:
+        requirements_lock = _DEFAULT_REQUIREMENTS_LOCK
+        environment_lock = _DEFAULT_ENVIRONMENT_LOCK
+    elif requirements_lock is None or environment_lock is None:
+        raise ValueError(
+            "requirements_lock and environment_lock must be provided together"
+        )
+    return verify_environment_requirements(
+        requirements_lock,
+        environment_lock,
+        live_fingerprint=live_fingerprint,
+    )
 
 
 def _validate_manifest_semantics(manifest: Mapping[str, object], *, identity: RunIdentity | None) -> None:
@@ -404,6 +442,9 @@ def _validate_manifest_semantics(manifest: Mapping[str, object], *, identity: Ru
     folded = [path.casefold() for path in paths]
     if len(folded) != len(set(folded)):
         raise ValueError("metric and artifact paths must not collide case-insensitively")
+    roles = [artifact["role"] for artifact in artifacts]
+    if len(roles) != len(set(roles)):
+        raise ValueError("artifact roles must be unique")
     for artifact in artifacts:
         if artifact["size_bytes"] < 0:
             raise ValueError("artifact size must be nonnegative")
@@ -564,7 +605,17 @@ def _open_regular_file(
     try:
         before_link = os.lstat(path)
         before = os.stat(path)
-        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        if (
+            not stat.S_ISREG(before_link.st_mode)
+            or not stat.S_ISREG(before.st_mode)
+        ):
+            raise ValueError(f"{noun} is not a regular file: {path}")
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
         descriptor = os.open(path, flags)
     except OSError as error:
         raise ValueError(f"cannot safely open {noun}: {path}") from error

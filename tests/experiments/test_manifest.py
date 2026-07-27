@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -29,6 +33,22 @@ _ROOT = Path(__file__).resolve().parents[2]
 _ENVIRONMENT_HASHES = json.loads(
     (_ROOT / "docs" / "reproducibility" / "environment-lock.json").read_text("utf-8")
 )["fingerprint_sha256"]
+
+
+def _make_directory_link_or_skip(link: Path, target: Path) -> None:
+    try:
+        os.symlink(target, link, target_is_directory=True)
+        return
+    except OSError:
+        if os.name != "nt":
+            pytest.skip("filesystem does not permit directory symlinks")
+    result = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        pytest.skip("filesystem does not permit directory junctions")
 
 
 def _identity(*, dirty: bool = False):
@@ -104,6 +124,69 @@ def test_manifest_rejects_config_content_that_disagrees_with_identity():
         validate_manifest(manifest)
 
 
+def _mutate_contract(manifest):
+    manifest["protocol"]["scientific_contract_id"] = "gsdiff-ablation-v1"
+    manifest["protocol"]["scientific_contract_sha256"] = "6" * 64
+
+
+def _mutate_dirty_source_pair(manifest):
+    manifest["code"]["dirty_worktree"] = True
+    manifest["code"]["source_tree_sha256"] = "6" * 64
+
+
+def _mutate_resolved_config(manifest):
+    resolved = {"solver": {"steps": 11}}
+    manifest["config"]["resolved"] = resolved
+    manifest["config"]["sha256"] = hashlib.sha256(
+        canonical_json_bytes(resolved)
+    ).hexdigest()
+
+
+def _mutate_metric_version(manifest):
+    manifest["metric_version"] = "metrics-v2"
+    manifest["metrics"]["version"] = "metrics-v2"
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        _mutate_contract,
+        lambda value: value["protocol"].__setitem__("method", "gsdiff_diffusion"),
+        lambda value: value["protocol"].__setitem__("target", "digit5"),
+        lambda value: value["protocol"].__setitem__("motion", "rot"),
+        lambda value: value["protocol"].__setitem__("seed", 11),
+        lambda value: value["code"].__setitem__("git_commit", "c" * 40),
+        _mutate_dirty_source_pair,
+        _mutate_resolved_config,
+        lambda value: value["inputs"].__setitem__(
+            "dataset_identity_sha256", "6" * 64
+        ),
+        lambda value: value["inputs"].__setitem__(
+            "assets", {"tank": "6" * 64}
+        ),
+        lambda value: value["inputs"].__setitem__(
+            "checkpoints", {"diffusion": "7" * 64}
+        ),
+        lambda value: value["runtime"].__setitem__(
+            "dependencies_sha256", "8" * 64
+        ),
+        lambda value: value["runtime"].__setitem__(
+            "environment_lock_sha256", "9" * 64
+        ),
+        _mutate_metric_version,
+        lambda value: value.__setitem__(
+            "execution_class", "compatibility_unblinded"
+        ),
+    ],
+)
+def test_manifest_rejects_valid_format_identity_field_mismatches(mutate):
+    manifest = _complete_manifest()
+    mutate(manifest)
+
+    with pytest.raises(ValueError, match="identity|invalid manifest|execution_class"):
+        validate_manifest(manifest)
+
+
 def test_dirty_diagnostic_complete_validates_but_is_not_reusable(tmp_path: Path):
     identity = _identity(dirty=True)
     manifest = _complete_manifest(identity)
@@ -147,6 +230,78 @@ def test_manifest_rejects_malformed_schema_and_native_values(mutate, message: st
     mutate(manifest)
 
     with pytest.raises((TypeError, ValueError), match=message):
+        validate_manifest(manifest)
+
+
+def test_manifest_rejects_direct_container_and_string_subclasses():
+    class DictSubclass(dict):
+        pass
+
+    class ListSubclass(list):
+        pass
+
+    class StringSubclass(str):
+        pass
+
+    with pytest.raises(TypeError, match="unsupported JSON type"):
+        validate_manifest(DictSubclass(_complete_manifest()))
+
+    manifest = _complete_manifest()
+    manifest["artifacts"] = ListSubclass()
+    with pytest.raises(TypeError, match="unsupported JSON type"):
+        validate_manifest(manifest)
+
+    manifest = _complete_manifest()
+    manifest["protocol"]["method"] = StringSubclass("gsdiff_tv")
+    with pytest.raises(TypeError, match="unsupported JSON type"):
+        validate_manifest(manifest)
+
+
+@pytest.mark.parametrize("literal", ["NaN", "Infinity", "-Infinity"])
+def test_loader_rejects_parsed_nonfinite_json_numbers(
+    tmp_path: Path,
+    literal: str,
+):
+    path, _ = _write_physical_complete(tmp_path)
+    raw = path.read_bytes()
+    mutated = raw.replace(b'"runtime_seconds":1.0', f'"runtime_seconds":{literal}'.encode())
+    assert mutated != raw
+    path.write_bytes(mutated)
+
+    with pytest.raises(ValueError, match="non-finite"):
+        load_complete_manifest(path)
+
+
+def _artifact(role: str, path: str) -> dict[str, object]:
+    return {
+        "role": role,
+        "path": path,
+        "sha256": "6" * 64,
+        "size_bytes": 1,
+        "schema_version": "artifact-v1",
+        "required": True,
+    }
+
+
+def test_manifest_rejects_duplicate_and_casefold_colliding_output_paths():
+    manifest = _complete_manifest()
+    manifest["artifacts"] = [
+        _artifact("first", "outputs/result.bin"),
+        _artifact("second", "OUTPUTS/RESULT.BIN"),
+    ]
+
+    with pytest.raises(ValueError, match="collide"):
+        validate_manifest(manifest)
+
+
+def test_manifest_rejects_duplicate_artifact_roles():
+    manifest = _complete_manifest()
+    manifest["artifacts"] = [
+        _artifact("reconstruction", "first.bin"),
+        _artifact("reconstruction", "second.bin"),
+    ]
+
+    with pytest.raises(ValueError, match="role"):
         validate_manifest(manifest)
 
 
@@ -249,6 +404,35 @@ def test_load_complete_manifest_rejects_a_symlinked_manifest_leaf(tmp_path: Path
         load_complete_manifest(path)
 
 
+def test_load_complete_manifest_rejects_a_linked_run_ancestor(tmp_path: Path):
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    path, manifest = _write_physical_complete(real_parent)
+    alias = tmp_path / "linked-parent"
+    _make_directory_link_or_skip(alias, real_parent)
+    linked_manifest = alias / manifest["identity_sha256"] / path.name
+
+    with pytest.raises(ValueError, match="symlink|reparse"):
+        load_complete_manifest(linked_manifest)
+
+
+def test_load_complete_manifest_rejects_a_nested_link_escape(tmp_path: Path):
+    path, manifest = _write_physical_complete(tmp_path)
+    original = path.parent / "reconstruction.npz"
+    original.unlink()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    escaped = outside / "reconstruction.npz"
+    escaped.write_bytes(b"artifact bytes")
+    nested = path.parent / "nested"
+    _make_directory_link_or_skip(nested, outside)
+    manifest["artifacts"][0]["path"] = "nested/reconstruction.npz"
+    path.write_bytes(canonical_json_bytes(manifest))
+
+    with pytest.raises(ValueError, match="symlink|reparse"):
+        load_complete_manifest(path)
+
+
 def test_single_handle_reader_detects_same_size_in_place_rewrite(tmp_path: Path, monkeypatch):
     path = tmp_path / "output.bin"
     path.write_bytes(b"original")
@@ -335,6 +519,56 @@ def test_output_hashing_streams_without_buffering_through_manifest_reader(
     assert size == len(payload)
 
 
+def test_safe_reader_rejects_a_nonregular_directory(tmp_path: Path):
+    with pytest.raises(ValueError, match="regular|safely open"):
+        manifest_module._read_regular_file(tmp_path, "output")
+
+
+def test_safe_reader_rejects_fifo_without_blocking(tmp_path: Path):
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("platform has no FIFO support")
+    fifo = tmp_path / "output.fifo"
+    os.mkfifo(fifo)
+    script = (
+        "from pathlib import Path;"
+        "from gsdiff.experiments.manifest import _read_regular_file;"
+        f"_read_regular_file(Path({str(fifo)!r}), 'output')"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=3,
+    )
+
+    assert result.returncode != 0
+    assert "regular" in result.stderr or "safely open" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("requirements_lock", "environment_lock"),
+    [
+        (_ROOT / "requirements-lock.txt", None),
+        (None, _ROOT / "docs" / "reproducibility" / "environment-lock.json"),
+    ],
+)
+def test_load_complete_manifest_rejects_asymmetric_lock_arguments(
+    tmp_path: Path,
+    requirements_lock: Path | None,
+    environment_lock: Path | None,
+):
+    path, _ = _write_physical_complete(tmp_path)
+
+    with pytest.raises(ValueError, match="provided together"):
+        load_complete_manifest(
+            path,
+            requirements_lock=requirements_lock,
+            environment_lock=environment_lock,
+        )
+
+
 def test_load_complete_manifest_rejects_duplicate_json_keys(tmp_path: Path):
     path = tmp_path / "manifest.json"
     path.write_text('{"status":"running","status":"failed"}', encoding="utf-8")
@@ -402,3 +636,119 @@ def test_primary_and_supplement_indices_share_one_byte_identical_run_manifest(tm
 
     assert manifest_path.read_bytes() == canonical_json_bytes(manifest)
     assert primary["run_manifests"] == supplement["run_manifests"]
+
+
+def test_build_aggregate_verifies_environment_and_reads_manifest_once(
+    tmp_path: Path, monkeypatch
+):
+    manifest_path, manifest = _write_physical_complete(tmp_path)
+    run_identity = manifest["identity_sha256"]
+    calls = {"environment": 0, "manifest_read": 0}
+    original_environment = manifest_module.verify_environment_requirements
+    original_load = manifest_module._load_unique_json
+
+    def count_environment(*args, **kwargs):
+        calls["environment"] += 1
+        return original_environment(*args, **kwargs)
+
+    def count_manifest_read(*args, **kwargs):
+        calls["manifest_read"] += 1
+        return original_load(*args, **kwargs)
+
+    monkeypatch.setattr(
+        manifest_module,
+        "verify_environment_requirements",
+        count_environment,
+    )
+    monkeypatch.setattr(
+        manifest_module,
+        "_load_unique_json",
+        count_manifest_read,
+    )
+
+    build_aggregate_index(
+        campaign_id="primary-v1",
+        campaign_sha256="1" * 64,
+        protocol_sha256="2" * 64,
+        scientific_contract_id="gsdiff-sim-v1",
+        scientific_contract_sha256=_HASH,
+        metric_version="metrics-v1",
+        expected_identity_sha256s=[run_identity],
+        manifest_paths={run_identity: manifest_path},
+    )
+
+    assert calls == {"environment": 1, "manifest_read": 1}
+
+
+def test_validate_aggregate_verifies_environment_and_reads_manifest_once(
+    tmp_path: Path, monkeypatch
+):
+    manifest_path, manifest = _write_physical_complete(tmp_path)
+    run_identity = manifest["identity_sha256"]
+    index = {
+        "schema_version": "experiment-aggregate-v1",
+        "document_kind": "campaign-index",
+        "campaign_id": "primary-v1",
+        "campaign_sha256": "1" * 64,
+        "protocol_sha256": "2" * 64,
+        "scientific_contract_id": "gsdiff-sim-v1",
+        "scientific_contract_sha256": _HASH,
+        "metric_version": "metrics-v1",
+        "expected_identity_sha256s": [run_identity],
+        "run_manifests": [
+            {
+                "identity_sha256": run_identity,
+                "manifest_sha256": hashlib.sha256(
+                    manifest_path.read_bytes()
+                ).hexdigest(),
+            }
+        ],
+    }
+    calls = {"environment": 0, "manifest_read": 0}
+    original_environment = manifest_module.verify_environment_requirements
+    original_load = manifest_module._load_unique_json
+
+    def count_environment(*args, **kwargs):
+        calls["environment"] += 1
+        return original_environment(*args, **kwargs)
+
+    def count_manifest_read(*args, **kwargs):
+        calls["manifest_read"] += 1
+        return original_load(*args, **kwargs)
+
+    monkeypatch.setattr(
+        manifest_module,
+        "verify_environment_requirements",
+        count_environment,
+    )
+    monkeypatch.setattr(
+        manifest_module,
+        "_load_unique_json",
+        count_manifest_read,
+    )
+
+    validate_aggregate_index(
+        index,
+        manifest_paths={run_identity: manifest_path},
+    )
+
+    assert calls == {"environment": 1, "manifest_read": 1}
+
+
+def test_build_aggregate_cross_checks_contract_during_physical_pass(
+    tmp_path: Path,
+):
+    manifest_path, manifest = _write_physical_complete(tmp_path)
+    run_identity = manifest["identity_sha256"]
+
+    with pytest.raises(ValueError, match="protocol"):
+        build_aggregate_index(
+            campaign_id="primary-v1",
+            campaign_sha256="1" * 64,
+            protocol_sha256="2" * 64,
+            scientific_contract_id="gsdiff-ablation-v1",
+            scientific_contract_sha256="6" * 64,
+            metric_version="metrics-v1",
+            expected_identity_sha256s=[run_identity],
+            manifest_paths={run_identity: manifest_path},
+        )

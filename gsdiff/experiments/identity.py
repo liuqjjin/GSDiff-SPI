@@ -150,7 +150,7 @@ def verify_environment_requirements(
         raise ValueError("requirements lock does not match environment lock distributions")
     current = live_fingerprint if live_fingerprint is not None else collect_environment_fingerprint()
     _validate_exact_json(current)
-    if current != fingerprint:
+    if canonical_json_bytes(current) != canonical_json_bytes(fingerprint):
         raise ValueError("live environment fingerprint does not exactly match environment lock")
     if _distribution_projection(current) != requirement_records:
         raise ValueError("live environment distributions do not match requirements lock")

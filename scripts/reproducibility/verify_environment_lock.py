@@ -108,11 +108,16 @@ def verify_environment_lock(
 
     if strict:
         current_fingerprint = collect_environment_fingerprint()
-        if current_fingerprint != stored_fingerprint:
+        if canonical_json_bytes(current_fingerprint) != canonical_json_bytes(
+            stored_fingerprint
+        ):
             fields = sorted(
                 key
                 for key in set(current_fingerprint) | set(stored_fingerprint)
-                if current_fingerprint.get(key) != stored_fingerprint.get(key)
+                if key not in current_fingerprint
+                or key not in stored_fingerprint
+                or canonical_json_bytes(current_fingerprint[key])
+                != canonical_json_bytes(stored_fingerprint[key])
             )
             raise EnvironmentLockError(
                 "current environment mismatch in: " + ", ".join(fields)
