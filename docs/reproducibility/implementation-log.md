@@ -2135,3 +2135,20 @@ immutable closure commit.
 
 Fix Round 1 is ready for the required whole-plan re-review. No new final
 plan-completion closure is claimed here.
+
+## Correctness whole-plan Fix Round 1 reclosure — Reviewer approved (2026-07-27)
+
+- Reviewed fix base:
+  `106ffb21422f1bb19beabbb6ef8acc355498c627`.
+- Approved fix commit:
+  `bd35b19161fd20fcee8e7be566b28a0660da8987`.
+- The same whole-plan reviewer found all six original findings
+  **ADDRESSED**, with **0 Blocker, 0 Major, 0 Minor** open and
+  **0 Critical, 0 Important, 0 Minor** new breakage.
+- Fresh reviewer probes passed:
+  `22` solver tests, `4` Gaussian/INR tests,
+  `177` import-boundary/semantic-trust tests, and
+  `4` explicit-truth/legacy compatibility tests.
+
+This re-closes the corrective implementation ledger only. The immutable
+post-reclosure completion gate is still pending and is not claimed here.
