@@ -1,9 +1,10 @@
-"""Capability-safe in-process adapters for the seven baseline methods."""
+"""Capability-safe in-process adapters and canonical family dispatch."""
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 import hashlib
+from pathlib import Path
 import random
 
 import numpy as np
@@ -12,7 +13,7 @@ import torch
 from gsdiff.data._artifact_models import SPIAcquisitionData
 
 from .child_outputs import MethodChildResult
-from .methods import AlgorithmSeed, ResolvedMethod
+from .methods import AlgorithmSeed, CANONICAL_METHOD_IDS, ResolvedMethod
 
 
 BASELINE_METHOD_IDS = (
@@ -383,3 +384,84 @@ def run_baseline_method(
     runner = _RUNNER_TABLE[method.method_id]
     with _algorithm_rng(algorithm_seed):
         return runner(method, acquisition, algorithm_seed, device)
+
+
+def _run_canonical_baseline(
+    method: ResolvedMethod,
+    acquisition: SPIAcquisitionData,
+    algorithm_seed: AlgorithmSeed,
+    checkpoint_paths: Mapping[str, Path],
+    device: str,
+) -> MethodChildResult:
+    if checkpoint_paths:
+        raise ValueError("baseline methods do not accept checkpoint paths")
+    return run_baseline_method(
+        method,
+        acquisition,
+        algorithm_seed=algorithm_seed,
+        device=device,
+    )
+
+
+def _run_canonical_gsdiff(
+    method: ResolvedMethod,
+    acquisition: SPIAcquisitionData,
+    algorithm_seed: AlgorithmSeed,
+    checkpoint_paths: Mapping[str, Path],
+    device: str,
+) -> MethodChildResult:
+    from .gsdiff_adapter import run_gsdiff_method
+
+    return run_gsdiff_method(
+        method,
+        acquisition,
+        algorithm_seed=algorithm_seed,
+        checkpoint_paths=checkpoint_paths,
+        device=device,
+    )
+
+
+_CanonicalRunner = Callable[
+    [
+        ResolvedMethod,
+        SPIAcquisitionData,
+        AlgorithmSeed,
+        Mapping[str, Path],
+        str,
+    ],
+    MethodChildResult,
+]
+_CANONICAL_RUNNER_TABLE: dict[str, _CanonicalRunner] = {
+    **{method_id: _run_canonical_baseline for method_id in BASELINE_METHOD_IDS},
+    **{
+        method_id: _run_canonical_gsdiff
+        for method_id in CANONICAL_METHOD_IDS[len(BASELINE_METHOD_IDS):]
+    },
+}
+if tuple(_CANONICAL_RUNNER_TABLE) != CANONICAL_METHOD_IDS:
+    raise RuntimeError("canonical runner table does not match canonical IDs")
+
+
+def run_canonical_method(
+    method: ResolvedMethod,
+    acquisition: SPIAcquisitionData,
+    *,
+    algorithm_seed: AlgorithmSeed,
+    checkpoint_paths: Mapping[str, Path],
+    device: str,
+) -> MethodChildResult:
+    """Dispatch one exact canonical method without importing other families."""
+    if type(method) is not ResolvedMethod:
+        raise TypeError("method must be a ResolvedMethod")
+    runner = _CANONICAL_RUNNER_TABLE.get(method.method_id)
+    if runner is None:
+        raise ValueError(f"unsupported canonical method: {method.method_id}")
+    if not isinstance(checkpoint_paths, Mapping):
+        raise TypeError("checkpoint_paths must be a mapping")
+    return runner(
+        method,
+        acquisition,
+        algorithm_seed,
+        checkpoint_paths,
+        device,
+    )

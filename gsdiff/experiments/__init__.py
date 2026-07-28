@@ -1,5 +1,7 @@
 """Reproducibility identity helpers for experiments."""
 
+from importlib import import_module
+
 from .identity import (
     canonical_json_bytes,
     collect_environment_fingerprint,
@@ -26,7 +28,24 @@ from .child_outputs import (
     validate_method_child_outputs_v2,
     write_method_child_outputs_v2,
 )
-from .adapters import BASELINE_METHOD_IDS, run_baseline_method
+from .adapters import (
+    BASELINE_METHOD_IDS,
+    run_baseline_method,
+    run_canonical_method,
+)
+
+_LAZY_GSDIFF_EXPORTS = {
+    "GSDIFF_METHOD_IDS",
+    "run_gsdiff_method",
+}
+
+
+def __getattr__(name):
+    if name not in _LAZY_GSDIFF_EXPORTS:
+        raise AttributeError(name)
+    value = getattr(import_module(".gsdiff_adapter", package=__name__), name)
+    globals()[name] = value
+    return value
 
 __all__ = [
     "canonical_json_bytes",
@@ -49,4 +68,7 @@ __all__ = [
     "write_method_child_outputs_v2",
     "BASELINE_METHOD_IDS",
     "run_baseline_method",
+    "GSDIFF_METHOD_IDS",
+    "run_gsdiff_method",
+    "run_canonical_method",
 ]

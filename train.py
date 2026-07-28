@@ -63,6 +63,17 @@ def _record_sigma_used(info, prior):
     return sigma_used
 
 
+def _admm_warmup_counts(solver_config):
+    """Resolve independent warmups while preserving the legacy split name."""
+    splitting = getattr(
+        solver_config,
+        "splitting_warmup_outer",
+        getattr(solver_config, "admm_n_warmup", 0),
+    )
+    motion = getattr(solver_config, "motion_warmup_outer", 0)
+    return splitting, motion
+
+
 def _write_results_json(path, results, history):
     """Persist explicitly labelled legacy compatibility results and history."""
     scalar_history = [
@@ -141,14 +152,28 @@ def save_loss_curve(history, out_path, solver_type):
         # spurious "X" that looks like the losses cancelling. Mask the warmup span
         # (in_warmup=True) so only the true post-warmup primal residual is drawn,
         # and overlay the actual ADMM coupling term (ρ/2)‖R(θ)-(z-u)‖².
-        pr = [h["prim_res"] if not h.get("in_warmup", False) else float("nan")
-              for h in history]
+        pr = [
+            h["prim_res"]
+            if not h.get(
+                "in_splitting_warmup", h.get("in_warmup", False)
+            )
+            else float("nan")
+            for h in history
+        ]
         ax.semilogy(pr, label="primal residual (post-warmup)")
         if any(h.get("loss_consist", 0) for h in history):
             lc = [h["loss_consist"] if h.get("loss_consist", 0) > 0 else float("nan")
                   for h in history]
             ax.semilogy(lc, label=r"consistency (ρ/2)‖R-(z-u)‖²")
-        n_warmup = sum(bool(h.get("in_warmup", False)) for h in history)
+        n_warmup = sum(
+            bool(
+                h.get(
+                    "in_splitting_warmup",
+                    h.get("in_warmup", False),
+                )
+            )
+            for h in history
+        )
         if 0 < n_warmup < len(history):
             ax.axvline(n_warmup, ls="--", color="gray", alpha=0.5,
                        label=f"warmup end (iter {n_warmup})")
@@ -190,7 +215,8 @@ def _estimated_motion_trajectory(motion_parameters, time_grid):
     return np.column_stack((translation, rotation)).astype(np.float32)
 
 
-def main(argv=None):
+def _run_legacy_compatibility(argv=None):
+    """Run the legacy evaluation/figure CLI retained for compatibility."""
     args = parse_args(argv)
     with open(args.config, encoding='utf-8') as f:
         raw = yaml.safe_load(f)
@@ -365,6 +391,7 @@ def main(argv=None):
 
     if cfg.solver.type == "admm":
         _s = cfg.solver
+        _splitting_warmup, _motion_warmup = _admm_warmup_counts(_s)
         _prior_type = getattr(_s, 'prior_type', 'tv')
         if _prior_type == 'tv':
             prior = TVPrior3D(max_iter=50, temporal_weight=_temp_w) if _use_3dtv \
@@ -383,7 +410,7 @@ def main(argv=None):
                 ddim_spacing=getattr(_dp, 'ddim_spacing', 'linear'),
             )
             # Tell the prior how many z-step calls to expect
-            _n_zsteps = _s.num_outer - getattr(_s, 'admm_n_warmup', 0)
+            _n_zsteps = _s.num_outer - _splitting_warmup
             prior.set_n_steps(_n_zsteps)
         else:
             raise ValueError(f"Unknown prior_type: {_prior_type}")
@@ -396,7 +423,8 @@ def main(argv=None):
             n_inner=_s.num_inner,
             rho_growth=_s.rho_growth,
             loss_norm=getattr(_s, 'loss_norm', 'zscore'),
-            n_warmup=getattr(_s, 'admm_n_warmup', 0),
+            splitting_warmup_outer=_splitting_warmup,
+            motion_warmup_outer=_motion_warmup,
             n_outer=_s.num_outer,
             soft_tv_weight=getattr(_s, 'admm_soft_tv_weight', 0.0),
             temporal_tv_weight=_temp_w if _use_3dtv else 0.0,
@@ -420,8 +448,12 @@ def main(argv=None):
             # Honest ADMM diagnostics: prim_res is only a residual post-warmup
             # (z≡0 during warmup ⇒ prim=video energy); consist/u_norm/dual_res are
             # the real coupling terms. Print them so the convergence is legible.
-            _cons = f"  consist={info.get('loss_consist', 0):.5f}  u={info.get('u_norm', 0):.4f}" \
-                if not info.get('in_warmup', True) else "  (warmup)"
+            _cons = (
+                f"  consist={info.get('loss_consist', 0):.5f}  "
+                f"u={info.get('u_norm', 0):.4f}"
+                if not info.get('in_splitting_warmup', True)
+                else "  (warmup)"
+            )
             print(f"[{l:3d}/{L}]  data={info['loss_data']:.4f}  "
                   f"prim={info['prim_res']:.6f}  TV/px={tv_pp:.4f}  "
                   f"rho={info['rho']:.3f}{_sigma_str}{_cons}  "
@@ -616,6 +648,11 @@ def main(argv=None):
 
     print(f"\nAll results saved to: {out_dir}")
     return mean_p
+
+
+def main(argv=None):
+    """Compatibility CLI entry point; strict child execution uses the adapter."""
+    return _run_legacy_compatibility(argv)
 
 
 if __name__ == "__main__":

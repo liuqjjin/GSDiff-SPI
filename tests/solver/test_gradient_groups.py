@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 import torch
 from torch import nn
@@ -62,7 +64,8 @@ def make_admm_solver(
     fwd=None,
     n_inner=1,
     n_outer=1,
-    n_warmup=1,
+    splitting_warmup_outer=1,
+    motion_warmup_outer=0,
     **kwargs,
 ):
     if fwd is None:
@@ -75,9 +78,161 @@ def make_admm_solver(
         soft_tv_weight=0.0,
         n_inner=n_inner,
         n_outer=n_outer,
-        n_warmup=n_warmup,
+        splitting_warmup_outer=splitting_warmup_outer,
+        motion_warmup_outer=motion_warmup_outer,
         **kwargs,
     )
+
+
+def _parameter_bytes(parameters):
+    return tuple(
+        parameter.detach().cpu().numpy().tobytes()
+        for parameter in parameters
+    )
+
+
+def test_admm_motion_warmup_freezes_only_scene_parameters(
+    dummy_admm_inputs,
+):
+    solver = make_admm_solver(
+        dummy_admm_inputs,
+        splitting_warmup_outer=0,
+        motion_warmup_outer=1,
+        n_outer=2,
+    )
+    scene_before = _parameter_bytes(solver._scene_params)
+    motion_before = _parameter_bytes(solver._motion_params)
+
+    first = solver.step()
+
+    assert _parameter_bytes(solver._scene_params) == scene_before
+    assert _parameter_bytes(solver._motion_params) != motion_before
+    assert first["in_motion_warmup"] is True
+    assert first["in_splitting_warmup"] is False
+    assert first["is_transition"] is True
+    assert solver.rho > 0.1
+
+    second = solver.step()
+
+    assert _parameter_bytes(solver._scene_params) != scene_before
+    assert second["in_motion_warmup"] is False
+    assert second["in_splitting_warmup"] is False
+
+
+def test_admm_splitting_warmup_preserves_transition_without_scene_freeze(
+    dummy_admm_inputs,
+):
+    solver = make_admm_solver(
+        dummy_admm_inputs,
+        splitting_warmup_outer=1,
+        motion_warmup_outer=0,
+        n_outer=2,
+    )
+    scene_before = _parameter_bytes(solver._scene_params)
+    rho_before = solver.rho
+
+    first = solver.step()
+
+    assert _parameter_bytes(solver._scene_params) != scene_before
+    assert first["in_splitting_warmup"] is True
+    assert first["in_motion_warmup"] is False
+    assert solver.rho == rho_before
+
+    second = solver.step()
+
+    assert second["in_splitting_warmup"] is False
+    assert second["is_transition"] is True
+    assert solver.rho > rho_before
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("splitting_warmup_outer", True),
+        ("splitting_warmup_outer", None),
+        ("splitting_warmup_outer", -1),
+        ("splitting_warmup_outer", 1.0),
+        ("splitting_warmup_outer", 3),
+        ("motion_warmup_outer", True),
+        ("motion_warmup_outer", None),
+        ("motion_warmup_outer", -1),
+        ("motion_warmup_outer", 1.0),
+        ("motion_warmup_outer", 3),
+    ],
+)
+def test_admm_rejects_invalid_warmup_count(
+    dummy_admm_inputs, field, value,
+):
+    with pytest.raises(ValueError, match="warmup"):
+        make_admm_solver(
+            dummy_admm_inputs,
+            n_outer=2,
+            **{field: value},
+        )
+
+
+@pytest.mark.parametrize(
+    "field", ("splitting_warmup_outer", "motion_warmup_outer")
+)
+def test_admm_allows_warmup_equal_to_outer_budget(
+    dummy_admm_inputs, field,
+):
+    solver = make_admm_solver(
+        dummy_admm_inputs,
+        n_outer=2,
+        **{field: 2},
+    )
+    assert getattr(solver, field) == 2
+
+
+def test_admm_rejects_legacy_and_new_splitting_warmup_together(
+    dummy_admm_inputs,
+):
+    with pytest.raises(ValueError, match="together"):
+        make_admm_solver(
+            dummy_admm_inputs,
+            splitting_warmup_outer=0,
+            n_warmup=0,
+        )
+
+
+def test_admm_legacy_warmup_warns_and_maps_only_to_splitting(
+    dummy_admm_inputs,
+):
+    with pytest.warns(DeprecationWarning, match="splitting_warmup_outer"):
+        solver = ADMMSolver(
+            _DifferentiableForward(),
+            TVPrior(max_iter=1),
+            **dummy_admm_inputs,
+            loss_norm="target_std",
+            n_inner=1,
+            n_outer=2,
+            n_warmup=1,
+            motion_warmup_outer=0,
+        )
+
+    assert solver.splitting_warmup_outer == 1
+    assert solver.n_warmup == 1
+    assert solver.motion_warmup_outer == 0
+
+
+def test_train_warmup_binding_prefers_independent_registry_fields():
+    from train import _admm_warmup_counts
+
+    config = SimpleNamespace(
+        splitting_warmup_outer=3,
+        motion_warmup_outer=2,
+        admm_n_warmup=9,
+    )
+    assert _admm_warmup_counts(config) == (3, 2)
+
+
+def test_train_warmup_binding_keeps_legacy_splitting_fallback():
+    from train import _admm_warmup_counts
+
+    assert _admm_warmup_counts(
+        SimpleNamespace(admm_n_warmup=4)
+    ) == (4, 0)
 
 
 def test_freeze_and_active_parameter_helpers_clear_stale_gradients():
@@ -212,7 +367,7 @@ def test_admm_parameter_groups_follow_exact_four_step_lr_schedule(
         lr_motion=0.15,
         n_inner=2,
         n_outer=2,
-        n_warmup=2,
+        splitting_warmup_outer=2,
     )
     expected = [
         [0.009, 0.15],
@@ -249,7 +404,7 @@ def test_admm_single_update_consumes_final_lr_ratio(
         lr_motion=0.15,
         n_inner=1,
         n_outer=1,
-        n_warmup=1,
+        splitting_warmup_outer=1,
     )
     used_lrs = []
 
