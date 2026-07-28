@@ -14,6 +14,18 @@ from .methods import (
     derive_algorithm_seed,
     resolve_method_semantics,
 )
+from .objectives import (
+    BlindObjective,
+    heldout_normalized_l2,
+    select_by_heldout_normalized_l2,
+)
+from .child_outputs import (
+    MethodChildResult,
+    ReconstructionV2,
+    load_reconstruction_v2,
+    validate_method_child_outputs_v2,
+    write_method_child_outputs_v2,
+)
 
 __all__ = [
     "canonical_json_bytes",
@@ -26,4 +38,12 @@ __all__ = [
     "canonical_method_id",
     "derive_algorithm_seed",
     "resolve_method_semantics",
+    "BlindObjective",
+    "heldout_normalized_l2",
+    "select_by_heldout_normalized_l2",
+    "MethodChildResult",
+    "ReconstructionV2",
+    "load_reconstruction_v2",
+    "validate_method_child_outputs_v2",
+    "write_method_child_outputs_v2",
 ]

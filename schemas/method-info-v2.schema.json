@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Blind method child information v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "method_id", "method_config_id", "execution_family", "execution_profile", "dataset_identity_sha256", "measurements_file_sha256", "method_config_sha256", "semantic_config", "algorithm_seed", "parameter_count", "native_iteration", "warmup", "selected_hyperparameters", "selection", "convergence", "checkpoints", "motion_estimate", "reconstruction", "child_timing"],
+  "properties": {
+    "schema": {"const": "method-info-v2"},
+    "method_id": {"type": "string", "minLength": 1},
+    "method_config_id": {"type": "string", "minLength": 1},
+    "execution_family": {"type": "string", "minLength": 1},
+    "execution_profile": {"type": "string", "minLength": 1},
+    "dataset_identity_sha256": {"$ref": "#/$defs/sha256"},
+    "measurements_file_sha256": {"$ref": "#/$defs/sha256"},
+    "method_config_sha256": {"$ref": "#/$defs/sha256"},
+    "semantic_config": {"type": "object"},
+    "algorithm_seed": {"type": "object", "additionalProperties": false, "required": ["domain", "derivation_sha256", "seed_u32"], "properties": {"domain": {"const": "algorithm-seed-v1"}, "derivation_sha256": {"$ref": "#/$defs/sha256"}, "seed_u32": {"type": "integer", "minimum": 0, "maximum": 4294967295}}},
+    "parameter_count": {"type": "integer", "minimum": 0},
+    "native_iteration": {"type": "object", "additionalProperties": false, "required": ["unit", "budget"], "properties": {"unit": {"type": "string", "minLength": 1}, "budget": {"type": "integer", "minimum": 0}}},
+    "warmup": {"type": "object", "additionalProperties": false, "required": ["splitting", "motion"], "properties": {"splitting": {"type": "integer", "minimum": 0}, "motion": {"type": "integer", "minimum": 0}}},
+    "selected_hyperparameters": {"type": ["object", "array", "string", "number", "boolean", "null"]},
+    "selection": {"type": ["object", "array", "string", "number", "boolean", "null"]},
+    "convergence": {"type": "object", "additionalProperties": false, "required": ["status", "sampling_policy", "observed_count", "serialized_count", "history"], "properties": {"status": {"type": "string", "minLength": 1}, "sampling_policy": {"type": "string", "minLength": 1}, "observed_count": {"type": "integer", "minimum": 0}, "serialized_count": {"type": "integer", "minimum": 0, "maximum": 21}, "history": {"type": "array", "maxItems": 21, "items": {"type": "object"}}}},
+    "checkpoints": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["logical_id", "sha256"], "properties": {"logical_id": {"type": "string", "minLength": 1}, "sha256": {"$ref": "#/$defs/sha256"}}}},
+    "motion_estimate": {"type": "object", "additionalProperties": false, "required": ["present", "native_model"], "properties": {"present": {"type": "boolean"}, "native_model": {"type": "string", "minLength": 1}}},
+    "reconstruction": {"type": "object", "additionalProperties": false, "required": ["sha256", "array_descriptors"], "properties": {"sha256": {"$ref": "#/$defs/sha256"}, "array_descriptors": {"type": "object", "minProperties": 3, "additionalProperties": {"$ref": "#/$defs/array_descriptor"}}}},
+    "child_timing": {"type": "object", "additionalProperties": false, "required": ["started_at", "finished_at", "elapsed_seconds"], "properties": {"started_at": {"type": "string", "pattern": "Z$"}, "finished_at": {"type": "string", "pattern": "Z$"}, "elapsed_seconds": {"type": "number", "minimum": 0}}}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "array_descriptor": {"type": "object", "additionalProperties": false, "required": ["dtype", "shape", "sha256"], "properties": {"dtype": {"type": "string", "minLength": 1}, "shape": {"type": "array", "items": {"type": "integer", "minimum": 0}}, "sha256": {"$ref": "#/$defs/sha256"}}}
+  }
+}
