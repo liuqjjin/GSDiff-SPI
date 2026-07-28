@@ -174,7 +174,8 @@ def materialize_method_execution(
     source_root: Path,
     requested_runtime_device: str,
 ) -> MaterializedMethodExecution:
-    """Create a new path-private stage after validating every parent input."""
+    """Create a new Windows-only stage after validating every parent input."""
+    _require_windows_platform()
     requested_device, child_device, physical_cuda = _runtime_device(
         requested_runtime_device
     )
@@ -2452,11 +2453,7 @@ def _materialize_child_arguments(
 
 
 def _windows_system_root() -> Path:
-    if os.name != "nt":
-        return _resolved_real_directory(
-            Path(os.path.abspath(os.sep)),
-            noun="platform system root",
-        )
+    _require_windows_platform()
     try:
         import ctypes
 
@@ -2495,6 +2492,14 @@ def _windows_system_root() -> Path:
                 f"{alias} disagrees with authoritative Windows directory"
             )
     return authoritative.path
+
+
+def _require_windows_platform() -> None:
+    if os.name != "nt":
+        raise NotImplementedError(
+            "strict method child execution has a Windows-only "
+            "security contract"
+        )
 
 
 def _runtime_site_package_roots(runtime_root: Path) -> tuple[Path, ...]:

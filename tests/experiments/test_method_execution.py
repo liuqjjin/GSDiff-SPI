@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -159,6 +160,47 @@ def materialize(
         source_root=source_root,
         requested_runtime_device=requested_runtime_device,
     )
+
+
+def test_materializer_rejects_non_windows_before_inspecting_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gsdiff.experiments import execution
+
+    monkeypatch.setattr(execution, "os", SimpleNamespace(name="posix"))
+    with pytest.raises(NotImplementedError, match="Windows-only"):
+        execution.materialize_method_execution(
+            object(),
+            stage_root=object(),
+            measurements_source=object(),
+            measurements_file_sha256=object(),
+            dataset_identity_sha256=object(),
+            expected_acquisition_spec=object(),
+            algorithm_seed=object(),
+            checkpoint_store=object(),
+            python_executable=object(),
+            source_root=object(),
+            requested_runtime_device=object(),
+        )
+
+
+def test_bootstrap_rejects_non_windows_before_parsing_or_reading(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = importlib.util.spec_from_file_location(
+        "tested_non_windows_method_child_bootstrap",
+        SOURCE_ROOT
+        / "scripts"
+        / "experiments"
+        / "method_child_bootstrap.py",
+    )
+    assert spec is not None and spec.loader is not None
+    bootstrap = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bootstrap)
+    monkeypatch.setattr(bootstrap, "os", SimpleNamespace(name="posix"))
+
+    with pytest.raises(NotImplementedError, match="Windows-only"):
+        bootstrap.main()
 
 
 def minimal_source_root(tmp_path: Path) -> Path:
@@ -1768,6 +1810,134 @@ def test_audit_allows_write_then_read_only_in_declared_roots(
     assert target.read_text(encoding="utf-8", errors="strict") == "盲态验证"
 
 
+@pytest.mark.parametrize(
+    ("action", "target_kind", "expected_access"),
+    [
+        ("os-open-read", "measurements", "read"),
+        ("os-open-write", "child-output", "write"),
+    ],
+)
+def test_audit_authorizes_windows_low_level_os_open(
+    tmp_path: Path,
+    action: str,
+    target_kind: str,
+    expected_access: str,
+) -> None:
+    source, digest = measurement_source(tmp_path)
+    execution = materialize(tmp_path / "stage", source, digest)
+    target = (
+        execution.measurements_path
+        if target_kind == "measurements"
+        else execution.child_output_dir / "low-level-write.txt"
+    )
+
+    result = run_audited_child(execution, action=action, target=target)
+
+    assert result.returncode == 0, execution.stderr_path.read_text(
+        encoding="utf-8", errors="strict"
+    )
+    if target_kind == "child-output":
+        assert target.read_bytes() == "盲态验证".encode("utf-8")
+    assert any(
+        event.get("operation") == "open"
+        and event.get("decision") == "allow"
+        and event.get("access") == expected_access
+        and event.get("resolved_path") == str(target.resolve())
+        for event in load_audit_events(execution.audit_log_path)
+    )
+    validate_audit_log(
+        execution.audit_log_path,
+        expected_policy_sha256=execution.audit_policy_sha256,
+    )
+
+
+def test_audit_denies_windows_low_level_os_open_outside_write_roots(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "outside-low-level-write.txt"
+    sentinel = b"outside-low-level-write-must-not-change"
+    outside.write_bytes(sentinel)
+    source, digest = measurement_source(tmp_path)
+    execution = materialize(tmp_path / "stage", source, digest)
+
+    result = run_audited_child(
+        execution,
+        action="os-open-write",
+        target=outside,
+        expect_denied=True,
+    )
+
+    assert result.returncode == 0, execution.stderr_path.read_text(
+        encoding="utf-8", errors="strict"
+    )
+    assert outside.read_bytes() == sentinel
+    with pytest.raises(ValueError, match="denied"):
+        validate_audit_log(
+            execution.audit_log_path,
+            expected_policy_sha256=execution.audit_policy_sha256,
+        )
+
+
+def test_audit_denies_delete_on_close_for_exact_read_target(
+    tmp_path: Path,
+) -> None:
+    if os.name != "nt" or not hasattr(os, "O_TEMPORARY"):
+        pytest.skip("Windows O_TEMPORARY is unavailable")
+    source, digest = measurement_source(tmp_path)
+    execution = materialize(tmp_path / "stage", source, digest)
+    target = execution.measurements_path
+    before = target.read_bytes()
+
+    result = run_audited_child(
+        execution,
+        action="os-open-temporary",
+        target=target,
+        expect_denied=True,
+    )
+
+    assert result.returncode == 0, execution.stderr_path.read_text(
+        encoding="utf-8", errors="strict"
+    )
+    assert target.read_bytes() == before
+    with pytest.raises(ValueError, match="denied"):
+        validate_audit_log(
+            execution.audit_log_path,
+            expected_policy_sha256=execution.audit_policy_sha256,
+        )
+
+
+def test_v2_child_output_transaction_succeeds_under_real_audit_hook(
+    tmp_path: Path,
+) -> None:
+    source, digest = measurement_source(tmp_path)
+    execution = materialize(tmp_path / "stage", source, digest)
+
+    result = run_audited_child(
+        execution,
+        action="write-v2-outputs",
+        target=execution.child_output_dir,
+        target2=execution.method_config_path,
+    )
+
+    assert result.returncode == 0, execution.stderr_path.read_text(
+        encoding="utf-8", errors="strict"
+    )
+    assert {
+        path.name for path in execution.child_output_dir.iterdir()
+    } == {"method-info.json", "reconstruction.npz"}
+    assert all(
+        path.stat().st_size > 0
+        for path in execution.child_output_dir.iterdir()
+    )
+    assert "V2-HASHES=" in execution.stdout_path.read_text(
+        encoding="utf-8", errors="strict"
+    )
+    validate_audit_log(
+        execution.audit_log_path,
+        expected_policy_sha256=execution.audit_policy_sha256,
+    )
+
+
 def test_audit_rejects_preexisting_hardlink_leaf_before_external_write(
     tmp_path: Path,
 ) -> None:
@@ -1925,6 +2095,231 @@ def test_audit_denies_mutations_outside_write_roots(
     assert target.exists() == (action != "mkdir")
 
 
+@pytest.mark.parametrize(
+    ("action", "operation"),
+    [
+        ("audit-chown", "os.chown"),
+        ("audit-chflags", "os.chflags"),
+        ("audit-setxattr", "os.setxattr"),
+        ("audit-removexattr", "os.removexattr"),
+        ("audit-mknod", "os.mknod"),
+        (
+            "audit-unknown-mutation",
+            "os.future_filesystem_mutation",
+        ),
+    ],
+)
+def test_audit_denies_extended_and_unknown_mutation_events_outside_roots(
+    tmp_path: Path,
+    action: str,
+    operation: str,
+) -> None:
+    outside = tmp_path / "outside-extended-mutation"
+    outside.write_bytes(b"must-remain")
+    source, digest = measurement_source(tmp_path)
+    execution = materialize(tmp_path / "stage", source, digest)
+
+    result = run_audited_child(
+        execution,
+        action=action,
+        target=outside,
+        expect_denied=True,
+    )
+
+    assert result.returncode == 0, execution.stderr_path.read_text(
+        encoding="utf-8", errors="strict"
+    )
+    assert outside.read_bytes() == b"must-remain"
+    assert any(
+        event.get("operation") == operation
+        and event.get("decision") == "deny"
+        for event in load_audit_events(execution.audit_log_path)
+    )
+
+
+@pytest.mark.parametrize(
+    "action",
+    ["audit-chown-dir-fd", "audit-mknod-dir-fd"],
+)
+def test_audit_denies_extended_mutation_directory_descriptors(
+    tmp_path: Path,
+    action: str,
+) -> None:
+    outside = tmp_path / "outside-dir-fd"
+    outside.write_bytes(b"must-remain")
+    source, digest = measurement_source(tmp_path)
+    execution = materialize(tmp_path / "stage", source, digest)
+
+    result = run_audited_child(
+        execution,
+        action=action,
+        target=outside,
+        expect_denied=True,
+    )
+
+    assert result.returncode == 0, execution.stderr_path.read_text(
+        encoding="utf-8", errors="strict"
+    )
+    assert outside.read_bytes() == b"must-remain"
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        "audit-chown-fd",
+        "audit-setxattr-fd",
+        "audit-removexattr-fd",
+    ],
+)
+def test_audit_denies_extended_mutation_file_descriptors(
+    tmp_path: Path,
+    action: str,
+) -> None:
+    source, digest = measurement_source(tmp_path)
+    execution = materialize(tmp_path / "stage", source, digest)
+    before = execution.measurements_path.read_bytes()
+
+    result = run_audited_child(
+        execution,
+        action=action,
+        target=execution.measurements_path,
+        expect_denied=True,
+    )
+
+    assert result.returncode == 0, execution.stderr_path.read_text(
+        encoding="utf-8", errors="strict"
+    )
+    assert execution.measurements_path.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        "audit-chown-malformed",
+        "audit-chflags-malformed",
+        "audit-setxattr-malformed",
+        "audit-removexattr-malformed",
+    ],
+)
+def test_audit_denies_malformed_extended_mutation_events(
+    tmp_path: Path,
+    action: str,
+) -> None:
+    source, digest = measurement_source(tmp_path)
+    execution = materialize(tmp_path / "stage", source, digest)
+    target = execution.child_output_dir / "malformed-target"
+
+    result = run_audited_child(
+        execution,
+        action=action,
+        target=target,
+        expect_denied=True,
+    )
+
+    assert result.returncode == 0, execution.stderr_path.read_text(
+        encoding="utf-8", errors="strict"
+    )
+    assert not target.exists()
+
+
+@pytest.mark.parametrize(
+    "action",
+    ["winapi-create-file", "winapi-create-junction"],
+)
+def test_audit_denies_direct_windows_filesystem_primitives(
+    tmp_path: Path,
+    action: str,
+) -> None:
+    if os.name != "nt":
+        pytest.skip("direct Windows filesystem primitives are unavailable")
+    import _winapi
+
+    required = (
+        "CreateFile"
+        if action == "winapi-create-file"
+        else "CreateJunction"
+    )
+    if not hasattr(_winapi, required):
+        pytest.skip(f"_winapi.{required} is unavailable")
+    outside = tmp_path / "outside-winapi"
+    outside.mkdir()
+    if action == "winapi-create-file":
+        source_target = outside / "created.txt"
+        destination = None
+    else:
+        source_target = outside / "junction-source"
+        source_target.mkdir()
+        destination = outside / "created-junction"
+    source, digest = measurement_source(tmp_path)
+    execution = materialize(tmp_path / "stage", source, digest)
+
+    result = run_audited_child(
+        execution,
+        action=action,
+        target=source_target,
+        target2=destination,
+        expect_denied=True,
+    )
+
+    assert result.returncode == 0, execution.stderr_path.read_text(
+        encoding="utf-8", errors="strict"
+    )
+    if action == "winapi-create-file":
+        assert not source_target.exists()
+    else:
+        assert destination is not None and not destination.exists()
+
+
+@pytest.mark.parametrize(
+    "action",
+    ["chown", "chflags", "setxattr", "removexattr", "mknod"],
+)
+def test_audit_denies_supported_target_platform_extended_mutations(
+    tmp_path: Path,
+    action: str,
+) -> None:
+    if os.name != "nt" or not hasattr(os, action):
+        pytest.skip(f"{action} is unsupported by the Windows target")
+    outside = tmp_path / f"outside-{action}"
+    if action != "mknod":
+        outside.write_bytes(b"must-remain")
+    source, digest = measurement_source(tmp_path)
+    execution = materialize(tmp_path / "stage", source, digest)
+
+    result = run_audited_child(
+        execution,
+        action=action,
+        target=outside,
+        expect_denied=True,
+    )
+
+    assert result.returncode == 0, execution.stderr_path.read_text(
+        encoding="utf-8", errors="strict"
+    )
+    assert outside.exists() == (action != "mknod")
+
+
+def test_audit_denies_supported_file_descriptor_mutation(
+    tmp_path: Path,
+) -> None:
+    source, digest = measurement_source(tmp_path)
+    execution = materialize(tmp_path / "stage", source, digest)
+    target = execution.child_output_dir / "fd-mutation.txt"
+    target.write_bytes(b"must-remain")
+
+    result = run_audited_child(
+        execution,
+        action="truncate-fd",
+        target=target,
+        expect_denied=True,
+    )
+
+    assert result.returncode == 0, execution.stderr_path.read_text(
+        encoding="utf-8", errors="strict"
+    )
+    assert target.read_bytes() == b"must-remain"
+
+
 @pytest.mark.parametrize("action", ["rename", "symlink", "hardlink"])
 def test_audit_denies_two_path_mutations_outside_write_roots(
     tmp_path: Path,
@@ -1990,6 +2385,65 @@ def test_audit_hook_is_installed_before_strict_child_code(
     events = load_audit_events(execution.audit_log_path)
     assert events[0]["operation"] == "hook-installed"
     assert any(event.get("decision") == "deny" for event in events)
+
+
+@pytest.mark.parametrize(
+    ("action", "reentered_operation"),
+    [
+        ("reentry-open", "open"),
+        ("reentry-process", "subprocess.Popen"),
+    ],
+)
+def test_audit_governed_reentry_poisons_caught_child_execution(
+    tmp_path: Path,
+    action: str,
+    reentered_operation: str,
+) -> None:
+    source, digest = measurement_source(tmp_path)
+    execution = materialize(tmp_path / "stage", source, digest)
+    forbidden = tmp_path / (
+        "outside-secret.txt"
+        if action == "reentry-open"
+        else "nested-process-marker.txt"
+    )
+    if action == "reentry-open":
+        forbidden.write_text(
+            "forbidden-reentry-secret",
+            encoding="utf-8",
+        )
+
+    result = run_audited_child(
+        execution,
+        action=action,
+        target=execution.measurements_path,
+        target2=forbidden,
+    )
+
+    assert result.returncode == 0, execution.stderr_path.read_text(
+        encoding="utf-8", errors="strict"
+    )
+    stdout = execution.stdout_path.read_text(
+        encoding="utf-8", errors="strict"
+    )
+    assert "REENTRY-LEAK=" not in stdout
+    assert "REENTRY-DENIED-CAUGHT" in stdout
+    assert "REENTRY-OUTER-DENIED-CAUGHT" in stdout
+    if action == "reentry-process":
+        assert not forbidden.exists()
+    events = load_audit_events(execution.audit_log_path)
+    assert any(
+        event.get("operation") == "audit-reentry"
+        and event.get("decision") == "deny"
+        and event.get("reentered_operation") == reentered_operation
+        for event in events
+    )
+    assert events[-1].get("operation") == "bootstrap-finished"
+    assert events[-1].get("status") == "error"
+    with pytest.raises(ValueError, match="denied|unsuccessful|terminal"):
+        validate_audit_log(
+            execution.audit_log_path,
+            expected_policy_sha256=execution.audit_policy_sha256,
+        )
 
 
 def test_audit_fresh_import_creates_no_bytecode_or_denied_write(

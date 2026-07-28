@@ -28,6 +28,19 @@ _UTC_TIMESTAMP = re.compile(
     flags=re.ASCII,
 )
 _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+_OPEN_ACCESS_MODE_MASK = getattr(
+    os,
+    "O_ACCMODE",
+    os.O_WRONLY | os.O_RDWR,
+)
+_MUTATING_OPEN_FLAGS = (
+    os.O_CREAT
+    | os.O_TRUNC
+    | os.O_APPEND
+    | getattr(os, "O_EXCL", 0)
+    | getattr(os, "O_TEMPORARY", 0)
+    | getattr(os, "O_TMPFILE", 0)
+)
 _POLICY_KEYS = frozenset(
     {
         "schema",
@@ -64,11 +77,35 @@ _SINGLE_WRITE_EVENTS = frozenset(
         "os.mkdir",
         "os.truncate",
         "os.chmod",
+        "os.chown",
+        "os.chflags",
         "os.utime",
+        "os.setxattr",
+        "os.removexattr",
+    }
+)
+_SINGLE_WRITE_EVENT_ARITIES = MappingProxyType(
+    {
+        "os.remove": 2,
+        "os.rmdir": 2,
+        "os.mkdir": 3,
+        "os.truncate": 2,
+        "os.chmod": 3,
+        "os.chown": 4,
+        "os.chflags": 2,
+        "os.utime": 4,
+        "os.setxattr": 4,
+        "os.removexattr": 2,
     }
 )
 _TWO_WRITE_EVENTS = frozenset({"os.rename"})
 _ALWAYS_DENIED_LINK_EVENTS = frozenset({"os.link", "os.symlink"})
+_DIRECT_WINDOWS_FILESYSTEM_EVENT_ARITIES = MappingProxyType(
+    {
+        "_winapi.CreateFile": 5,
+        "_winapi.CreateJunction": 2,
+    }
+)
 _MAX_AUDIT_LOG_BYTES = 128 * 1024 * 1024
 
 
@@ -161,6 +198,8 @@ class _AuditBoundary:
         self._sequence = 0
         self._lock = threading.Lock()
         self._local = threading.local()
+        self._poisoned = False
+        self._poisoned_event: str | None = None
         self._exact_reads = tuple(
             str(path) for path in policy["exact_read_paths"]
         )
@@ -179,12 +218,27 @@ class _AuditBoundary:
 
     def __call__(self, event: str, arguments: tuple[object, ...]) -> None:
         if getattr(self._local, "active", False):
+            if _is_governed_event(event):
+                self._poison_reentry(event)
+                raise PermissionError(
+                    f"audit policy denied governed re-entry: {event}"
+                )
+            return
+        if self._poisoned:
+            if _is_governed_event(event):
+                raise PermissionError(
+                    "audit boundary is poisoned after governed re-entry"
+                )
             return
         self._local.active = True
         try:
             if event == "open":
                 self._audit_open(arguments)
-            elif event in {"os.listdir", "os.scandir"}:
+            elif event in {
+                "os.listdir",
+                "os.scandir",
+                "os.add_dll_directory",
+            }:
                 raw = arguments[0] if arguments else None
                 allowed, display = self._authorize_path(
                     "." if raw is None else raw,
@@ -200,7 +254,10 @@ class _AuditBoundary:
                 self._decide_path(event, allowed, display)
             elif event in _SINGLE_WRITE_EVENTS:
                 raw = arguments[0] if arguments else object()
-                if _uses_directory_descriptor(event, arguments):
+                if (
+                    len(arguments) != _SINGLE_WRITE_EVENT_ARITIES[event]
+                    or _uses_directory_descriptor(event, arguments)
+                ):
                     self._deny_path(event, "<directory-descriptor>")
                 allowed, display = self._authorize_path(
                     raw,
@@ -210,7 +267,7 @@ class _AuditBoundary:
                 )
                 self._decide_path(event, allowed, display)
             elif event in _TWO_WRITE_EVENTS:
-                if len(arguments) < 2 or _uses_directory_descriptor(
+                if len(arguments) != 4 or _uses_directory_descriptor(
                     event, arguments
                 ):
                     self._deny_path(event, "<invalid-two-path-operation>")
@@ -257,6 +314,37 @@ class _AuditBoundary:
                     destination_path=second,
                 )
                 raise PermissionError(f"audit policy denied {event}")
+            elif event in _DIRECT_WINDOWS_FILESYSTEM_EVENT_ARITIES:
+                if (
+                    len(arguments)
+                    != _DIRECT_WINDOWS_FILESYSTEM_EVENT_ARITIES[event]
+                ):
+                    self._deny_path(event, "<invalid-arguments>")
+                first = _display_path(arguments[0])
+                if event == "_winapi.CreateJunction":
+                    second = _display_path(arguments[1])
+                    self.record(
+                        event,
+                        decision="deny",
+                        resolved_path=first,
+                        destination_path=second,
+                    )
+                else:
+                    desired_access = arguments[1]
+                    creation_disposition = arguments[3]
+                    if (
+                        type(desired_access) is not int
+                        or type(creation_disposition) is not int
+                    ):
+                        self._deny_path(event, "<invalid-access-intent>")
+                    self.record(
+                        event,
+                        decision="deny",
+                        resolved_path=first,
+                        desired_access=desired_access,
+                        creation_disposition=creation_disposition,
+                    )
+                raise PermissionError(f"audit policy denied {event}")
             elif _is_process_event(event):
                 self.record(
                     event,
@@ -266,10 +354,24 @@ class _AuditBoundary:
                 raise PermissionError(
                     f"audit policy denied nested process event {event}"
                 )
+            elif event in {"os.putenv", "os.unsetenv"}:
+                self.record(event, decision="allow")
             elif event in self._logged_unrelated:
                 self.record(event, decision="allow")
+            elif event.startswith("os."):
+                raw = arguments[0] if arguments else object()
+                self._deny_path(event, _display_path(raw))
+            if self._poisoned:
+                raise PermissionError(
+                    "audit boundary is poisoned after governed re-entry"
+                )
         finally:
             self._local.active = False
+
+    def _poison_reentry(self, event: str) -> None:
+        if not self._poisoned:
+            self._poisoned_event = event
+            self._poisoned = True
 
     def record(
         self,
@@ -313,6 +415,17 @@ class _AuditBoundary:
     def record_finished(self, *, status: str) -> None:
         if status not in {"success", "error"}:
             raise ValueError("bootstrap status must be success or error")
+        if self._poisoned:
+            self.record(
+                "audit-reentry",
+                decision="deny",
+                reentered_operation=(
+                    self._poisoned_event
+                    if self._poisoned_event is not None
+                    else "<unknown>"
+                ),
+            )
+            status = "error"
         self.record(
             "bootstrap-finished",
             decision="allow",
@@ -535,16 +648,10 @@ def _open_access(mode: object, flags: object) -> tuple[bool, bool]:
         return read, write
     if type(flags) is not int:
         raise ValueError("open flags are invalid")
-    access_mode = flags & os.O_ACCMODE
+    access_mode = flags & _OPEN_ACCESS_MODE_MASK
     read = access_mode in {os.O_RDONLY, os.O_RDWR}
     write = access_mode in {os.O_WRONLY, os.O_RDWR} or bool(
-        flags
-        & (
-            os.O_CREAT
-            | os.O_TRUNC
-            | os.O_APPEND
-            | getattr(os, "O_EXCL", 0)
-        )
+        flags & _MUTATING_OPEN_FLAGS
     )
     return read, write
 
@@ -649,6 +756,7 @@ def _uses_directory_descriptor(
         "os.rmdir": (1,),
         "os.mkdir": (2,),
         "os.chmod": (2,),
+        "os.chown": (3,),
         "os.utime": (3,),
         "os.rename": (2, 3),
     }.get(event, ())
@@ -668,6 +776,15 @@ def _is_process_event(event: str) -> bool:
         or event.startswith("os.exec")
         or event.startswith("os.fork")
         or "createprocess" in lowered
+    )
+
+
+def _is_governed_event(event: str) -> bool:
+    return (
+        event == "open"
+        or event.startswith("os.")
+        or event in _DIRECT_WINDOWS_FILESYSTEM_EVENT_ARITIES
+        or _is_process_event(event)
     )
 
 

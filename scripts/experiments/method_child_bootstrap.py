@@ -116,6 +116,7 @@ def _install_controlled_sys_path(
 
 
 def main() -> None:
+    _require_windows_platform()
     policy_arg, code_arg, entrypoint, child_arguments = (
         _parse_bootstrap_arguments(sys.argv[1:])
     )
@@ -197,6 +198,14 @@ def main() -> None:
             os.fsync(log_fd)
     finally:
         os.close(log_fd)
+
+
+def _require_windows_platform() -> None:
+    if os.name != "nt":
+        raise NotImplementedError(
+            "strict method child bootstrap has a Windows-only "
+            "security contract"
+        )
 
 
 def _real_directory(path: Path, *, noun: str) -> Path:
