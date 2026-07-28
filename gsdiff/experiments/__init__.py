@@ -33,6 +33,13 @@ from .adapters import (
     run_baseline_method,
     run_canonical_method,
 )
+from .execution import (
+    MaterializedMethodExecution,
+    MaterializedMethodRequest,
+    load_materialized_method_request,
+    materialize_method_execution,
+)
+from .audit import validate_audit_log
 
 _LAZY_GSDIFF_EXPORTS = {
     "GSDIFF_METHOD_IDS",
@@ -71,4 +78,9 @@ __all__ = [
     "GSDIFF_METHOD_IDS",
     "run_gsdiff_method",
     "run_canonical_method",
+    "MaterializedMethodExecution",
+    "MaterializedMethodRequest",
+    "load_materialized_method_request",
+    "materialize_method_execution",
+    "validate_audit_log",
 ]

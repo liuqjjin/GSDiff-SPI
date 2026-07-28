@@ -9,8 +9,6 @@ Usage:
 import argparse, json, os, time
 from pathlib import Path
 from types import SimpleNamespace
-import matplotlib; matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np, torch, yaml
 
 from gsdiff.utils import (set_seed, get_device, ensure_dir, normalize_01,
@@ -28,6 +26,16 @@ from gsdiff.data import (
     method_execution_policy,
     write_method_child_outputs,
 )
+
+
+def _compatibility_pyplot():
+    """Load plotting only for the legacy evaluation/figure workflow."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as pyplot
+
+    return pyplot
 
 
 def parse_args(argv=None):
@@ -108,6 +116,7 @@ def _write_metrics_json(path, gt_frames, recon_np):
 # ─── Visualization ────────────────────────────────────────────
 def save_comparison_figure(gt, dgi_img, recon_np, out_path, title=""):
     """Save GT vs DGI vs Recon for first/mid/last frames."""
+    plt = _compatibility_pyplot()
     T = gt.shape[0]
     idxs = [0, T // 2, T - 1]
     fig, axes = plt.subplots(3, len(idxs), figsize=(4 * len(idxs), 12))
@@ -129,6 +138,7 @@ def save_comparison_figure(gt, dgi_img, recon_np, out_path, title=""):
 
 def save_y_comparison(y_gt, y_pred_np, out_path):
     """Plot GT measurements vs predicted measurements."""
+    plt = _compatibility_pyplot()
     fig, axes = plt.subplots(2, 1, figsize=(12, 6))
     K = len(y_gt)
     axes[0].plot(y_gt, linewidth=0.5, alpha=0.8, label='GT y')
@@ -144,6 +154,7 @@ def save_y_comparison(y_gt, y_pred_np, out_path):
 
 
 def save_loss_curve(history, out_path, solver_type):
+    plt = _compatibility_pyplot()
     fig, ax = plt.subplots(figsize=(8, 4))
     ax.semilogy([h["loss_data"] for h in history], label="data fidelity")
     if "prim_res" in history[0]:
@@ -250,6 +261,7 @@ def _run_legacy_compatibility(argv=None):
         )
     blind_method_child = measurements_path is not None and truth_path is None
     execution_policy = method_execution_policy(truth_path=truth_path)
+    plt = None if blind_method_child else _compatibility_pyplot()
 
     if not blind_method_child:
         with open(os.path.join(out_dir, "config.yaml"), "w", encoding='utf-8') as f:
