@@ -1,94 +1,136 @@
-"""Motion-free classical compressive-sensing lower bounds.
+"""Motion-free TV-CS baselines with blind, physical-scale selection."""
+from __future__ import annotations
 
-(A) static_tvcs   — all K measurements → ONE image, tiled across T frames.
-                    The "ignore motion" bound (converges to a motion-blurred
-                    average of the moving scene).
-(B) perframe_tvcs — each frame reconstructed independently from its ~125
-                    measurements. The "no cross-frame sharing" bound; near-total
-                    failure at ~3% per-frame sampling IS the intended result.
+from collections.abc import Mapping
 
-Neither uses a motion model — that absence is the point. Both solve the convex
-  min_{x>=0} 0.5||A x - y_n||^2 + lambda*TV(x)
-by ADMM-TV (common.admm_tv), with lambda selected GT-free on a held-out
-measurement residual and then refit on all measurements. Requires
-time_assignment_mode == 'uniform' (per-frame model is exact only then).
-"""
 import numpy as np
 import torch
 
-from .common import (build_operator, admm_tv, evaluate_video,
-                     holdout_residual, select_by_holdout)
+from gsdiff.experiments.objectives import heldout_normalized_l2
+
+from .common import admm_tv, build_operator
+
 
 LAMBDA_GRID = [1e-3, 3e-3, 1e-2, 3e-2, 1e-1, 3e-1, 1e0]
 
 
-def _train_val_split(data, device):
-    """Return (A_train, y_train, fidx_train) and the held-out eval arrays.
-
-    Prefer the non-invasive eval set baked into SPIData; else carve k%10==7.
-    The forward operator is always built from TRAIN patterns only.
-    """
-    pat = torch.as_tensor(data.patterns, dtype=torch.float32, device=device)
-    y = torch.as_tensor(data.measurements, dtype=torch.float32, device=device)
-    fidx = torch.as_tensor(data.frame_idx, dtype=torch.long, device=device)
-    if getattr(data, 'eval_patterns', None) is not None:
-        ep = torch.as_tensor(data.eval_patterns, dtype=torch.float32, device=device)
-        em = torch.as_tensor(data.eval_measurements, dtype=torch.float32, device=device)
-        ef = torch.as_tensor(data.eval_frame_idx, dtype=torch.long, device=device)
-        return pat, y, fidx, ep, em, ef
-    mask = (torch.arange(len(y), device=device) % 10) == 7
-    return (pat[~mask], y[~mask], fidx[~mask], pat[mask], y[mask], fidx[mask])
+def _holdout(acquisition):
+    values = (
+        acquisition.holdout_patterns,
+        acquisition.holdout_measurements,
+        acquisition.holdout_frame_indices,
+    )
+    if any(value is None for value in values) or acquisition.holdout_K <= 0:
+        raise ValueError("a distinct holdout set is required for selection")
+    return values  # type: ignore[return-value]
 
 
-def static_tvcs(data, device='cpu', rho=0.5, n_admm=150, lam_grid=LAMBDA_GRID):
-    """(A) Static full-measurement TV-CS. Returns (recon[T,H,W], info)."""
-    assert getattr(data, 'time_assignment_mode', 'uniform') == 'uniform' or \
-        not hasattr(data, 'time_assignment_mode'), "per-frame/static CS need uniform assignment"
-    H, W, T = data.H, data.W, data.T
-    pat_tr, y_tr, _, ep, em, ef = _train_val_split(data, device)
-    A = build_operator(pat_tr).to(device)
-
-    def run(lam):
-        x = admm_tv(A, y_tr, H, W, lam, rho=rho, n_admm=n_admm)   # [H,W]
-        return x.unsqueeze(0).repeat(T, 1, 1)                     # tile → [T,H,W]
-
-    best, best_recon, table = select_by_holdout(
-        lam_grid, run, ep, em, ef, gt_frames=data.gt_frames)
-    psnrs, mean_p = evaluate_video(data.gt_frames, best_recon)
-    return best_recon.cpu().numpy(), {
-        "method": "static_tvcs", "lambda": best, "mean_psnr": mean_p,
-        "per_frame_psnr": psnrs, "selection_table": table,
-        "note": "motion-blur lower bound (single image tiled over T)"}
+def _solver(semantic_config: Mapping[str, object]) -> Mapping[str, object]:
+    solver = semantic_config.get("solver")
+    if not isinstance(solver, Mapping):
+        raise ValueError("CS solver semantics are required")
+    return solver
 
 
-def perframe_tvcs(data, device='cpu', rho=0.5, n_admm=120, lam_grid=LAMBDA_GRID):
-    """(B) Per-frame independent TV-CS. Returns (recon[T,H,W], info).
+def _selection(candidate_grid, candidate_reconstructions, holdout):
+    rows: list[dict[str, object]] = []
+    best_index = 0
+    best_value: float | None = None
+    for index, (candidate, reconstruction) in enumerate(zip(candidate_grid, candidate_reconstructions)):
+        objective = heldout_normalized_l2(reconstruction, *holdout)
+        rows.append({"candidate": candidate, "formula_id": objective.formula_id,
+                     "numerator": objective.numerator, "denominator": objective.denominator,
+                     "value": objective.value})
+        if best_value is None or objective.value < best_value:
+            best_index, best_value = index, objective.value
+    selected = candidate_grid[best_index]
+    return selected, {
+        "formula_id": "heldout-normalized-l2-v1",
+        "candidate_grid": list(candidate_grid),
+        "selected_candidate": selected,
+        "rows": rows,
+    }
 
-    One shared lambda for all frames (selected on the pooled holdout) keeps it a
-    single fair hyperparameter. Each frame is solved from its own 125 patterns.
-    """
-    H, W, T = data.H, data.W, data.T
-    pat_tr, y_tr, fidx_tr, ep, em, ef = _train_val_split(data, device)
 
-    # Assert the frame partition is clean on the TRAIN set (verify spec req).
-    counts = torch.bincount(fidx_tr, minlength=T)
-    assert (counts > 0).all(), f"some frame has no training patterns: {counts.tolist()}"
+def run_static_cs(acquisition, semantic_config: Mapping[str, object], algorithm_seed, device: str):
+    """Select λ on training rows, then refit the selected λ on all rows."""
+    del algorithm_seed
+    if acquisition.time_assignment_mode != "uniform":
+        raise ValueError("static_cs requires uniform frame assignment")
+    solver = _solver(semantic_config)
+    holdout = _holdout(acquisition)
+    H, W, T = acquisition.H, acquisition.W, acquisition.T
+    train_patterns = torch.tensor(acquisition.patterns, dtype=torch.float32, device=device)
+    train_measurements = torch.tensor(acquisition.measurements, dtype=torch.float32, device=device)
+    A = build_operator(train_patterns).to(device)
+    candidates = list(solver["lambda_grid"])
+    candidate_reconstructions = []
+    for lam in candidates:
+        image = admm_tv(A, train_measurements, H, W, float(lam), rho=float(solver["rho"]),
+                        n_admm=int(solver["n_admm"]), chambolle_iter=int(solver["chambolle_iter"]),
+                        nonneg=bool(solver["nonnegative"]))
+        candidate_reconstructions.append(image.unsqueeze(0).repeat(T, 1, 1).detach().cpu().numpy())
+    selected, selection = _selection(candidates, candidate_reconstructions, holdout)
+    all_patterns = np.concatenate((acquisition.patterns, holdout[0]), axis=0)
+    all_measurements = np.concatenate((acquisition.measurements, holdout[1]), axis=0)
+    A_all = build_operator(torch.as_tensor(all_patterns, dtype=torch.float32, device=device)).to(device)
+    final = admm_tv(A_all, torch.as_tensor(all_measurements, dtype=torch.float32, device=device), H, W,
+                    float(selected), rho=float(solver["rho"]), n_admm=int(solver["n_admm"]),
+                    chambolle_iter=int(solver["chambolle_iter"]), nonneg=bool(solver["nonnegative"]))
+    return final.unsqueeze(0).repeat(T, 1, 1).detach().cpu().numpy(), {
+        "selected_hyperparameters": {"lambda": selected}, "selection": selection,
+    }
 
-    A_by_frame, y_by_frame = [], []
-    for f in range(T):
-        m = fidx_tr == f
-        A_by_frame.append(build_operator(pat_tr[m]).to(device))
-        y_by_frame.append(y_tr[m])
 
-    def run(lam):
-        frames = [admm_tv(A_by_frame[f], y_by_frame[f], H, W, lam,
-                          rho=rho, n_admm=n_admm) for f in range(T)]
-        return torch.stack(frames, 0)                            # [T,H,W]
+def run_perframe_cs(acquisition, semantic_config: Mapping[str, object], algorithm_seed, device: str):
+    """Fit candidate λ values per frame, then refit using train plus holdout rows."""
+    del algorithm_seed
+    if acquisition.time_assignment_mode != "uniform":
+        raise ValueError("perframe_cs requires uniform frame assignment")
+    solver = _solver(semantic_config)
+    holdout = _holdout(acquisition)
+    H, W, T = acquisition.H, acquisition.W, acquisition.T
 
-    best, best_recon, table = select_by_holdout(
-        lam_grid, run, ep, em, ef, gt_frames=data.gt_frames)
-    psnrs, mean_p = evaluate_video(data.gt_frames, best_recon)
-    return best_recon.cpu().numpy(), {
-        "method": "perframe_tvcs", "lambda": best, "mean_psnr": mean_p,
-        "per_frame_psnr": psnrs, "selection_table": table,
-        "note": "no-cross-frame-sharing bound (~3% per-frame sampling)"}
+    def solve(patterns: np.ndarray, measurements: np.ndarray, indices: np.ndarray, lam: float) -> np.ndarray:
+        frames = []
+        for frame in range(T):
+            mask = indices == frame
+            if not np.any(mask):
+                raise ValueError("each frame requires at least one measurement")
+            A = build_operator(torch.as_tensor(patterns[mask], dtype=torch.float32, device=device)).to(device)
+            y = torch.as_tensor(measurements[mask], dtype=torch.float32, device=device)
+            frames.append(admm_tv(A, y, H, W, lam, rho=float(solver["rho"]),
+                                  n_admm=int(solver["n_admm"]), chambolle_iter=int(solver["chambolle_iter"]),
+                                  nonneg=bool(solver["nonnegative"])))
+        return torch.stack(frames).detach().cpu().numpy()
+
+    candidates = list(solver["lambda_grid"])
+    candidate_reconstructions = [solve(acquisition.patterns, acquisition.measurements, acquisition.frame_indices, float(lam)) for lam in candidates]
+    selected, selection = _selection(candidates, candidate_reconstructions, holdout)
+    final = solve(np.concatenate((acquisition.patterns, holdout[0]), axis=0),
+                  np.concatenate((acquisition.measurements, holdout[1]), axis=0),
+                  np.concatenate((acquisition.frame_indices, holdout[2]), axis=0), float(selected))
+    return final, {"selected_hyperparameters": {"lambda": selected}, "selection": selection}
+
+
+# Compatibility entry points are intentionally separate from strict dispatch.
+def static_tvcs(data, device="cpu", rho=0.5, n_admm=150, lam_grid=LAMBDA_GRID):
+    from ._evaluation import evaluate_video
+    semantic = {"solver": {"rho": rho, "n_admm": n_admm, "chambolle_iter": 100,
+                             "lambda_grid": list(lam_grid), "nonnegative": True}}
+    reconstruction, details = run_static_cs(data, semantic, None, device)
+    psnrs, mean = evaluate_video(data.gt_frames, reconstruction)
+    return reconstruction, {"method": "static_tvcs", "lambda": details["selected_hyperparameters"]["lambda"],
+                            "mean_psnr": mean, "per_frame_psnr": psnrs,
+                            "selection_table": details["selection"]["rows"]}
+
+
+def perframe_tvcs(data, device="cpu", rho=0.5, n_admm=120, lam_grid=LAMBDA_GRID):
+    from ._evaluation import evaluate_video
+    semantic = {"solver": {"rho": rho, "n_admm": n_admm, "chambolle_iter": 100,
+                             "lambda_grid": list(lam_grid), "nonnegative": True}}
+    reconstruction, details = run_perframe_cs(data, semantic, None, device)
+    psnrs, mean = evaluate_video(data.gt_frames, reconstruction)
+    return reconstruction, {"method": "perframe_tvcs", "lambda": details["selected_hyperparameters"]["lambda"],
+                            "mean_psnr": mean, "per_frame_psnr": psnrs,
+                            "selection_table": details["selection"]["rows"]}

@@ -243,3 +243,97 @@ def recinr_baseline(data, device="cuda", n_nodes=None, interp=False, seed=None, 
     psnrs, mean_p = evaluate_video(data.gt_frames, recon)
     return recon, {"method": "recinr", "mean_psnr": mean_p, "per_frame_psnr": psnrs,
                    "holdout": holdout, "note": "ReCINR INR (vendored, random-pattern forward)"}
+
+
+def run_recinr(acquisition, semantic_config, algorithm_seed, device: str):
+    """Strict native ReCINR core with an external raw-measurement snapshot score."""
+    representation = semantic_config.get("representation")
+    solver = semantic_config.get("solver")
+    if not hasattr(representation, "get") or not hasattr(solver, "get"):
+        raise ValueError("ReCINR representation and solver semantics are required")
+    holdout = (acquisition.holdout_patterns, acquisition.holdout_measurements,
+               acquisition.holdout_frame_indices)
+    if any(value is None for value in holdout) or acquisition.holdout_K <= 0:
+        raise ValueError("a distinct holdout set is required for selection")
+    H, W, T = acquisition.H, acquisition.W, acquisition.T
+    nodes = round(1.7 * T)
+    config = _paper_cfg(
+        H, W, T, seed=int(algorithm_seed.seed_u32),
+        hidden=int(representation["hidden_dim"]), render_layers=int(representation["render_layers"]),
+        warp_arch=str(representation["basis"]), warp_order=int(representation["basis_order"]),
+        warp_t_harmonics=int(representation["harmonics"]), flow_scale=float(representation["flow_scale"]),
+        pe_xy=int(representation["position_encoding_space"]), pe_t=int(representation["position_encoding_time"]),
+        pe_anneal_frac=float(solver["anneal_fraction"]), anchor_tau=float(solver["anchor_tau"]),
+        warm_epochs=int(solver["warm_steps"]), flow_only_epochs=int(solver["flow_steps"]), epochs=int(solver["joint_steps"]),
+        lr0=float(solver["lr_start"]), lr1=float(solver["lr_end"]), lam_flow_t=float(solver["lam_flow_t"]),
+        lam_flow_xy=float(solver["lam_flow_xy"]), lam_l1=float(solver["lam_l1"]), tv_xy=float(solver["tv_xy"]),
+        lam_tv_canon=float(solver["lam_tv_canon"]), lam_ttv=float(solver["lam_ttv"]),
+    )
+    config.K = nodes
+    torch.manual_seed(config.seed); np.random.seed(config.seed)
+    patterns = torch.tensor(acquisition.patterns, dtype=torch.float32, device=device).unsqueeze(1)
+    time_grid = torch.tensor(acquisition.time_grid, dtype=torch.float32, device=device)
+    indices = torch.tensor(acquisition.frame_indices, dtype=torch.long, device=device)
+    tau_meas = time_grid[indices]
+    node_times = torch.linspace(0, 1, nodes, device=device)
+    measurements = torch.tensor(acquisition.measurements, dtype=torch.float32, device=device)
+    target = ((measurements - measurements.mean()) / (measurements.std(unbiased=False) + 1e-8)).view(1, -1)
+    network = ReCINR(config).to(device)
+    canonical_parameters = [network.scene.features, *network.scene.renderer.parameters()]
+    dgi = dgi_image(acquisition.patterns, acquisition.measurements).to(device)
+    dgi_target = ((dgi - dgi.mean()) / (dgi.std() + 1e-8)).view(1, 1, H, W)
+    anchor = torch.tensor([config.anchor_tau], device=device)
+    if config.warm_epochs:
+        warm_optimizer = torch.optim.Adam(network.parameters(), lr=config.lr0)
+        network.scene.set_pe_progress(0.0)
+        for _ in range(config.warm_epochs):
+            warm_optimizer.zero_grad()
+            image, _ = network.scene(anchor)
+            F.mse_loss((image - image.mean()) / (image.std(unbiased=False) + 1e-8), dgi_target).backward()
+            warm_optimizer.step()
+    warp_parameters = [parameter for parameter in network.parameters() if not any(parameter is fixed for fixed in canonical_parameters)]
+    optimizer = torch.optim.Adam(warp_parameters, lr=config.lr0)
+    parameter_count = sum(parameter.numel() for group in optimizer.param_groups for parameter in group["params"])
+    schedule = None
+    total_steps = int(config.flow_only_epochs + config.epochs)
+    anneal_steps = max(1, int(config.pe_anneal_frac * total_steps))
+    best_reconstruction, best_score = None, None
+    for step in range(total_steps):
+        if step == config.flow_only_epochs:
+            for parameter in canonical_parameters:
+                parameter.requires_grad_(True)
+            optimizer = torch.optim.Adam(network.parameters(), lr=config.lr0)
+            parameter_count = sum(parameter.numel() for group in optimizer.param_groups for parameter in group["params"])
+            schedule = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, config.epochs), eta_min=config.lr1)
+        if step < config.flow_only_epochs:
+            for parameter in canonical_parameters:
+                parameter.requires_grad_(False)
+        network.scene.set_pe_progress(min(1.0, step / anneal_steps))
+        optimizer.zero_grad()
+        predicted, key_images, flow, raw_images = network(patterns=patterns, tau_meas=tau_meas, t_nodes=node_times, n_cycles=1)
+        loss = F.mse_loss(predicted[0], target[0]) + config.tv_xy * _tv_l1(key_images)
+        if config.lam_tv_canon > 0:
+            canonical = network.scene.canonical_image()
+            loss = loss + config.lam_tv_canon * _tv_l1((canonical - canonical.mean()) / (canonical.std(unbiased=False) + 1e-8))
+        if config.lam_l1 > 0:
+            centered = raw_images - torch.quantile(raw_images, 0.02)
+            loss = loss + config.lam_l1 * (centered.abs().mean() / (centered.square().mean().sqrt() + 1e-8))
+        if config.lam_flow_t > 0:
+            loss = loss + config.lam_flow_t * ((flow[1:] - flow[:-1]).square().mean())
+        if config.lam_flow_xy > 0:
+            loss = loss + config.lam_flow_xy * (((flow[:, :, 1:] - flow[:, :, :-1]).square().mean()) + ((flow[:, 1:, :] - flow[:, :-1, :]).square().mean()))
+        loss.backward(); torch.nn.utils.clip_grad_norm_(network.parameters(), 1.0); optimizer.step()
+        if schedule is not None:
+            schedule.step()
+        if step >= config.flow_only_epochs and (step % int(solver["snapshot_every"]) == 0 or step == total_steps - 1):
+            with torch.no_grad():
+                reconstruction = network.get_key_estimates(time_grid)[0][:, 0].cpu().numpy()
+            score = holdout_residual(reconstruction, *holdout)
+            if best_score is None or score < best_score:
+                best_reconstruction, best_score = reconstruction, score
+    with torch.no_grad():
+        network.scene.set_pe_progress(1.0)
+        if best_reconstruction is None:
+            best_reconstruction = network.get_key_estimates(time_grid)[0][:, 0].cpu().numpy()
+    return best_reconstruction, {"selected_hyperparameters": None, "selection": None,
+                                 "parameter_count": parameter_count}

@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .common import build_operator, evaluate_video, holdout_residual
+from .common import build_operator, dgi_image, holdout_residual
 
 
 def _zscore(a):
@@ -29,9 +29,11 @@ def _zscore(a):
 
 # ── GIDC U-Net (2D, 5-level, no-bias convs + BatchNorm + LeakyReLU, Sigmoid head) ──
 class GIDCUNet2D(nn.Module):
-    def __init__(self, base=16, in_channels=1):
+    def __init__(self, base=16, in_channels=1, channels=None):
         super().__init__()
-        c = [base, 2 * base, 4 * base, 8 * base, 16 * base]     # 16,32,64,128,256
+        c = list(channels) if channels is not None else [base, 2 * base, 4 * base, 8 * base, 16 * base]
+        if len(c) != 5 or any(type(value) is not int or value <= 0 for value in c):
+            raise ValueError("GIDC requires five positive U-Net channel counts")
 
         def blk(i, o):
             return nn.Sequential(
@@ -135,6 +137,7 @@ def static_gidc(data, device="cpu", n_steps=1500, xi_grid=(0.0, 0.01, 0.1, 1.0),
 
     results = [(xi, *run(xi)) for xi in xi_grid]
     xi_best, recon, res = min(results, key=lambda r: r[2])
+    from ._evaluation import evaluate_video
     psnrs, mean_p = evaluate_video(data.gt_frames, recon)
     return recon, {"method": "static_gidc", "xi": xi_best, "holdout": res,
                    "mean_psnr": mean_p, "per_frame_psnr": psnrs,
@@ -182,7 +185,65 @@ def dynamic_gidc3dtv(data, device="cpu", n_steps=2500,
 
     results = [(xy, t, *run(xy, t)) for xy in xi_xy_grid for t in xi_t_grid]
     xy_b, t_b, recon, res = min(results, key=lambda r: r[3])
+    from ._evaluation import evaluate_video
     psnrs, mean_p = evaluate_video(data.gt_frames, recon)
     return recon, {"method": "dynamic_gidc3dtv", "xi_xy": xy_b, "xi_t": t_b,
                    "holdout": res, "mean_psnr": mean_p, "per_frame_psnr": psnrs,
                    "note": "untrained deep prior + 3D TV, NO shared-SE(2) model"}
+
+
+def run_gidc3dtv(acquisition, semantic_config, algorithm_seed, device: str):
+    """Strict dynamic GIDC core: raw holdout selection, no evaluator inputs."""
+    solver = semantic_config.get("solver")
+    if not isinstance(solver, dict) and not hasattr(solver, "get"):
+        raise ValueError("GIDC solver semantics are required")
+    holdout = (acquisition.holdout_patterns, acquisition.holdout_measurements,
+               acquisition.holdout_frame_indices)
+    if any(value is None for value in holdout) or acquisition.holdout_K <= 0:
+        raise ValueError("a distinct holdout set is required for selection")
+    H, W, T = acquisition.H, acquisition.W, acquisition.T
+    patterns = torch.tensor(acquisition.patterns, dtype=torch.float32, device=device)
+    measurements = torch.tensor(acquisition.measurements, dtype=torch.float32, device=device)
+    indices = torch.tensor(acquisition.frame_indices, dtype=torch.long, device=device)
+    A = build_operator(patterns).to(device)
+    torch.manual_seed(int(algorithm_seed.seed_u32))
+    dgi = _zscore(dgi_image(patterns, measurements).to(device)).reshape(1, 1, H, W).repeat(T, 1, 1, 1)
+    fixed_noise = torch.randn(T, 1, H, W, device=device)
+    input_tensor = torch.cat([fixed_noise, dgi], dim=1)
+    target = _zscore(measurements)
+    candidates = [{"xi_xy": xy, "xi_t": temporal} for xy in solver["xi_xy"] for temporal in solver["xi_t"]]
+    rows, best_video, best_candidate, best_value, parameter_count = [], None, None, None, 0
+    for candidate in candidates:
+        torch.manual_seed(int(algorithm_seed.seed_u32))
+        network = GIDCUNet2D(in_channels=2, channels=solver["unet_channels"]).to(device).train()
+        optimizer = torch.optim.Adam(network.parameters(), lr=float(solver["lr"]),
+                                     betas=tuple(solver["betas"]), eps=float(solver["adam_epsilon"]))
+        parameter_count = sum(parameter.numel() for group in optimizer.param_groups for parameter in group["params"])
+        snapshot, snapshot_objective = None, None
+        for step in range(int(solver["n_steps"])):
+            for group in optimizer.param_groups:
+                group["lr"] = _lr_at(step, float(solver["lr"]))
+            optimizer.zero_grad()
+            video = network(input_tensor)[:, 0]
+            data_loss = F.mse_loss(_zscore(_measure_dynamic(A, video, indices, T)), target)
+            loss = data_loss + float(candidate["xi_xy"]) * _tv2d(_zscore(video)) + float(candidate["xi_t"]) * (video[1:] - video[:-1]).abs().mean()
+            loss.backward(); optimizer.step()
+            if step % int(solver["eval_every"]) == 0 or step == int(solver["n_steps"]) - 1:
+                value = video.detach().cpu().numpy()
+                objective = holdout_residual(value, *holdout)
+                if snapshot_objective is None or objective < snapshot_objective:
+                    snapshot, snapshot_objective = value, objective
+        assert snapshot is not None and snapshot_objective is not None
+        # Record the exact locked objective fields, not a normalized training loss.
+        from gsdiff.experiments.objectives import heldout_normalized_l2
+        objective = heldout_normalized_l2(snapshot, *holdout)
+        rows.append({"candidate": candidate, "formula_id": objective.formula_id,
+                     "numerator": objective.numerator, "denominator": objective.denominator,
+                     "value": objective.value})
+        if best_value is None or objective.value < best_value:
+            best_video, best_candidate, best_value = snapshot, candidate, objective.value
+    assert best_video is not None and best_candidate is not None
+    return best_video, {"selected_hyperparameters": best_candidate,
+                        "selection": {"formula_id": "heldout-normalized-l2-v1", "candidate_grid": candidates,
+                                      "selected_candidate": best_candidate, "rows": rows},
+                        "parameter_count": parameter_count}

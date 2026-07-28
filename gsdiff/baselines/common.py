@@ -17,6 +17,7 @@ import torch
 
 from ..prior.tv import TVPrior
 from ..data.dgi import dgi_reconstruct
+from ..experiments.objectives import heldout_normalized_l2
 
 
 def __getattr__(name):
@@ -97,7 +98,10 @@ def admm_tv(A, y, H, W, lam, rho=0.5, n_admm=150, chambolle_iter=100,
         zt = TVPrior._chambolle((x + u).reshape(H, W), w, chambolle_iter).reshape(-1)
         z = zt.clamp(min=0) if nonneg else zt
         u = u + x - z
-    return z.reshape(H, W).to(out_dtype)
+    # Conditioning is strictly an internal numerical device.  The returned
+    # image stays on the physical forward-model scale so callers can safely
+    # compare it with raw measurements.
+    return (z * float(b_scale)).reshape(H, W).to(out_dtype)
 
 
 # ── DGI init ─────────────────────────────────────────────────
@@ -108,44 +112,31 @@ def dgi_image(patterns, measurements):
     return torch.as_tensor(dgi_reconstruct(pat, y), dtype=torch.float32)
 
 
-# ── GT-free hyperparameter selection ─────────────────────────
-def _zscore_np(a):
-    a = np.asarray(a, dtype=np.float64)
-    return (a - a.mean()) / (a.std(ddof=1) + 1e-8)
-
-
 def holdout_residual(recon, eval_patterns, eval_measurements, eval_frame_idx):
-    """GT-free z-scored NRMSE of a [T,H,W] recon on a held-out measurement set."""
+    """Compatibility alias for the locked physical held-out objective."""
     rc = recon.cpu().numpy() if torch.is_tensor(recon) else np.asarray(recon)
     P = eval_patterns.cpu().numpy() if torch.is_tensor(eval_patterns) else np.asarray(eval_patterns)
     y = eval_measurements.cpu().numpy() if torch.is_tensor(eval_measurements) else np.asarray(eval_measurements)
     fi = eval_frame_idx.cpu().numpy() if torch.is_tensor(eval_frame_idx) else np.asarray(eval_frame_idx)
-    yhat = np.array([np.sum(P[k] * rc[fi[k]]) for k in range(len(y))])
-    zy, zyh = _zscore_np(y), _zscore_np(yhat)
-    return float(np.linalg.norm(zyh - zy) / (np.linalg.norm(zy) + 1e-12))
+    return heldout_normalized_l2(rc, P, y, fi).value
 
 
 def select_by_holdout(candidates, run_fn, eval_patterns, eval_measurements,
-                      eval_frame_idx, gt_frames=None):
-    """Pick the candidate with the lowest GT-free holdout residual.
-
-    candidates : list of hyperparameter values
-    run_fn     : cand -> recon [T,H,W]  (fit on TRAIN measurements only)
-    Returns    : (best_cand, best_recon, table) where table lists
-                 (cand, holdout_residual, psnr_if_gt_given) for logging.
-    PSNR is recorded only for logging; selection is ONLY on the holdout residual.
-    """
+                      eval_frame_idx):
+    """Compatibility selection using only the locked raw held-out objective."""
+    if eval_patterns is None or eval_measurements is None or eval_frame_idx is None:
+        raise ValueError("a distinct holdout set is required for selection")
     best, best_recon, best_res, table = None, None, np.inf, []
     for c in candidates:
         recon = run_fn(c)
-        res = holdout_residual(recon, eval_patterns, eval_measurements, eval_frame_idx)
-        if gt_frames is None:
-            psnr = None
-        else:
-            from ._evaluation import evaluate_video
-
-            psnr = evaluate_video(gt_frames, recon)[1]
-        table.append((c, res, psnr))
+        objective = heldout_normalized_l2(
+            recon.cpu().numpy() if torch.is_tensor(recon) else recon,
+            eval_patterns.cpu().numpy() if torch.is_tensor(eval_patterns) else eval_patterns,
+            eval_measurements.cpu().numpy() if torch.is_tensor(eval_measurements) else eval_measurements,
+            eval_frame_idx.cpu().numpy() if torch.is_tensor(eval_frame_idx) else eval_frame_idx,
+        )
+        res = objective.value
+        table.append((c, res))
         if res < best_res:
             best, best_recon, best_res = c, recon, res
     return best, best_recon, table

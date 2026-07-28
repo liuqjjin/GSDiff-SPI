@@ -14,7 +14,7 @@ import numpy as np
 import torch
 from scipy.ndimage import shift as nd_shift, gaussian_filter
 
-from .common import build_operator, admm_tv, evaluate_video, holdout_residual
+from .common import admm_tv, holdout_residual
 
 LAMBDA_GRID = [1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2]
 
@@ -165,6 +165,7 @@ def monin(data, device="cpu", rho=1.0, n_admm=150, lam_grid=LAMBDA_GRID,
         if res < best_res:
             best, best_video, best_res = lam, video, res
 
+    from ._evaluation import evaluate_video
     psnrs, mean_p = evaluate_video(data.gt_frames, best_video)
     v_gt = np.asarray(data.gt_velocity, float)
     return best_video, {
@@ -174,3 +175,46 @@ def monin(data, device="cpu", rho=1.0, n_admm=150, lam_grid=LAMBDA_GRID,
         "velocity_error": np.abs(v_est - v_gt).tolist(),
         "selection_table": table,
         "note": "translation-only; rotation (if any) re-appears as blur"}
+
+
+def run_monin(acquisition, semantic_config, algorithm_seed, device: str):
+    """Strict translation-only Monin core with measurement-derived motion."""
+    del algorithm_seed
+    solver = semantic_config.get("solver")
+    if not hasattr(solver, "get"):
+        raise ValueError("Monin solver semantics are required")
+    holdout = (acquisition.holdout_patterns, acquisition.holdout_measurements,
+               acquisition.holdout_frame_indices)
+    if any(value is None for value in holdout) or acquisition.holdout_K <= 0:
+        raise ValueError("a distinct holdout set is required for selection")
+    H, W, T = acquisition.H, acquisition.W, acquisition.T
+    if T < int(solver["motion_blocks"]):
+        raise ValueError("motion_blocks cannot exceed the number of frames")
+    patterns = torch.tensor(acquisition.patterns, dtype=torch.float32)
+    measurements = torch.tensor(acquisition.measurements, dtype=torch.float32)
+    indices = torch.tensor(acquisition.frame_indices, dtype=torch.long)
+    previews = _frame_previews(patterns, measurements, indices, T, blur_sigma=float(solver["preview_blur_sigma"]))
+    translation, _, _ = _estimate_trajectory(previews, acquisition.time_grid,
+                                              n_blocks=int(solver["motion_blocks"]),
+                                              rng=int(solver["ncc_search_radius"]),
+                                              poly_degree=int(solver["polynomial_degree"]))
+    compensated = _build_Acomp(patterns, indices, translation, method=str(solver["interpolation"])).to(device)
+    candidates = list(solver["lambda_grid"])
+    rows, selected, selected_video, selected_value = [], None, None, None
+    for candidate in candidates:
+        canonical = admm_tv(compensated, measurements.to(device), H, W, float(candidate),
+                            rho=float(solver["rho"]), n_admm=int(solver["n_admm"]),
+                            chambolle_iter=int(solver["chambolle_iter"]))
+        video = _backwarp_video(canonical, translation, T, method=str(solver["interpolation"]))
+        from gsdiff.experiments.objectives import heldout_normalized_l2
+        objective = heldout_normalized_l2(video, *holdout)
+        rows.append({"candidate": candidate, "formula_id": objective.formula_id,
+                     "numerator": objective.numerator, "denominator": objective.denominator,
+                     "value": objective.value})
+        if selected_value is None or objective.value < selected_value:
+            selected, selected_video, selected_value = candidate, video, objective.value
+    assert selected is not None and selected_video is not None
+    motion = np.column_stack((translation, np.zeros(T, dtype=translation.dtype)))
+    return selected_video, motion, {"selected_hyperparameters": {"lambda": selected},
+                                    "selection": {"formula_id": "heldout-normalized-l2-v1", "candidate_grid": candidates,
+                                                  "selected_candidate": selected, "rows": rows}}

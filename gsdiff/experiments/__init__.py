@@ -26,6 +26,7 @@ from .child_outputs import (
     validate_method_child_outputs_v2,
     write_method_child_outputs_v2,
 )
+from .adapters import BASELINE_METHOD_IDS, run_baseline_method
 
 __all__ = [
     "canonical_json_bytes",
@@ -46,4 +47,6 @@ __all__ = [
     "load_reconstruction_v2",
     "validate_method_child_outputs_v2",
     "write_method_child_outputs_v2",
+    "BASELINE_METHOD_IDS",
+    "run_baseline_method",
 ]
