@@ -33,6 +33,7 @@ from ._artifact_truth import (
 from ._corrected_generation import (
     CorrectedDataset,
     _CALIBRATION_RECORD_KEYS,
+    _validate_calibration_reference_descriptor,
     _validate_corrected_config,
     validate_corrected_truth,
     validate_dataset_identity_spec,
@@ -305,31 +306,11 @@ def _validate_calibration_record(
         mapping["reference_cell_sha256"],
         "noise calibration reference cell",
     )
-    reference = _exact_dict(
+    _validate_calibration_reference_descriptor(
         mapping["reference_measurements"],
-        "reference measurements",
-        {"dtype", "shape", "sha256"},
+        expected_count=config["dimensions"]["K"],
     )
-    if (
-        type(reference["dtype"]) is not str
-        or reference["dtype"] != np.dtype(np.float64).str
-    ):
-        raise ArtifactValidationError(
-            "reference measurement dtype must be float64"
-        )
     dimensions = config["dimensions"]
-    if (
-        type(reference["shape"]) is not list
-        or len(reference["shape"]) != 1
-        or type(reference["shape"][0]) is not int
-        or reference["shape"][0] != dimensions["K"]
-    ):
-        raise ArtifactValidationError(
-            "reference measurement shape disagrees with train K"
-        )
-    validate_sha256(
-        reference["sha256"], "reference measurements"
-    )
     realized = _exact_dict(
         mapping["realized_snr_db"],
         "realized SNR",

@@ -476,6 +476,176 @@ def verify_dataset_directory_discovery(
             )
 
 
+def _stable_directory_identity(
+    signature: _DirectorySignature,
+) -> tuple[int, int, int, bool]:
+    return (
+        signature[0],
+        signature[1],
+        stat.S_IFMT(signature[6]),
+        bool(signature[7] & _FILE_ATTRIBUTE_REPARSE_POINT),
+    )
+
+
+def _canonical_directory_names(datasets_dir: Path) -> tuple[str, ...]:
+    try:
+        with os.scandir(datasets_dir) as iterator:
+            return tuple(
+                entry.name
+                for entry in sorted(
+                    iterator,
+                    key=lambda entry: entry.name,
+                )
+                if _classify_dataset_directory_name(entry.name)
+                == "canonical"
+            )
+    except OSError as error:
+        raise ArtifactValidationError(
+            "canonical dataset directory discovery changed"
+        ) from error
+
+
+def _canonical_directory_signatures(
+    datasets_dir: Path,
+    *,
+    datasets_device: int,
+) -> tuple[tuple[str, _DirectorySignature], ...]:
+    names = _canonical_directory_names(datasets_dir)
+    signatures: list[tuple[str, _DirectorySignature]] = []
+    for name in names:
+        signature = _discovery_directory_signature(
+            datasets_dir / name,
+            "canonical dataset directory",
+        )
+        if signature[0] != datasets_device:
+            raise ArtifactValidationError(
+                "canonical dataset directory crosses a filesystem boundary"
+            )
+        signatures.append((name, signature))
+    if _canonical_directory_names(datasets_dir) != names:
+        raise ArtifactValidationError(
+            "canonical dataset directory discovery changed"
+        )
+    for name, expected_signature in signatures:
+        if (
+            _discovery_directory_signature(
+                datasets_dir / name,
+                "canonical dataset directory",
+            )
+            != expected_signature
+        ):
+            raise ArtifactValidationError(
+                "canonical dataset directory discovery changed"
+            )
+    if _canonical_directory_names(datasets_dir) != names:
+        raise ArtifactValidationError(
+            "canonical dataset directory discovery changed"
+        )
+    return tuple(signatures)
+
+
+def verify_canonical_dataset_directory_discovery(
+    discovery: DatasetDirectoryDiscovery,
+) -> tuple[Path, ...]:
+    """Recheck canonical entries while ignoring diagnostic directory churn.
+
+    Existing canonical directories must retain their complete discovery
+    signatures. Stable canonical additions are returned for full verification
+    by the caller. Staging and rejected names and signatures are intentionally
+    outside this recheck contract.
+    """
+
+    if type(discovery) is not DatasetDirectoryDiscovery:
+        raise TypeError(
+            "discovery must be an exact DatasetDirectoryDiscovery"
+        )
+    try:
+        _reject_non_directory_discovery_ancestors(discovery.datasets_dir)
+        _reject_linked_ancestors(discovery.datasets_dir)
+    except ArtifactValidationError as error:
+        raise ArtifactValidationError(
+            "canonical dataset directory changed"
+        ) from error
+    if (
+        os.path.lexists(discovery.artifact_root)
+        != discovery._artifact_root_exists
+        or os.path.lexists(discovery.datasets_dir)
+        != discovery.datasets_dir_exists
+    ):
+        raise ArtifactValidationError(
+            "canonical dataset directory changed"
+        )
+    if not discovery.datasets_dir_exists:
+        return ()
+    observed_root = _discovery_directory_signature(
+        discovery.artifact_root,
+        "artifact root",
+    )
+    observed_datasets = _discovery_directory_signature(
+        discovery.datasets_dir,
+        "datasets directory",
+    )
+    if (
+        discovery._artifact_root_signature is None
+        or discovery._datasets_dir_signature is None
+        or _stable_directory_identity(observed_root)
+        != _stable_directory_identity(discovery._artifact_root_signature)
+        or _stable_directory_identity(observed_datasets)
+        != _stable_directory_identity(discovery._datasets_dir_signature)
+    ):
+        raise ArtifactValidationError(
+            "canonical dataset directory changed"
+        )
+    observed_entries = _canonical_directory_signatures(
+        discovery.datasets_dir,
+        datasets_device=observed_datasets[0],
+    )
+    if (
+        _stable_directory_identity(
+            _discovery_directory_signature(
+                discovery.artifact_root,
+                "artifact root",
+            )
+        )
+        != _stable_directory_identity(observed_root)
+        or _stable_directory_identity(
+            _discovery_directory_signature(
+                discovery.datasets_dir,
+                "datasets directory",
+            )
+        )
+        != _stable_directory_identity(observed_datasets)
+    ):
+        raise ArtifactValidationError(
+            "canonical dataset directory changed"
+        )
+    if (
+        _canonical_directory_signatures(
+            discovery.datasets_dir,
+            datasets_device=observed_datasets[0],
+        )
+        != observed_entries
+    ):
+        raise ArtifactValidationError(
+            "canonical dataset directory discovery changed"
+        )
+    expected_entries = {
+        name: signature
+        for name, signature in discovery._entry_signatures
+        if _CANONICAL_DATASET_DIRECTORY.fullmatch(name)
+    }
+    current_entries = dict(observed_entries)
+    for name, expected_signature in expected_entries.items():
+        if current_entries.get(name) != expected_signature:
+            raise ArtifactValidationError(
+                "canonical dataset directory changed"
+            )
+    return tuple(
+        discovery.datasets_dir / name
+        for name in sorted(current_entries.keys() - expected_entries.keys())
+    )
+
+
 def _role_byte_limit(name: str) -> int:
     if name == _MANIFEST_NAME:
         return MAX_DATASET_MANIFEST_BYTES

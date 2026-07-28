@@ -43,6 +43,7 @@ __all__ = [
     "validate_dataset_identity_spec",
     "validate_evaluation_inputs",
     "verify_dataset_payload_bytes",
+    "verify_canonical_dataset_directory_discovery",
     "verify_dataset_directory",
     "verify_dataset_directory_discovery",
     "write_method_child_outputs",
@@ -71,6 +72,7 @@ _PERSISTENCE_EXPORTS = {
     "VerifiedDatasetDirectory",
     "discover_dataset_directories",
     "publish_dataset",
+    "verify_canonical_dataset_directory_discovery",
     "verify_dataset_directory",
     "verify_dataset_directory_discovery",
 }

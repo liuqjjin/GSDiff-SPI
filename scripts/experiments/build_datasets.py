@@ -32,12 +32,15 @@ if __package__ in (None, ""):
 
 from gsdiff.data.artifacts import (
     ArtifactValidationError,
+    DatasetDirectoryDiscovery,
     TargetSnapshot,
+    VerifiedDatasetDirectory,
     discover_dataset_directories,
     generate_corrected_dataset,
     publish_dataset,
     resolve_corrected_dataset_request,
     resolve_target_snapshot,
+    verify_canonical_dataset_directory_discovery,
     verify_dataset_directory,
     verify_dataset_directory_discovery,
 )
@@ -93,6 +96,21 @@ class CampaignDatasetPlan:
     expanded_cells: int
     expected_datasets: int
     requests: tuple[DatasetRequest, ...]
+
+
+@dataclass(frozen=True)
+class _CatalogCandidate:
+    path: Path
+    identity: str
+    manifest_sha256: str
+    projection: bytes
+
+
+@dataclass(frozen=True)
+class _DatasetCatalog:
+    discovery: DatasetDirectoryDiscovery
+    candidates: tuple[_CatalogCandidate, ...]
+    corrupt_identities: tuple[str, ...]
 
 
 def _matching_entry(
@@ -306,6 +324,10 @@ class _DirtyWorktreeError(RuntimeError):
 
 
 class _ProvenanceChangedError(RuntimeError):
+    pass
+
+
+class _AmbiguousCurrentDatasetError(RuntimeError):
     pass
 
 
@@ -532,6 +554,273 @@ def _semantic_projection_from_manifest(
     return canonical_json_bytes(projection)
 
 
+def _catalog_candidate_from_verified(
+    *,
+    path: Path,
+    identity: str,
+    verified: VerifiedDatasetDirectory,
+) -> _CatalogCandidate:
+    if verified.manifest_externally_anchored:
+        raise RuntimeError(
+            "catalog verification unexpectedly claimed an external anchor"
+        )
+    if verified.expected_generated_verified:
+        raise RuntimeError(
+            "catalog verification unexpectedly claimed generated verification"
+        )
+    manifest = verified.manifest
+    projection = _semantic_projection_from_manifest(manifest)
+    candidate = _CatalogCandidate(
+        path=path,
+        identity=identity,
+        manifest_sha256=verified.dataset_manifest_sha256,
+        projection=projection,
+    )
+    del manifest
+    return candidate
+
+
+def _scan_dataset_catalog(artifact_root: Path) -> _DatasetCatalog:
+    discovery = discover_dataset_directories(artifact_root)
+    candidates: list[_CatalogCandidate] = []
+    corrupt_identities: list[str] = []
+    for path in discovery.canonical_directories:
+        identity = path.name
+        try:
+            verified = verify_dataset_directory(
+                path,
+                expected_dataset_identity_sha256=identity,
+            )
+        except (ArtifactValidationError, TypeError):
+            corrupt_identities.append(identity)
+            continue
+        candidate = _catalog_candidate_from_verified(
+            path=path,
+            identity=identity,
+            verified=verified,
+        )
+        del verified
+        candidates.append(candidate)
+    return _DatasetCatalog(
+        discovery=discovery,
+        candidates=tuple(candidates),
+        corrupt_identities=tuple(sorted(corrupt_identities)),
+    )
+
+
+def _reverify_catalog_candidate(
+    candidate: _CatalogCandidate,
+) -> None:
+    verified = verify_dataset_directory(
+        candidate.path,
+        expected_dataset_identity_sha256=candidate.identity,
+    )
+    if verified.manifest_externally_anchored:
+        raise RuntimeError(
+            "catalog recheck unexpectedly claimed an external anchor"
+        )
+    if verified.expected_generated_verified:
+        raise RuntimeError(
+            "catalog recheck unexpectedly claimed generated verification"
+        )
+    if verified.dataset_manifest_sha256 != candidate.manifest_sha256:
+        del verified
+        raise ArtifactValidationError(
+            "catalog candidate manifest changed after initial verification"
+        )
+    manifest = verified.manifest
+    observed_projection = _semantic_projection_from_manifest(manifest)
+    del manifest
+    del verified
+    if observed_projection != candidate.projection:
+        raise ArtifactValidationError(
+            "catalog candidate projection changed after initial verification"
+        )
+
+
+def _catalog_identities(catalog: _DatasetCatalog) -> set[str]:
+    identities = {
+        candidate.identity for candidate in catalog.candidates
+    }
+    identities.update(catalog.corrupt_identities)
+    return identities
+
+
+def _refresh_corrupt_catalog_candidates(
+    catalog: _DatasetCatalog,
+) -> tuple[_DatasetCatalog, bool]:
+    candidates = list(catalog.candidates)
+    remaining_corrupt: list[str] = []
+    changed = False
+    for identity in catalog.corrupt_identities:
+        path = catalog.discovery.datasets_dir / identity
+        try:
+            verified = verify_dataset_directory(
+                path,
+                expected_dataset_identity_sha256=identity,
+            )
+        except (ArtifactValidationError, TypeError):
+            remaining_corrupt.append(identity)
+            continue
+        candidate = _catalog_candidate_from_verified(
+            path=path,
+            identity=identity,
+            verified=verified,
+        )
+        del verified
+        candidates.append(candidate)
+        changed = True
+    return (
+        _DatasetCatalog(
+            discovery=catalog.discovery,
+            candidates=tuple(
+                sorted(candidates, key=lambda candidate: candidate.identity)
+            ),
+            corrupt_identities=tuple(remaining_corrupt),
+        ),
+        changed,
+    )
+
+
+def _rescan_changed_catalog(
+    *,
+    artifact_root: Path,
+    original_discovery: DatasetDirectoryDiscovery,
+) -> tuple[_DatasetCatalog, DatasetDirectoryDiscovery]:
+    if original_discovery.datasets_dir_exists:
+        verify_canonical_dataset_directory_discovery(
+            original_discovery
+        )
+    catalog = _scan_dataset_catalog(artifact_root)
+    if not original_discovery.datasets_dir_exists:
+        original_discovery = catalog.discovery
+    return catalog, original_discovery
+
+
+def _stabilize_dataset_catalog(
+    *,
+    artifact_root: Path,
+    catalog: _DatasetCatalog,
+) -> _DatasetCatalog:
+    original_discovery = catalog.discovery
+    for _ in range(6):
+        try:
+            additions = verify_canonical_dataset_directory_discovery(
+                catalog.discovery
+            )
+        except ArtifactValidationError:
+            catalog, original_discovery = _rescan_changed_catalog(
+                artifact_root=artifact_root,
+                original_discovery=original_discovery,
+            )
+            continue
+        if additions:
+            catalog, original_discovery = _rescan_changed_catalog(
+                artifact_root=artifact_root,
+                original_discovery=original_discovery,
+            )
+            continue
+
+        catalog, corrupt_changed = _refresh_corrupt_catalog_candidates(
+            catalog
+        )
+        if corrupt_changed:
+            continue
+
+        fresh_discovery = discover_dataset_directories(artifact_root)
+        fresh_identities = {
+            path.name for path in fresh_discovery.canonical_directories
+        }
+        if fresh_identities != _catalog_identities(catalog):
+            catalog, original_discovery = _rescan_changed_catalog(
+                artifact_root=artifact_root,
+                original_discovery=original_discovery,
+            )
+            continue
+        try:
+            catalog_additions = (
+                verify_canonical_dataset_directory_discovery(
+                    catalog.discovery
+                )
+            )
+            fresh_additions = (
+                verify_canonical_dataset_directory_discovery(
+                    fresh_discovery
+                )
+            )
+        except ArtifactValidationError:
+            catalog, original_discovery = _rescan_changed_catalog(
+                artifact_root=artifact_root,
+                original_discovery=original_discovery,
+            )
+            continue
+        if catalog_additions or fresh_additions:
+            catalog, original_discovery = _rescan_changed_catalog(
+                artifact_root=artifact_root,
+                original_discovery=original_discovery,
+            )
+            continue
+
+        catalog, corrupt_changed = _refresh_corrupt_catalog_candidates(
+            catalog
+        )
+        if corrupt_changed:
+            continue
+        original_identities = {
+            path.name
+            for path in original_discovery.canonical_directories
+        }
+        expected_additions = (
+            _catalog_identities(catalog) - original_identities
+        )
+        try:
+            observed_additions = {
+                path.name
+                for path in verify_canonical_dataset_directory_discovery(
+                    original_discovery
+                )
+            }
+            final_fresh_additions = (
+                verify_canonical_dataset_directory_discovery(
+                    fresh_discovery
+                )
+            )
+        except ArtifactValidationError:
+            catalog, original_discovery = _rescan_changed_catalog(
+                artifact_root=artifact_root,
+                original_discovery=original_discovery,
+            )
+            continue
+        if (
+            observed_additions != expected_additions
+            or final_fresh_additions
+        ):
+            catalog, original_discovery = _rescan_changed_catalog(
+                artifact_root=artifact_root,
+                original_discovery=original_discovery,
+            )
+            continue
+        return _DatasetCatalog(
+            discovery=fresh_discovery,
+            candidates=catalog.candidates,
+            corrupt_identities=catalog.corrupt_identities,
+        )
+    raise ArtifactValidationError(
+        "canonical dataset catalog did not stabilize"
+    )
+
+
+def _catalog_matches(
+    catalog: _DatasetCatalog,
+    projection: bytes,
+) -> tuple[_CatalogCandidate, ...]:
+    return tuple(
+        candidate
+        for candidate in catalog.candidates
+        if candidate.projection == projection
+    )
+
+
 def _campaign_report_fields(
     plan: CampaignDatasetPlan,
 ) -> tuple[str, str]:
@@ -705,9 +994,58 @@ def _build(
         runtime=runtime,
         generator_commit=commit,
     )
-    records: list[dict[str, object]] = []
-    identities: dict[str, str] = {}
+    expected_by_projection: dict[bytes, DatasetRequest] = {}
     for request in plan.requests:
+        projection = _semantic_projection_from_request(request)
+        if projection in expected_by_projection:
+            raise ValueError("planned dataset semantic projection collision")
+        expected_by_projection[projection] = request
+
+    initial_catalog = _scan_dataset_catalog(artifact_root)
+    selected: dict[str, _CatalogCandidate] = {}
+    missing: set[str] = set()
+    for projection, request in expected_by_projection.items():
+        matches = _catalog_matches(initial_catalog, projection)
+        if len(matches) > 1:
+            raise _AmbiguousCurrentDatasetError(
+                "multiple current datasets match one scientific request"
+            )
+        if matches:
+            selected[request.request_sha256] = matches[0]
+        else:
+            missing.add(request.request_sha256)
+
+    for candidate in selected.values():
+        _reverify_catalog_candidate(candidate)
+
+    initial_catalog = _stabilize_dataset_catalog(
+        artifact_root=artifact_root,
+        catalog=initial_catalog,
+    )
+    selected = {}
+    missing = set()
+    for projection, request in expected_by_projection.items():
+        matches = _catalog_matches(initial_catalog, projection)
+        if len(matches) > 1:
+            raise _AmbiguousCurrentDatasetError(
+                "multiple current datasets match one scientific request"
+            )
+        if matches:
+            selected[request.request_sha256] = matches[0]
+        else:
+            missing.add(request.request_sha256)
+
+    outcomes: dict[str, tuple[str, str]] = {
+        request_sha256: (candidate.identity, "reused")
+        for request_sha256, candidate in selected.items()
+    }
+    identities: dict[str, str] = {
+        candidate.identity: request_sha256
+        for request_sha256, candidate in selected.items()
+    }
+    for request in plan.requests:
+        if request.request_sha256 not in missing:
+            continue
         _recheck_clean_state(initial_state)
         generated = generate_corrected_dataset(
             **request.generation_arguments()
@@ -729,29 +1067,65 @@ def _build(
         if status not in {"created", "reused"}:
             raise RuntimeError("unknown dataset publication status")
         del publication
-        records.append(
-            {
-                "dataset_identity_sha256": identity,
-                "request_sha256": request.request_sha256,
-                "status": status,
-            }
+        outcomes[request.request_sha256] = (
+            identity,
+            status,
         )
         del generated
 
-    if len(identities) != plan.expected_datasets:
+    if (
+        len(outcomes) != plan.expected_datasets
+        or len(identities) != plan.expected_datasets
+    ):
         raise ValueError(
-            "generated identity count does not match expected_datasets"
+            "resolved identity count does not match expected_datasets"
         )
     _recheck_clean_state(initial_state)
-    final_discovery = discover_dataset_directories(artifact_root)
-    verify_dataset_directory_discovery(final_discovery)
+    final_catalog = _scan_dataset_catalog(artifact_root)
     _recheck_clean_state(initial_state)
-    final_identities = {
-        path.name for path in final_discovery.canonical_directories
-    }
-    if not set(identities).issubset(final_identities):
+    final_catalog = _stabilize_dataset_catalog(
+        artifact_root=artifact_root,
+        catalog=final_catalog,
+    )
+    _recheck_clean_state(initial_state)
+
+    final_selected: dict[str, _CatalogCandidate] = {}
+    for projection, request in expected_by_projection.items():
+        matches = _catalog_matches(final_catalog, projection)
+        if len(matches) > 1:
+            raise _AmbiguousCurrentDatasetError(
+                "multiple current datasets match one scientific request"
+            )
+        if not matches:
+            raise ArtifactValidationError(
+                "current dataset missing from final catalog"
+            )
+        final_selected[request.request_sha256] = matches[0]
+    for request_sha256, candidate in final_selected.items():
+        if outcomes[request_sha256][0] != candidate.identity:
+            raise ArtifactValidationError(
+                "resolved dataset changed before final catalog"
+            )
+    _recheck_clean_state(initial_state)
+
+    records = [
+        {
+            "dataset_identity_sha256": outcomes[request.request_sha256][0],
+            "request_sha256": request.request_sha256,
+            "status": outcomes[request.request_sha256][1],
+        }
+        for request in plan.requests
+    ]
+    requested_projections = set(expected_by_projection)
+    corrupt_identities = sorted(set(final_catalog.corrupt_identities))
+    unmatched_identities = sorted(
+        candidate.identity
+        for candidate in final_catalog.candidates
+        if candidate.projection not in requested_projections
+    )
+    if len(final_selected) != plan.expected_datasets:
         raise ArtifactValidationError(
-            "published dataset identity missing from final discovery"
+            "final catalog count does not match expected_datasets"
         )
     campaign_id, protocol_sha256 = _campaign_report_fields(plan)
     _emit_report(
@@ -768,20 +1142,23 @@ def _build(
             "manifest_externally_anchored": False,
             "datasets": records,
             "stale_staging_count": len(
-                final_discovery.stale_staging_directories
+                final_catalog.discovery.stale_staging_directories
             ),
             "stale_staging": _diagnostic_inventory(
-                final_discovery.stale_staging_directories
+                final_catalog.discovery.stale_staging_directories
             ),
             "rejected_count": len(
-                final_discovery.rejected_directories
+                final_catalog.discovery.rejected_directories
             ),
             "rejected": _diagnostic_inventory(
-                final_discovery.rejected_directories
+                final_catalog.discovery.rejected_directories
             ),
-            "unmatched_datasets": sorted(
-                final_identities - set(identities)
-            ),
+            "unmatched_datasets": unmatched_identities,
+            "corrupt_count": len(corrupt_identities),
+            "corrupt_datasets": [
+                {"dataset_identity_sha256": identity}
+                for identity in corrupt_identities
+            ],
             "errors": [],
         }
     )
@@ -793,6 +1170,8 @@ def _operational_error_code(error: Exception) -> str:
         return "dirty-worktree"
     if isinstance(error, _ProvenanceChangedError):
         return "provenance-changed"
+    if isinstance(error, _AmbiguousCurrentDatasetError):
+        return "ambiguous-current-dataset"
     if isinstance(error, ArtifactValidationError):
         return "artifact-validation-error"
     if isinstance(

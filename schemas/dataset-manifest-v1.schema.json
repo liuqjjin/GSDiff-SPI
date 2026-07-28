@@ -55,11 +55,35 @@
   "$defs": {
     "sha256": {
       "type": "string",
-      "pattern": "^[0-9a-f]{64}$"
+      "pattern": "^[0-9a-f]{64}(?![\\s\\S])"
+    },
+    "pathFreeOpaqueId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}(?![\\s\\S])",
+      "allOf": [
+        {
+          "not": {
+            "pattern": "\\.\\."
+          }
+        },
+        {
+          "not": {
+            "pattern": "([Tt][Rr][Uu][Tt][Hh]|[Ee][Vv][Aa][Ll][Uu][Aa][Tt][Ii][Oo][Nn]|[Ee][Vv][Aa][Ll][Uu][Aa][Tt][Oo][Rr]|[Cc][Aa][Nn][Oo][Nn][Ii][Cc][Aa][Ll]|[Tt][Rr][Aa][Jj][Ee][Cc][Tt][Oo][Rr][Yy]|[Mm][Ee][Tt][Rr][Ii][Cc]|[Dd][Ii][Ss][Pp][Ll][Aa][Yy]|[Nn][Oo][Rr][Mm][Aa][Ll][Ii][Zz][Ee][Dd])"
+          }
+        },
+        {
+          "not": {
+            "pattern": "(^|[._-])[Gg][Tt]([._-]|$)"
+          }
+        }
+      ]
     },
     "namedHashes": {
       "type": "object",
       "minProperties": 1,
+      "propertyNames": {
+        "minLength": 1
+      },
       "additionalProperties": {
         "$ref": "#/$defs/sha256"
       }
@@ -70,8 +94,7 @@
       "required": ["id", "sha256"],
       "properties": {
         "id": {
-          "type": "string",
-          "minLength": 1
+          "$ref": "#/$defs/pathFreeOpaqueId"
         },
         "sha256": {
           "$ref": "#/$defs/sha256"
@@ -84,16 +107,14 @@
       "required": ["id", "version", "git_commit"],
       "properties": {
         "id": {
-          "type": "string",
-          "minLength": 1
+          "$ref": "#/$defs/pathFreeOpaqueId"
         },
         "version": {
-          "type": "string",
-          "minLength": 1
+          "$ref": "#/$defs/pathFreeOpaqueId"
         },
         "git_commit": {
           "type": "string",
-          "pattern": "^[0-9a-f]{40}$"
+          "pattern": "^[0-9a-f]{40}(?![\\s\\S])"
         }
       }
     },
@@ -139,7 +160,9 @@
       "properties": {
         "font_family": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^(?!.*[\\\\/])(?!.*\\.\\.)[^\\u0000-\\u001f\\u007f-\\u009f]+(?![\\s\\S])"
         },
         "fill_fraction": {
           "type": "number",
@@ -209,10 +232,35 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["id", "descriptor", "assets_sha256", "renderer"],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "descriptor": {
+                "pattern": "^char:"
+              }
+            },
+            "required": ["descriptor"]
+          },
+          "then": {
+            "properties": {
+              "renderer": {
+                "$ref": "#/$defs/glyphRenderer"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "renderer": {
+                "$ref": "#/$defs/fileRenderer"
+              }
+            }
+          }
+        }
+      ],
       "properties": {
         "id": {
-          "type": "string",
-          "minLength": 1
+          "$ref": "#/$defs/pathFreeOpaqueId"
         },
         "descriptor": {
           "type": "string",
@@ -238,8 +286,7 @@
       ],
       "properties": {
         "id": {
-          "type": "string",
-          "minLength": 1
+          "$ref": "#/$defs/pathFreeOpaqueId"
         },
         "velocity": {
           "$ref": "#/$defs/vector2"
@@ -347,8 +394,7 @@
           "type": "number"
         },
         "noise_calibration_id": {
-          "type": "string",
-          "minLength": 1
+          "$ref": "#/$defs/pathFreeOpaqueId"
         }
       },
       "allOf": [
@@ -551,8 +597,7 @@
       "required": ["id", "registry_entry_sha256"],
       "properties": {
         "id": {
-          "type": "string",
-          "minLength": 1
+          "$ref": "#/$defs/pathFreeOpaqueId"
         },
         "registry_entry_sha256": {
           "$ref": "#/$defs/sha256"
@@ -629,12 +674,10 @@
           "$ref": "#/$defs/scientificContract"
         },
         "target_id": {
-          "type": "string",
-          "minLength": 1
+          "$ref": "#/$defs/pathFreeOpaqueId"
         },
         "motion_id": {
-          "type": "string",
-          "minLength": 1
+          "$ref": "#/$defs/pathFreeOpaqueId"
         },
         "seed": {
           "type": "integer"
@@ -692,18 +735,7 @@
           "const": "dataset-identity-v1"
         },
         "scientific_contract": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["id", "sha256"],
-          "properties": {
-            "id": {
-              "type": "string",
-              "minLength": 1
-            },
-            "sha256": {
-              "$ref": "#/$defs/sha256"
-            }
-          }
+          "$ref": "#/$defs/scientificContract"
         },
         "target": {
           "type": "object",
@@ -711,8 +743,7 @@
           "required": ["id", "assets_sha256"],
           "properties": {
             "id": {
-              "type": "string",
-              "minLength": 1
+              "$ref": "#/$defs/pathFreeOpaqueId"
             },
             "assets_sha256": {
               "$ref": "#/$defs/namedHashes"
@@ -725,8 +756,7 @@
           "required": ["id"],
           "properties": {
             "id": {
-              "type": "string",
-              "minLength": 1
+              "$ref": "#/$defs/pathFreeOpaqueId"
             }
           }
         },
@@ -742,8 +772,7 @@
           "required": ["id", "sha256"],
           "properties": {
             "id": {
-              "type": "string",
-              "minLength": 1
+              "$ref": "#/$defs/pathFreeOpaqueId"
             },
             "sha256": {
               "$ref": "#/$defs/sha256"
@@ -751,23 +780,7 @@
           }
         },
         "generator": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["id", "version", "git_commit"],
-          "properties": {
-            "id": {
-              "type": "string",
-              "minLength": 1
-            },
-            "version": {
-              "type": "string",
-              "minLength": 1
-            },
-            "git_commit": {
-              "type": "string",
-              "pattern": "^[0-9a-f]{40}$"
-            }
-          }
+          "$ref": "#/$defs/generator"
         },
         "runtime": {
           "type": "object",

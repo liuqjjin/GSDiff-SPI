@@ -29,6 +29,11 @@ from ._artifact_identity import (
     validate_path_free_opaque_id,
     validate_sha256,
 )
+from ._artifact_io import (
+    SafeFileSnapshot,
+    read_safe_file_snapshot,
+    verify_safe_file_snapshot,
+)
 from ._artifact_models import EvaluationTruth, SPIAcquisitionData
 from .patterns import generate_patterns
 
@@ -106,6 +111,16 @@ _PATTERN_FAMILIES = frozenset(
     }
 )
 _REPARSE_POINT = 0x400
+_GLYPH_RENDERER_KEYS = {
+    "font_family",
+    "fill_fraction",
+    "resample",
+    "supersample",
+}
+_FILE_RENDERER_KEYS = {"color_mode", "resample"}
+_MAX_TARGET_ASSET_BYTES = 64 * 1024 * 1024
+_MAX_TARGET_FONT_BYTES = 16 * 1024 * 1024
+_MAX_FONT_FAMILY_LENGTH = 128
 
 
 def _strict_native(value: object) -> object:
@@ -210,6 +225,68 @@ def _require_named_sha(
     return value
 
 
+def _validate_font_family(value: object, field: str) -> str:
+    family = _require_string(value, field)
+    if (
+        len(family) > _MAX_FONT_FAMILY_LENGTH
+        or ".." in family
+        or "/" in family
+        or "\\" in family
+        or any(
+            ord(character) <= 0x1F
+            or 0x7F <= ord(character) <= 0x9F
+            for character in family
+        )
+    ):
+        raise ArtifactValidationError(
+            f"{field} must be a path-free font family of at most "
+            f"{_MAX_FONT_FAMILY_LENGTH} characters"
+        )
+    return family
+
+
+def _validate_target_renderer(
+    renderer: object,
+    *,
+    descriptor: str,
+    field: str,
+) -> Mapping[str, object]:
+    if type(renderer) not in (dict, MappingProxyType):
+        raise ArtifactValidationError(
+            f"{field} must be an exact renderer object"
+        )
+    expected_keys = (
+        _GLYPH_RENDERER_KEYS
+        if descriptor.startswith("char:")
+        else _FILE_RENDERER_KEYS
+    )
+    mapping = _require_mapping(renderer, field, expected_keys)
+    if mapping["resample"] != "lanczos":
+        raise ArtifactValidationError(f"{field}.resample must be lanczos")
+    if expected_keys == _GLYPH_RENDERER_KEYS:
+        _validate_font_family(
+            mapping["font_family"],
+            f"{field}.font_family",
+        )
+        fill_fraction = _require_number(
+            mapping["fill_fraction"], f"{field}.fill_fraction"
+        )
+        if fill_fraction <= 0 or fill_fraction > 1:
+            raise ArtifactValidationError(
+                f"{field}.fill_fraction must be in (0, 1]"
+            )
+        _require_int(
+            mapping["supersample"],
+            f"{field}.supersample",
+            minimum=1,
+        )
+    elif mapping["color_mode"] != "grayscale":
+        raise ArtifactValidationError(
+            f"{field}.color_mode must be grayscale"
+        )
+    return mapping
+
+
 def _is_reparse_or_link(path_stat: os.stat_result) -> bool:
     return stat.S_ISLNK(path_stat.st_mode) or bool(
         getattr(path_stat, "st_file_attributes", 0) & _REPARSE_POINT
@@ -231,64 +308,67 @@ def _validate_existing_ancestors(path: Path) -> None:
         current = parent
 
 
-def _read_regular_snapshot(path: Path) -> bytes:
-    path = Path(path)
-    _validate_existing_ancestors(path)
-    before = os.lstat(path)
-    if _is_reparse_or_link(before) or not stat.S_ISREG(before.st_mode):
-        raise ArtifactValidationError("target asset must be a regular file")
-    flags = os.O_RDONLY
-    flags |= getattr(os, "O_BINARY", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
-    flags |= getattr(os, "O_NONBLOCK", 0)
-    try:
-        descriptor = os.open(path, flags)
-    except OSError as error:
-        raise ArtifactValidationError("cannot safely open target asset") from error
-    try:
-        opened = os.fstat(descriptor)
-        if not stat.S_ISREG(opened.st_mode):
-            raise ArtifactValidationError("target asset is not a regular file")
-        if (
-            getattr(before, "st_dev", None),
-            getattr(before, "st_ino", None),
-        ) != (
-            getattr(opened, "st_dev", None),
-            getattr(opened, "st_ino", None),
-        ):
-            raise ArtifactValidationError("target asset changed during open")
-        chunks: list[bytes] = []
-        while True:
-            chunk = os.read(descriptor, 1024 * 1024)
-            if not chunk:
-                break
-            chunks.append(chunk)
-        after_fd = os.fstat(descriptor)
-    finally:
-        os.close(descriptor)
-    after = os.lstat(path)
-    observed = (
-        getattr(opened, "st_dev", None),
-        getattr(opened, "st_ino", None),
-        opened.st_size,
-        getattr(opened, "st_mtime_ns", None),
+def _verify_consumed_target_snapshot(
+    snapshot: SafeFileSnapshot,
+    *,
+    max_bytes: int,
+    noun: str,
+) -> None:
+    verify_safe_file_snapshot(snapshot)
+    observed = read_safe_file_snapshot(
+        snapshot.path,
+        max_bytes=max_bytes,
+        noun=noun,
     )
-    if observed != (
-        getattr(after_fd, "st_dev", None),
-        getattr(after_fd, "st_ino", None),
-        after_fd.st_size,
-        getattr(after_fd, "st_mtime_ns", None),
-    ) or observed != (
-        getattr(after, "st_dev", None),
-        getattr(after, "st_ino", None),
-        after.st_size,
-        getattr(after, "st_mtime_ns", None),
+    verify_safe_file_snapshot(snapshot)
+    if (
+        observed.raw != snapshot.raw
+        or observed.size_bytes != snapshot.size_bytes
+        or observed.sha256 != snapshot.sha256
     ):
-        raise ArtifactValidationError("target asset changed during read")
-    payload = b"".join(chunks)
-    if len(payload) != opened.st_size:
-        raise ArtifactValidationError("target asset size changed during read")
-    return payload
+        raise ArtifactValidationError(
+            "target snapshot changed after the safe read"
+        )
+    verify_safe_file_snapshot(observed)
+
+
+def _validate_target_snapshot_fields(
+    *,
+    target_id: object,
+    descriptor: object,
+    assets_sha256: object,
+    canonical_image: object,
+    renderer: object,
+) -> tuple[Mapping[str, object], np.ndarray]:
+    validate_path_free_opaque_id(target_id, "target_id")
+    descriptor_native = _require_string(
+        descriptor, "target descriptor"
+    )
+    if type(assets_sha256) not in (dict, MappingProxyType):
+        raise TypeError("assets_sha256 must be an exact dict")
+    if not assets_sha256:
+        raise ArtifactValidationError("assets_sha256 cannot be empty")
+    for name, digest in assets_sha256.items():
+        _require_string(name, "asset name")
+        _require_named_sha(digest, f"asset hash {name}")
+    validate_exact_json_native(assets_sha256, "assets_sha256")
+    renderer_native = _validate_target_renderer(
+        renderer,
+        descriptor=descriptor_native,
+        field="renderer",
+    )
+    image = np.asarray(canonical_image)
+    if (
+        image.ndim != 2
+        or not np.issubdtype(image.dtype, np.floating)
+        or not np.isfinite(image).all()
+        or np.any(image < 0)
+        or np.any(image > 1)
+    ):
+        raise ArtifactValidationError(
+            "canonical_image must be a finite floating [H,W] image in [0,1]"
+        )
+    return renderer_native, image
 
 
 @dataclass(frozen=True)
@@ -299,34 +379,16 @@ class TargetSnapshot:
     descriptor: str
     assets_sha256: Mapping[str, object]
     canonical_image: np.ndarray
-    renderer: Mapping[str, object] | None
+    renderer: Mapping[str, object]
 
     def __post_init__(self) -> None:
-        validate_path_free_opaque_id(self.target_id, "target_id")
-        _require_string(self.descriptor, "target descriptor")
-        if type(self.assets_sha256) not in (dict, MappingProxyType):
-            raise TypeError("assets_sha256 must be an exact dict")
-        if not self.assets_sha256:
-            raise ArtifactValidationError("assets_sha256 cannot be empty")
-        for name, digest in self.assets_sha256.items():
-            _require_string(name, "asset name")
-            _require_named_sha(digest, f"asset hash {name}")
-        validate_exact_json_native(self.assets_sha256, "assets_sha256")
-        if self.renderer is not None:
-            if type(self.renderer) not in (dict, MappingProxyType):
-                raise TypeError("renderer must be an exact dict or None")
-            validate_exact_json_native(self.renderer, "renderer")
-        image = np.asarray(self.canonical_image)
-        if (
-            image.ndim != 2
-            or not np.issubdtype(image.dtype, np.floating)
-            or not np.isfinite(image).all()
-            or np.any(image < 0)
-            or np.any(image > 1)
-        ):
-            raise ArtifactValidationError(
-                "canonical_image must be a finite floating [H,W] image in [0,1]"
-            )
+        renderer, image = _validate_target_snapshot_fields(
+            target_id=self.target_id,
+            descriptor=self.descriptor,
+            assets_sha256=self.assets_sha256,
+            canonical_image=self.canonical_image,
+            renderer=self.renderer,
+        )
         object.__setattr__(
             self,
             "assets_sha256",
@@ -340,7 +402,7 @@ class TargetSnapshot:
         object.__setattr__(
             self,
             "renderer",
-            None if self.renderer is None else deep_freeze_json(self.renderer),
+            deep_freeze_json(renderer),
         )
         object.__setattr__(
             self,
@@ -523,15 +585,20 @@ def resolve_target_snapshot(
             "resample": "lanczos",
             "supersample": 4,
         }
-        font_bytes = _read_regular_snapshot(_bundled_dejavu_font_path())
+        font_snapshot = read_safe_file_snapshot(
+            _bundled_dejavu_font_path(),
+            max_bytes=_MAX_TARGET_FONT_BYTES,
+            noun="target font",
+        )
+        font_bytes = font_snapshot.raw
         assets = {
             "descriptor": hashlib.sha256(
                 descriptor.encode("utf-8")
             ).hexdigest(),
-            "font": hashlib.sha256(font_bytes).hexdigest(),
+            "font": font_snapshot.sha256,
             "renderer": _sha256_json(renderer),
         }
-        return TargetSnapshot(
+        target = TargetSnapshot(
             target_id=target_id,
             descriptor=descriptor,
             assets_sha256=assets,
@@ -540,6 +607,12 @@ def resolve_target_snapshot(
             ),
             renderer=renderer,
         )
+        _verify_consumed_target_snapshot(
+            font_snapshot,
+            max_bytes=_MAX_TARGET_FONT_BYTES,
+            noun="target font",
+        )
+        return target
 
     normalized = descriptor.replace("\\", "/")
     parts = normalized.split("/")
@@ -562,18 +635,28 @@ def resolve_target_snapshot(
         raise ArtifactValidationError("target asset escapes repository") from error
     if common != str(root):
         raise ArtifactValidationError("target asset escapes repository")
-    raw = _read_regular_snapshot(asset)
+    asset_snapshot = read_safe_file_snapshot(
+        asset,
+        max_bytes=_MAX_TARGET_ASSET_BYTES,
+        noun="target asset",
+    )
     renderer = {
         "color_mode": "grayscale",
         "resample": "lanczos",
     }
-    return TargetSnapshot(
+    target = TargetSnapshot(
         target_id=target_id,
         descriptor=descriptor,
-        assets_sha256={descriptor: hashlib.sha256(raw).hexdigest()},
-        canonical_image=_decode_image(raw, H, W),
+        assets_sha256={descriptor: asset_snapshot.sha256},
+        canonical_image=_decode_image(asset_snapshot.raw, H, W),
         renderer=renderer,
     )
+    _verify_consumed_target_snapshot(
+        asset_snapshot,
+        max_bytes=_MAX_TARGET_ASSET_BYTES,
+        noun="target asset",
+    )
+    return target
 
 
 def acquisition_rng(seed: int, stream_id: int) -> np.random.Generator:
@@ -629,6 +712,13 @@ def _validate_generation_inputs(
     }
     if type(target_snapshot) is not TargetSnapshot:
         raise TypeError("target_snapshot must be an exact TargetSnapshot")
+    _, target_image = _validate_target_snapshot_fields(
+        target_id=target_snapshot.target_id,
+        descriptor=target_snapshot.descriptor,
+        assets_sha256=target_snapshot.assets_sha256,
+        canonical_image=target_snapshot.canonical_image,
+        renderer=target_snapshot.renderer,
+    )
     motion_map = _require_mapping(motion, "motion", _MOTION_KEYS)
     velocity = [
         _require_number(item, f"motion.velocity[{index}]")
@@ -668,7 +758,7 @@ def _validate_generation_inputs(
         )
     ]
     H, W = image_size
-    if target_snapshot.canonical_image.shape != (H, W):
+    if target_image.shape != (H, W):
         raise ArtifactValidationError(
             "target snapshot dimensions disagree with acquisition config"
         )
@@ -1101,10 +1191,16 @@ def validate_dataset_identity_spec(
     )
     if mapping["schema_version"] != "dataset-identity-v1":
         raise ArtifactValidationError("dataset identity schema mismatch")
-    _require_mapping(
+    contract = _require_mapping(
         mapping["scientific_contract"],
         "scientific_contract",
         {"id", "sha256"},
+    )
+    validate_path_free_opaque_id(
+        contract["id"], "scientific_contract.id"
+    )
+    _require_named_sha(
+        contract["sha256"], "scientific_contract.sha256"
     )
     target = _require_mapping(
         mapping["target"], "target", {"id", "assets_sha256"}
@@ -1112,6 +1208,10 @@ def validate_dataset_identity_spec(
     validate_path_free_opaque_id(target["id"], "target.id")
     if type(target["assets_sha256"]) not in (dict, MappingProxyType):
         raise TypeError("target.assets_sha256 must be an exact dict")
+    if not target["assets_sha256"]:
+        raise ArtifactValidationError(
+            "target.assets_sha256 cannot be empty"
+        )
     for name, digest in target["assets_sha256"].items():  # type: ignore[union-attr]
         _require_string(name, "asset name")
         _require_named_sha(digest, f"asset hash {name}")
@@ -1205,12 +1305,13 @@ def _validate_corrected_config(
     for name, digest in target["assets_sha256"].items():  # type: ignore[union-attr]
         _require_string(name, "generator config asset name")
         _require_named_sha(digest, f"generator config asset hash {name}")
-    renderer = target["renderer"]
-    if renderer is not None and type(renderer) not in (
-        dict,
-        MappingProxyType,
-    ):
-        raise TypeError("generator config renderer must be an exact dict or None")
+    _validate_target_renderer(
+        target["renderer"],
+        descriptor=_require_string(
+            target["descriptor"], "generator config target.descriptor"
+        ),
+        field="generator config target renderer",
+    )
     if _canonical_json_bytes(
         {"id": target["id"], "assets_sha256": target["assets_sha256"]}
     ) != _canonical_json_bytes(identity["target"]):
@@ -1328,6 +1429,45 @@ def _validate_corrected_config(
     return dimensions, motion, acquisition
 
 
+def _validate_calibration_reference_descriptor(
+    value: object,
+    *,
+    expected_count: object,
+) -> Mapping[str, object]:
+    reference = _require_mapping(
+        value,
+        "reference measurements descriptor",
+        {"dtype", "shape", "sha256"},
+    )
+    if (
+        type(reference["dtype"]) is not str
+        or reference["dtype"] != np.dtype(np.float64).str
+    ):
+        raise ArtifactValidationError(
+            "reference measurements dtype must be float64"
+        )
+    shape = _require_sequence(
+        reference["shape"],
+        "reference measurements shape",
+        length=1,
+    )
+    if (
+        _require_int(
+            shape[0],
+            "reference measurements shape[0]",
+            minimum=1,
+        )
+        != expected_count
+    ):
+        raise ArtifactValidationError(
+            "reference measurements count disagrees with generator config"
+        )
+    _require_named_sha(
+        reference["sha256"], "reference measurements hash"
+    )
+    return reference
+
+
 def validate_corrected_truth(data: EvaluationTruth) -> None:
     """Validate evaluator-only bindings for ``dataset-identity-v1``."""
 
@@ -1386,34 +1526,9 @@ def validate_corrected_truth(data: EvaluationTruth) -> None:
     _require_named_sha(
         record["reference_cell_sha256"], "reference cell hash"
     )
-    reference_measurements = _require_mapping(
+    _validate_calibration_reference_descriptor(
         record["reference_measurements"],
-        "reference measurements descriptor",
-        {"dtype", "shape", "sha256"},
-    )
-    _require_string(
-        reference_measurements["dtype"],
-        "reference measurements dtype",
-    )
-    reference_shape = _require_sequence(
-        reference_measurements["shape"],
-        "reference measurements shape",
-        length=1,
-    )
-    if (
-        _require_int(
-            reference_shape[0],
-            "reference measurements shape[0]",
-            minimum=1,
-        )
-        != dimensions["K"]
-    ):
-        raise ArtifactValidationError(
-            "reference measurements count disagrees with generator config"
-        )
-    _require_named_sha(
-        reference_measurements["sha256"],
-        "reference measurements hash",
+        expected_count=dimensions["K"],
     )
     requested_snr = _require_number(
         record["requested_snr_db"], "requested SNR"

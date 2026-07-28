@@ -5989,6 +5989,160 @@ def test_task3_c3a_dataset_discovery_is_read_only_sorted_and_recheckable(
         verify_dataset_directory_discovery(discovery)
 
 
+def test_task3_round1_canonical_recheck_ignores_diagnostic_churn(tmp_path):
+    from gsdiff.data.artifacts import (
+        discover_dataset_directories,
+        verify_canonical_dataset_directory_discovery,
+    )
+
+    datasets_dir = tmp_path / "artifacts" / "datasets"
+    datasets_dir.mkdir(parents=True)
+    identity = "a" * 64
+    (datasets_dir / identity).mkdir()
+    stale = datasets_dir / f".{identity}.staging-crashleft"
+    rejected = datasets_dir / f".{identity}.rejected-{'1' * 24}"
+    stale.mkdir()
+    rejected.mkdir()
+    discovery = discover_dataset_directories(tmp_path / "artifacts")
+
+    stale.rmdir()
+    rejected.rmdir()
+    (datasets_dir / f".{identity}.staging-new").mkdir()
+    (datasets_dir / f".{identity}.rejected-{'2' * 24}").mkdir()
+
+    assert (
+        verify_canonical_dataset_directory_discovery(discovery) == ()
+    )
+
+
+def test_task3_round1_canonical_recheck_reports_stable_addition(tmp_path):
+    from gsdiff.data.artifacts import (
+        discover_dataset_directories,
+        verify_canonical_dataset_directory_discovery,
+    )
+
+    artifact_root = tmp_path / "artifacts"
+    datasets_dir = artifact_root / "datasets"
+    datasets_dir.mkdir(parents=True)
+    (datasets_dir / ("a" * 64)).mkdir()
+    discovery = discover_dataset_directories(artifact_root)
+    added = datasets_dir / ("b" * 64)
+    added.mkdir()
+
+    assert verify_canonical_dataset_directory_discovery(discovery) == (
+        added.absolute(),
+    )
+
+
+@pytest.mark.parametrize("mutation", ["removed", "replaced"])
+def test_task3_round1_canonical_recheck_rejects_existing_candidate_change(
+    tmp_path,
+    mutation,
+):
+    from gsdiff.data.artifacts import (
+        ArtifactValidationError,
+        discover_dataset_directories,
+        verify_canonical_dataset_directory_discovery,
+    )
+
+    artifact_root = tmp_path / "artifacts"
+    datasets_dir = artifact_root / "datasets"
+    datasets_dir.mkdir(parents=True)
+    candidate = datasets_dir / ("a" * 64)
+    candidate.mkdir()
+    discovery = discover_dataset_directories(artifact_root)
+    displaced = tmp_path / "displaced"
+    candidate.rename(displaced)
+    if mutation == "replaced":
+        candidate.mkdir()
+
+    with pytest.raises(
+        ArtifactValidationError,
+        match="canonical dataset directory changed",
+    ):
+        verify_canonical_dataset_directory_discovery(discovery)
+
+
+def test_task3_round1_canonical_recheck_closes_post_signature_addition_race(
+    tmp_path,
+    monkeypatch,
+):
+    import gsdiff.data._artifact_persistence as persistence
+
+    artifact_root = tmp_path / "artifacts"
+    datasets_dir = artifact_root / "datasets"
+    datasets_dir.mkdir(parents=True)
+    existing = datasets_dir / ("a" * 64)
+    existing.mkdir()
+    discovery = persistence.discover_dataset_directories(artifact_root)
+    addition = datasets_dir / ("b" * 64)
+    real_signature = persistence._discovery_directory_signature
+    candidate_signature_calls = 0
+
+    def signature_then_add(path, noun):
+        nonlocal candidate_signature_calls
+        signature = real_signature(path, noun)
+        if Path(path) == existing:
+            candidate_signature_calls += 1
+            if candidate_signature_calls == 2:
+                addition.mkdir()
+        return signature
+
+    monkeypatch.setattr(
+        persistence,
+        "_discovery_directory_signature",
+        signature_then_add,
+    )
+
+    with pytest.raises(
+        ArtifactValidationError,
+        match="canonical dataset directory discovery changed",
+    ):
+        persistence.verify_canonical_dataset_directory_discovery(discovery)
+    assert addition.is_dir()
+
+
+def test_task3_round1_canonical_recheck_closes_same_name_replacement_race(
+    tmp_path,
+    monkeypatch,
+):
+    import gsdiff.data._artifact_persistence as persistence
+
+    artifact_root = tmp_path / "artifacts"
+    datasets_dir = artifact_root / "datasets"
+    datasets_dir.mkdir(parents=True)
+    candidate = datasets_dir / ("a" * 64)
+    candidate.mkdir()
+    discovery = persistence.discover_dataset_directories(artifact_root)
+    displaced = tmp_path / "displaced-candidate"
+    real_signature = persistence._discovery_directory_signature
+    root_signature_calls = 0
+
+    def signature_then_replace(path, noun):
+        nonlocal root_signature_calls
+        signature = real_signature(path, noun)
+        if Path(path) == artifact_root:
+            root_signature_calls += 1
+            if root_signature_calls == 2:
+                candidate.rename(displaced)
+                candidate.mkdir()
+        return signature
+
+    monkeypatch.setattr(
+        persistence,
+        "_discovery_directory_signature",
+        signature_then_replace,
+    )
+
+    with pytest.raises(
+        ArtifactValidationError,
+        match="canonical dataset directory discovery changed",
+    ):
+        persistence.verify_canonical_dataset_directory_discovery(discovery)
+    assert candidate.is_dir()
+    assert displaced.is_dir()
+
+
 def test_task3_c3a_dataset_discovery_rejects_unknown_or_non_directory_entries(
     tmp_path,
 ):
@@ -6122,3 +6276,982 @@ def test_task3_c3d_discovery_fails_closed_when_datasets_appears_after_root_scan(
 
     assert injected is True
     assert datasets_dir.is_dir()
+
+
+@pytest.mark.parametrize(
+    ("descriptor", "renderer"),
+    [
+        ("char:5", None),
+        ("char:5", {}),
+        (
+            "char:5",
+            {
+                "font_family": "DejaVu Sans",
+                "fill_fraction": 0.8,
+                "resample": "nearest",
+                "supersample": 4,
+            },
+        ),
+        (
+            "char:5",
+            {
+                "font_family": "",
+                "fill_fraction": 0.8,
+                "resample": "lanczos",
+                "supersample": 4,
+            },
+        ),
+        (
+            "char:5",
+            {
+                "font_family": "DejaVu Sans",
+                "fill_fraction": True,
+                "resample": "lanczos",
+                "supersample": 4,
+            },
+        ),
+        (
+            "char:5",
+            {
+                "font_family": "DejaVu Sans",
+                "fill_fraction": 0.0,
+                "resample": "lanczos",
+                "supersample": 4,
+            },
+        ),
+        (
+            "char:5",
+            {
+                "font_family": "DejaVu Sans",
+                "fill_fraction": 1.01,
+                "resample": "lanczos",
+                "supersample": 4,
+            },
+        ),
+        (
+            "char:5",
+            {
+                "font_family": "DejaVu Sans",
+                "fill_fraction": 0.8,
+                "resample": "lanczos",
+                "supersample": False,
+            },
+        ),
+        (
+            "char:5",
+            {
+                "font_family": "DejaVu Sans",
+                "fill_fraction": 0.8,
+                "resample": "lanczos",
+                "supersample": 0,
+                "extra": 1,
+            },
+        ),
+        ("assets/target.png", None),
+        ("assets/target.png", {}),
+        (
+            "assets/target.png",
+            {"color_mode": "rgb", "resample": "lanczos"},
+        ),
+        (
+            "assets/target.png",
+            {"color_mode": "grayscale", "resample": "nearest"},
+        ),
+        (
+            "assets/target.png",
+            {
+                "color_mode": "grayscale",
+                "resample": "lanczos",
+                "extra": 1,
+            },
+        ),
+    ],
+)
+def test_task3_round1_target_snapshot_rejects_invalid_renderer(
+    descriptor, renderer
+):
+    from gsdiff.data.artifacts import TargetSnapshot
+
+    with pytest.raises((TypeError, ArtifactValidationError), match="renderer"):
+        TargetSnapshot(
+            target_id="target",
+            descriptor=descriptor,
+            assets_sha256={"asset": "a" * 64},
+            canonical_image=np.zeros((8, 8), dtype=np.float32),
+            renderer=renderer,
+        )
+
+
+@pytest.mark.parametrize(
+    "font_family",
+    [
+        "../DejaVu Sans",
+        "DejaVu/Sans",
+        "DejaVu\\Sans",
+        "DejaVu\x00Sans",
+        "DejaVu\x1fSans",
+        "x" * 129,
+    ],
+)
+def test_task3_round1_target_snapshot_rejects_pathlike_font_family(
+    font_family,
+):
+    from gsdiff.data.artifacts import TargetSnapshot
+
+    with pytest.raises(ArtifactValidationError, match="font_family"):
+        TargetSnapshot(
+            target_id="target",
+            descriptor="char:5",
+            assets_sha256={"asset": "a" * 64},
+            canonical_image=np.zeros((8, 8), dtype=np.float32),
+            renderer={
+                "font_family": font_family,
+                "fill_fraction": 0.8,
+                "resample": "lanczos",
+                "supersample": 4,
+            },
+        )
+
+
+def test_task3_round1_request_revalidates_frozen_target_renderer():
+    from gsdiff.data.artifacts import resolve_corrected_dataset_request
+
+    inputs = _phase3b_generation_inputs()
+    target = inputs["target_snapshot"]
+    object.__setattr__(
+        target,
+        "renderer",
+        {
+            "font_family": "DejaVu Sans",
+            "fill_fraction": 0.8,
+            "resample": "nearest",
+            "supersample": 4,
+        },
+    )
+
+    with pytest.raises(ArtifactValidationError, match="renderer"):
+        resolve_corrected_dataset_request(**inputs)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("target-id", "target_id"),
+        ("descriptor", "descriptor"),
+        ("assets-empty", "assets_sha256"),
+        ("asset-name-empty", "asset name"),
+        ("asset-digest-invalid", "asset hash"),
+        ("canonical-integer", "canonical_image"),
+        ("canonical-nonfinite", "canonical_image"),
+        ("canonical-out-of-range", "canonical_image"),
+    ],
+)
+def test_task3_round1_request_revalidates_all_tampered_target_fields(
+    mutation, message
+):
+    from gsdiff.data.artifacts import resolve_corrected_dataset_request
+
+    inputs = _phase3b_generation_inputs()
+    target = inputs["target_snapshot"]
+    if mutation == "target-id":
+        object.__setattr__(target, "target_id", "../truth")
+    elif mutation == "descriptor":
+        object.__setattr__(target, "descriptor", None)
+    elif mutation == "assets-empty":
+        object.__setattr__(target, "assets_sha256", {})
+    elif mutation == "asset-name-empty":
+        object.__setattr__(
+            target, "assets_sha256", {"": "a" * 64}
+        )
+    elif mutation == "asset-digest-invalid":
+        object.__setattr__(
+            target, "assets_sha256", {"asset": "not-a-sha"}
+        )
+    elif mutation == "canonical-integer":
+        object.__setattr__(
+            target,
+            "canonical_image",
+            np.zeros((8, 8), dtype=np.int32),
+        )
+    elif mutation == "canonical-nonfinite":
+        image = np.zeros((8, 8), dtype=np.float32)
+        image[0, 0] = np.nan
+        object.__setattr__(target, "canonical_image", image)
+    else:
+        image = np.zeros((8, 8), dtype=np.float32)
+        image[0, 0] = 1.01
+        object.__setattr__(target, "canonical_image", image)
+
+    with pytest.raises(
+        (TypeError, ArtifactValidationError), match=message
+    ):
+        resolve_corrected_dataset_request(**inputs)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("contract-id", "../contract"),
+        ("contract-id", ""),
+        ("contract-sha", "not-a-sha"),
+        ("target-assets", {}),
+    ],
+)
+def test_task3_round1_identity_validator_is_authoritative(field, value):
+    from gsdiff.data.artifacts import validate_dataset_identity_spec
+
+    identity = _phase3b_generate().dataset_identity_spec
+    if field == "contract-id":
+        identity["scientific_contract"]["id"] = value
+    elif field == "contract-sha":
+        identity["scientific_contract"]["sha256"] = value
+    else:
+        identity["target"]["assets_sha256"] = value
+
+    with pytest.raises((TypeError, ArtifactValidationError)):
+        validate_dataset_identity_spec(identity)
+
+
+def _task3_round1_truth_with_reference_dtype(dtype):
+    generated = _phase3b_generate()
+    identity = generated.dataset_identity_spec
+    metadata = _mutable_json(generated.truth.evaluator_metadata)
+    record = metadata["noise_calibration_record"]
+    record["reference_measurements"]["dtype"] = dtype
+    identity["noise_calibration"]["sha256"] = hashlib.sha256(
+        _canonical_json_bytes(record)
+    ).hexdigest()
+    dataset_identity = hashlib.sha256(
+        _canonical_json_bytes(identity)
+    ).hexdigest()
+    truth = dataclasses.replace(
+        generated.truth,
+        dataset_identity_sha256=dataset_identity,
+        dataset_identity_spec=identity,
+        evaluator_metadata=metadata,
+    )
+    return dataset_identity, truth
+
+
+def test_task3_round1_truth_serializer_rejects_non_float64_reference_dtype():
+    from gsdiff.data._artifact_truth import evaluation_truth_npz_bytes
+
+    _, truth = _task3_round1_truth_with_reference_dtype("<f4")
+    with pytest.raises(ArtifactValidationError, match="dtype|float64"):
+        evaluation_truth_npz_bytes(truth)
+
+
+def test_task3_round1_truth_loader_rejects_non_float64_reference_dtype():
+    from gsdiff.data._artifact_truth import load_evaluation_truth_bytes
+
+    generated, payloads, _, _ = _phase3c_build_bundle()
+    expected_identity = None
+
+    def mutate(members):
+        nonlocal expected_identity
+        raw = np.load(
+            io.BytesIO(members["__metadata_json__.npy"]),
+            allow_pickle=False,
+        )
+        metadata = json.loads(raw.tobytes().decode("utf-8"))
+        record = metadata["evaluator_metadata"][
+            "noise_calibration_record"
+        ]
+        record["reference_measurements"]["dtype"] = "<f4"
+        identity = metadata["dataset_identity_spec"]
+        identity["noise_calibration"]["sha256"] = hashlib.sha256(
+            _canonical_json_bytes(record)
+        ).hexdigest()
+        expected_identity = hashlib.sha256(
+            _canonical_json_bytes(identity)
+        ).hexdigest()
+        metadata["dataset_identity_sha256"] = expected_identity
+        encoded = _canonical_json_bytes(metadata)
+        changed = dict(members)
+        changed["__metadata_json__.npy"] = _npy_bytes(
+            np.frombuffer(encoded, dtype=np.uint8)
+        )
+        return changed
+
+    payload = _phase3c_rezip(
+        payloads["evaluation-truth.npz"],
+        mutate,
+        canonical=True,
+    )
+    assert expected_identity is not None
+    assert expected_identity != generated.dataset_identity_sha256
+    with pytest.raises(ArtifactValidationError, match="dtype|float64"):
+        load_evaluation_truth_bytes(
+            payload,
+            expected_dataset_identity_sha256=expected_identity,
+        )
+
+
+def _task3_round1_rehash_manifest(manifest):
+    config = manifest["resolved_generator_config"]
+    identity = manifest["dataset_identity_spec"]
+    record = manifest["noise_calibration_record"]
+    config_sha256 = hashlib.sha256(
+        _canonical_json_bytes(config)
+    ).hexdigest()
+    identity["generator_config_sha256"] = config_sha256
+    record["generator_config_sha256"] = config_sha256
+    identity["noise_calibration"]["sha256"] = hashlib.sha256(
+        _canonical_json_bytes(record)
+    ).hexdigest()
+    manifest["dataset_identity_sha256"] = hashlib.sha256(
+        _canonical_json_bytes(identity)
+    ).hexdigest()
+    return manifest
+
+
+def _task3_round1_set_nested_value(mapping, path, value):
+    current = mapping
+    for key in path[:-1]:
+        current = current[key]
+    current[path[-1]] = value
+
+
+def test_task3_round1_manifest_schema_matches_runtime_path_free_ids():
+    from jsonschema import Draft202012Validator
+    from gsdiff.data._artifact_identity import (
+        validate_path_free_opaque_id,
+    )
+    from gsdiff.data.artifacts import dataset_manifest_bytes
+
+    schema = json.loads(
+        (
+            REPO_ROOT / "schemas" / "dataset-manifest-v1.schema.json"
+        ).read_text(encoding="utf-8")
+    )
+    validator = Draft202012Validator(schema)
+    _, _, base_manifest, _ = _phase3c_build_bundle()
+    base_manifest = _mutable_json(base_manifest)
+    assert not list(validator.iter_errors(base_manifest))
+
+    path_free_fields = (
+        (
+            "resolvedTarget.id",
+            ("resolved_generator_config", "target", "id"),
+        ),
+        (
+            "resolvedMotion.id",
+            ("resolved_generator_config", "motion", "id"),
+        ),
+        (
+            "resolvedAcquisition.noise_calibration_id",
+            (
+                "resolved_generator_config",
+                "acquisition",
+                "noise_calibration_id",
+            ),
+        ),
+        (
+            "calibrationDescriptor.id",
+            ("noise_calibration_record", "calibration", "id"),
+        ),
+        (
+            "noiseCalibrationRecord.scientific_contract.id",
+            (
+                "noise_calibration_record",
+                "scientific_contract",
+                "id",
+            ),
+        ),
+        (
+            "noiseCalibrationRecord.target_id",
+            ("noise_calibration_record", "target_id"),
+        ),
+        (
+            "noiseCalibrationRecord.motion_id",
+            ("noise_calibration_record", "motion_id"),
+        ),
+        (
+            "noiseCalibrationRecord.generator.id",
+            ("noise_calibration_record", "generator", "id"),
+        ),
+        (
+            "noiseCalibrationRecord.generator.version",
+            ("noise_calibration_record", "generator", "version"),
+        ),
+        (
+            "datasetIdentity.scientific_contract.id",
+            (
+                "dataset_identity_spec",
+                "scientific_contract",
+                "id",
+            ),
+        ),
+        (
+            "datasetIdentity.target.id",
+            ("dataset_identity_spec", "target", "id"),
+        ),
+        (
+            "datasetIdentity.motion.id",
+            ("dataset_identity_spec", "motion", "id"),
+        ),
+        (
+            "datasetIdentity.noise_calibration.id",
+            (
+                "dataset_identity_spec",
+                "noise_calibration",
+                "id",
+            ),
+        ),
+        (
+            "datasetIdentity.generator.id",
+            ("dataset_identity_spec", "generator", "id"),
+        ),
+        (
+            "datasetIdentity.generator.version",
+            ("dataset_identity_spec", "generator", "version"),
+        ),
+    )
+    opaque_id_cases = (
+        ("valid-minimum", "A"),
+        ("valid-punctuation", "Alpha_1.beta-2"),
+        ("valid-maximum", "A" + ("x" * 127)),
+        ("valid-embedded-gt", "alphaGTbeta"),
+        ("empty", ""),
+        ("leading-punctuation", "_alpha"),
+        ("forward-slash", "alpha/beta"),
+        ("backslash", "alpha\\beta"),
+        ("space", "alpha beta"),
+        ("non-ascii", "αlpha"),
+        ("too-long", "A" + ("x" * 128)),
+        ("trailing-newline", "alpha\n"),
+        ("double-dot", "alpha..beta"),
+        ("reserved-truth", "alphaTruthBeta"),
+        ("reserved-evaluation", "alphaEvaluationBeta"),
+        ("reserved-evaluator", "alphaEvaluatorBeta"),
+        ("reserved-canonical", "alphaCanonicalBeta"),
+        ("reserved-trajectory", "alphaTrajectoryBeta"),
+        ("reserved-metric", "alphaMetricBeta"),
+        ("reserved-display", "alphaDisplayBeta"),
+        ("reserved-normalized", "alphaNormalizedBeta"),
+        ("reserved-gt-exact", "GT"),
+        ("reserved-gt-segment", "alpha-Gt_beta"),
+    )
+    mismatches = []
+    for field_name, path in path_free_fields:
+        for case_name, value in opaque_id_cases:
+            manifest = _mutable_json(base_manifest)
+            _task3_round1_set_nested_value(manifest, path, value)
+            schema_accepts = not list(validator.iter_errors(manifest))
+            try:
+                validate_path_free_opaque_id(value, field_name)
+            except (TypeError, ArtifactValidationError):
+                runtime_accepts = False
+            else:
+                runtime_accepts = True
+            if schema_accepts != runtime_accepts:
+                mismatches.append(
+                    {
+                        "field": field_name,
+                        "case": case_name,
+                        "schema_accepts": schema_accepts,
+                        "runtime_accepts": runtime_accepts,
+                    }
+                )
+
+    for field_name, path in (
+        (
+            "resolvedTarget.assets_sha256",
+            ("resolved_generator_config", "target", "assets_sha256"),
+        ),
+        (
+            "datasetIdentity.target.assets_sha256",
+            ("dataset_identity_spec", "target", "assets_sha256"),
+        ),
+    ):
+        manifest = _mutable_json(base_manifest)
+        named_hashes = manifest
+        for key in path:
+            named_hashes = named_hashes[key]
+        digest = next(iter(named_hashes.values()))
+        _task3_round1_set_nested_value(manifest, path, {"": digest})
+        schema_accepts = not list(validator.iter_errors(manifest))
+        _task3_round1_rehash_manifest(manifest)
+        try:
+            dataset_manifest_bytes(manifest)
+        except (TypeError, ArtifactValidationError):
+            runtime_accepts = False
+        else:
+            runtime_accepts = True
+        if schema_accepts != runtime_accepts:
+            mismatches.append(
+                {
+                    "field": field_name,
+                    "case": "empty-property-name",
+                    "schema_accepts": schema_accepts,
+                    "runtime_accepts": runtime_accepts,
+                }
+            )
+
+    assert not mismatches, json.dumps(mismatches, indent=2)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "sha256-trailing-newline",
+        "identity-git-commit-trailing-newline",
+        "record-git-commit-trailing-newline",
+        "font-family-trailing-newline",
+    ],
+)
+def test_task3_round1_manifest_schema_matches_runtime_fullmatch_patterns(
+    mutation,
+):
+    from jsonschema import Draft202012Validator
+    from gsdiff.data.artifacts import dataset_manifest_bytes
+
+    schema = json.loads(
+        (
+            REPO_ROOT / "schemas" / "dataset-manifest-v1.schema.json"
+        ).read_text(encoding="utf-8")
+    )
+    _, _, manifest, _ = _phase3c_build_bundle()
+    manifest = _mutable_json(manifest)
+    if mutation == "sha256-trailing-newline":
+        manifest["dataset_identity_sha256"] = ("0" * 64) + "\n"
+    elif mutation == "identity-git-commit-trailing-newline":
+        manifest["dataset_identity_spec"]["generator"]["git_commit"] = (
+            ("0" * 40) + "\n"
+        )
+        _task3_round1_rehash_manifest(manifest)
+    elif mutation == "record-git-commit-trailing-newline":
+        manifest["noise_calibration_record"]["generator"]["git_commit"] = (
+            ("0" * 40) + "\n"
+        )
+        _task3_round1_rehash_manifest(manifest)
+    else:
+        manifest["resolved_generator_config"]["target"]["renderer"][
+            "font_family"
+        ] = "DejaVu Sans\n"
+        _task3_round1_rehash_manifest(manifest)
+
+    schema_accepts = not list(
+        Draft202012Validator(schema).iter_errors(manifest)
+    )
+    try:
+        dataset_manifest_bytes(manifest)
+    except (TypeError, ArtifactValidationError):
+        runtime_accepts = False
+    else:
+        runtime_accepts = True
+    assert runtime_accepts is False, mutation
+    assert schema_accepts is False, mutation
+    assert schema_accepts == runtime_accepts, mutation
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "renderer-null",
+        "renderer-empty",
+        "renderer-wrong-const",
+        "renderer-extra",
+        "renderer-fill-range",
+        "renderer-supersample-bool",
+        "renderer-font-family-path",
+        "renderer-char-file-family",
+        "renderer-file-glyph-family",
+        "contract-path",
+        "contract-double-dot",
+        "contract-reserved-token",
+        "contract-bad-sha",
+    ],
+)
+def test_task3_round1_schema_and_runtime_reject_coherent_semantic_holes(
+    mutation,
+):
+    from jsonschema import Draft202012Validator
+    from gsdiff.data.artifacts import dataset_manifest_bytes
+
+    schema = json.loads(
+        (
+            REPO_ROOT / "schemas" / "dataset-manifest-v1.schema.json"
+        ).read_text(encoding="utf-8")
+    )
+    _, _, manifest, _ = _phase3c_build_bundle()
+    manifest = _mutable_json(manifest)
+    if mutation == "renderer-null":
+        manifest["resolved_generator_config"]["target"]["renderer"] = None
+    elif mutation == "renderer-empty":
+        manifest["resolved_generator_config"]["target"]["renderer"] = {}
+    elif mutation == "renderer-wrong-const":
+        manifest["resolved_generator_config"]["target"]["renderer"][
+            "resample"
+        ] = "nearest"
+    elif mutation == "renderer-extra":
+        manifest["resolved_generator_config"]["target"]["renderer"][
+            "extra"
+        ] = 1
+    elif mutation == "renderer-fill-range":
+        manifest["resolved_generator_config"]["target"]["renderer"][
+            "fill_fraction"
+        ] = 1.01
+    elif mutation == "renderer-supersample-bool":
+        manifest["resolved_generator_config"]["target"]["renderer"][
+            "supersample"
+        ] = True
+    elif mutation == "renderer-font-family-path":
+        manifest["resolved_generator_config"]["target"]["renderer"][
+            "font_family"
+        ] = "../DejaVu Sans"
+    elif mutation == "renderer-char-file-family":
+        manifest["resolved_generator_config"]["target"]["renderer"] = {
+            "color_mode": "grayscale",
+            "resample": "lanczos",
+        }
+    elif mutation == "renderer-file-glyph-family":
+        manifest["resolved_generator_config"]["target"][
+            "descriptor"
+        ] = "assets/target.png"
+    elif mutation == "contract-path":
+        contract = {"id": "../contract", "sha256": "3" * 64}
+        manifest["dataset_identity_spec"]["scientific_contract"] = contract
+        manifest["noise_calibration_record"][
+            "scientific_contract"
+        ] = contract
+    elif mutation == "contract-double-dot":
+        contract = {"id": "contract..v1", "sha256": "3" * 64}
+        manifest["dataset_identity_spec"]["scientific_contract"] = contract
+        manifest["noise_calibration_record"][
+            "scientific_contract"
+        ] = contract
+    elif mutation == "contract-reserved-token":
+        contract = {"id": "truth-contract", "sha256": "3" * 64}
+        manifest["dataset_identity_spec"]["scientific_contract"] = contract
+        manifest["noise_calibration_record"][
+            "scientific_contract"
+        ] = contract
+    else:
+        contract = {"id": "contract", "sha256": "not-a-sha"}
+        manifest["dataset_identity_spec"]["scientific_contract"] = contract
+        manifest["noise_calibration_record"][
+            "scientific_contract"
+        ] = contract
+    _task3_round1_rehash_manifest(manifest)
+
+    assert list(Draft202012Validator(schema).iter_errors(manifest)), mutation
+    with pytest.raises(
+        (TypeError, ArtifactValidationError), match="renderer|scientific"
+    ):
+        dataset_manifest_bytes(manifest)
+
+
+def test_task3_round1_directory_parser_rejects_coherent_invalid_renderer(
+    tmp_path,
+):
+    from gsdiff.data.artifacts import verify_dataset_directory
+
+    _, _, manifest, _, dataset_dir = _phase3c_write_dataset_directory(
+        tmp_path
+    )
+    manifest = _mutable_json(manifest)
+    manifest["resolved_generator_config"]["target"]["renderer"] = None
+    _task3_round1_rehash_manifest(manifest)
+    (dataset_dir / "dataset-manifest.json").write_bytes(
+        _canonical_json_bytes(manifest)
+    )
+
+    with pytest.raises(ArtifactValidationError, match="renderer"):
+        verify_dataset_directory(dataset_dir)
+
+
+@pytest.mark.parametrize("loader_kind", ["path", "bytes"])
+@pytest.mark.parametrize(
+    "spoof",
+    [
+        "identity-string-subclass",
+        "spec-dict-subclass",
+        "nested-string-subclass",
+        "nested-numpy-int",
+    ],
+)
+def test_task3_round1_blind_loaders_reject_nonexact_expected_anchors(
+    tmp_path, loader_kind, spoof
+):
+    from gsdiff.data._artifact_dataset import load_acquisition_data_bytes
+
+    generated, payloads, _, _ = _phase3c_build_bundle()
+    identity = generated.dataset_identity_sha256
+    spec = _mutable_json(blind_acquisition_spec(generated.acquisition))
+    if spoof == "identity-string-subclass":
+        identity = type("StringSubclass", (str,), {})(identity)
+    elif spoof == "spec-dict-subclass":
+        spec = type("DictSubclass", (dict,), {})(spec)
+    elif spoof == "nested-string-subclass":
+        spec["acquisition"]["pattern_family"] = type(
+            "StringSubclass", (str,), {}
+        )(spec["acquisition"]["pattern_family"])
+    else:
+        spec["dimensions"]["H"] = np.int64(spec["dimensions"]["H"])
+    payload = payloads["measurements.npz"]
+    path = tmp_path / "measurements.npz"
+    path.write_bytes(payload)
+    loader = (
+        load_acquisition_data
+        if loader_kind == "path"
+        else load_acquisition_data_bytes
+    )
+    source = path if loader_kind == "path" else payload
+
+    with pytest.raises((TypeError, ArtifactValidationError)):
+        loader(
+            source,
+            expected_dataset_identity_sha256=identity,
+            expected_acquisition_spec=spec,
+        )
+
+
+@pytest.mark.parametrize("loader_kind", ["path", "bytes"])
+def test_task3_round1_blind_loaders_accept_exact_mapping_proxy_anchor(
+    tmp_path, loader_kind
+):
+    from types import MappingProxyType
+    from gsdiff.data._artifact_dataset import load_acquisition_data_bytes
+
+    generated, payloads, _, _ = _phase3c_build_bundle()
+    payload = payloads["measurements.npz"]
+    path = tmp_path / "measurements.npz"
+    path.write_bytes(payload)
+    loader = (
+        load_acquisition_data
+        if loader_kind == "path"
+        else load_acquisition_data_bytes
+    )
+    source = path if loader_kind == "path" else payload
+    spec = MappingProxyType(
+        _mutable_json(blind_acquisition_spec(generated.acquisition))
+    )
+
+    loaded = loader(
+        source,
+        expected_dataset_identity_sha256=(
+            generated.dataset_identity_sha256
+        ),
+        expected_acquisition_spec=spec,
+    )
+    assert loaded.dataset_identity_sha256 == (
+        generated.dataset_identity_sha256
+    )
+
+
+def _task3_round1_write_target_png(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(
+        np.arange(64, dtype=np.uint8).reshape(8, 8),
+        mode="L",
+    ).save(path, format="PNG")
+    return path.read_bytes()
+
+
+@pytest.mark.parametrize("role", ["target", "font"])
+def test_task3_round1_target_inputs_enforce_bound_before_bulk_read(
+    tmp_path, monkeypatch, role
+):
+    import gsdiff.data._artifact_io as artifact_io
+    import gsdiff.data._corrected_generation as corrected
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    if role == "target":
+        leaf = repo / "assets" / "target.png"
+        payload = _task3_round1_write_target_png(leaf)
+        monkeypatch.setattr(
+            corrected, "_MAX_TARGET_ASSET_BYTES", len(payload) - 1,
+            raising=False,
+        )
+        descriptor = "assets/target.png"
+    else:
+        leaf = tmp_path / "oversize-font.ttf"
+        payload = b"font-bytes"
+        leaf.write_bytes(payload)
+        monkeypatch.setattr(
+            corrected, "_bundled_dejavu_font_path", lambda: leaf
+        )
+        monkeypatch.setattr(
+            corrected, "_MAX_TARGET_FONT_BYTES", len(payload) - 1,
+            raising=False,
+        )
+        descriptor = "char:5"
+
+    def forbidden_bulk_read(*args, **kwargs):
+        raise AssertionError("oversize target reached bulk read")
+
+    monkeypatch.setattr(artifact_io.os, "read", forbidden_bulk_read)
+    with pytest.raises(ArtifactValidationError, match="byte bound"):
+        corrected.resolve_target_snapshot(
+            repo_root=repo,
+            target_id="target",
+            descriptor=descriptor,
+            H=8,
+            W=8,
+        )
+
+
+@pytest.mark.parametrize("role", ["target", "font"])
+def test_task3_round1_target_inputs_reject_hardlinked_leaf(
+    tmp_path, monkeypatch, role
+):
+    import gsdiff.data._corrected_generation as corrected
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    source = tmp_path / f"{role}-source"
+    leaf = (
+        repo / "assets" / "target.png"
+        if role == "target"
+        else tmp_path / "font-link.ttf"
+    )
+    leaf.parent.mkdir(parents=True, exist_ok=True)
+    if role == "target":
+        _task3_round1_write_target_png(source)
+        descriptor = "assets/target.png"
+    else:
+        source.write_bytes(
+            corrected._bundled_dejavu_font_path().read_bytes()
+        )
+        monkeypatch.setattr(
+            corrected, "_bundled_dejavu_font_path", lambda: leaf
+        )
+        descriptor = "char:5"
+    try:
+        os.link(source, leaf)
+    except OSError as error:
+        pytest.skip(f"hardlinks unavailable: {error}")
+
+    with pytest.raises(ArtifactValidationError, match="hardlink"):
+        corrected.resolve_target_snapshot(
+            repo_root=repo,
+            target_id="target",
+            descriptor=descriptor,
+            H=8,
+            W=8,
+        )
+
+
+@pytest.mark.parametrize("role", ["target", "font"])
+@pytest.mark.parametrize("mutation", ["restored-mtime", "leaf-replacement"])
+def test_task3_round1_target_inputs_recheck_physical_snapshot_after_use(
+    tmp_path, monkeypatch, role, mutation
+):
+    import gsdiff.data._corrected_generation as corrected
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    if role == "target":
+        leaf = repo / "assets" / "target.png"
+        _task3_round1_write_target_png(leaf)
+        descriptor = "assets/target.png"
+    else:
+        leaf = tmp_path / "font.ttf"
+        leaf.write_bytes(
+            corrected._bundled_dejavu_font_path().read_bytes()
+        )
+        monkeypatch.setattr(
+            corrected, "_bundled_dejavu_font_path", lambda: leaf
+        )
+        descriptor = "char:5"
+    real_snapshot = getattr(
+        corrected, "read_safe_file_snapshot", None
+    )
+    if real_snapshot is None:
+        from gsdiff.data._artifact_io import read_safe_file_snapshot
+
+        real_snapshot = read_safe_file_snapshot
+    injected = False
+
+    def read_then_mutate(path, *, max_bytes, noun):
+        nonlocal injected
+        snapshot = real_snapshot(
+            path, max_bytes=max_bytes, noun=noun
+        )
+        if not injected:
+            injected = True
+            original_mtime = snapshot.path.stat().st_mtime_ns
+            if mutation == "restored-mtime":
+                changed = bytes([snapshot.raw[0] ^ 1]) + snapshot.raw[1:]
+                snapshot.path.write_bytes(changed)
+            else:
+                replacement = snapshot.path.with_name(
+                    snapshot.path.name + ".replacement"
+                )
+                replacement.write_bytes(snapshot.raw)
+                os.replace(replacement, snapshot.path)
+            os.utime(
+                snapshot.path,
+                ns=(original_mtime, original_mtime),
+            )
+        return snapshot
+
+    monkeypatch.setattr(
+        corrected,
+        "read_safe_file_snapshot",
+        read_then_mutate,
+        raising=False,
+    )
+    with pytest.raises(ArtifactValidationError, match="snapshot.*changed"):
+        corrected.resolve_target_snapshot(
+            repo_root=repo,
+            target_id="target",
+            descriptor=descriptor,
+            H=8,
+            W=8,
+        )
+    assert injected is True
+
+
+@pytest.mark.parametrize("role", ["target", "font"])
+def test_task3_round1_target_inputs_reject_same_bytes_replacement_at_second_read(
+    tmp_path, monkeypatch, role
+):
+    import gsdiff.data._corrected_generation as corrected
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    if role == "target":
+        leaf = repo / "assets" / "target.png"
+        _task3_round1_write_target_png(leaf)
+        descriptor = "assets/target.png"
+    else:
+        leaf = tmp_path / "font.ttf"
+        leaf.write_bytes(
+            corrected._bundled_dejavu_font_path().read_bytes()
+        )
+        monkeypatch.setattr(
+            corrected, "_bundled_dejavu_font_path", lambda: leaf
+        )
+        descriptor = "char:5"
+    real_snapshot = corrected.read_safe_file_snapshot
+    calls = 0
+
+    def replace_before_second_read(path, *, max_bytes, noun):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raw = Path(path).read_bytes()
+            replacement = Path(path).with_name(
+                Path(path).name + ".replacement"
+            )
+            replacement.write_bytes(raw)
+            os.replace(replacement, path)
+        return real_snapshot(path, max_bytes=max_bytes, noun=noun)
+
+    monkeypatch.setattr(
+        corrected,
+        "read_safe_file_snapshot",
+        replace_before_second_read,
+    )
+    with pytest.raises(ArtifactValidationError, match="snapshot.*changed"):
+        corrected.resolve_target_snapshot(
+            repo_root=repo,
+            target_id="target",
+            descriptor=descriptor,
+            H=8,
+            W=8,
+        )
+    assert calls == 2

@@ -123,6 +123,10 @@ _EXPORTS = {
         "._artifact_bundle",
         "verify_dataset_payload_bytes",
     ),
+    "verify_canonical_dataset_directory_discovery": (
+        "._artifact_persistence",
+        "verify_canonical_dataset_directory_discovery",
+    ),
     "verify_dataset_directory": (
         "._artifact_persistence",
         "verify_dataset_directory",

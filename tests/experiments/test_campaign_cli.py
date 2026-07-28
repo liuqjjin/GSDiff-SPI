@@ -1,7 +1,9 @@
 import importlib.util
+import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 from dataclasses import replace
@@ -86,6 +88,72 @@ def _artifact_inventory(artifact_root):
             path.read_bytes() if path.is_file() else None,
         )
     return inventory
+
+
+def _controlled_pilot_request_and_generated(cli):
+    plan = cli.plan_campaign_datasets(
+        repo_root=REPO_ROOT,
+        protocol_path=(
+            REPO_ROOT / "configs" / "protocols" / "pilot-v1.yaml"
+        ),
+        runtime=CONTROLLED_RUNTIME,
+        generator_commit=CONTROLLED_COMMIT,
+    )
+    assert len(plan.requests) == 1
+    request = plan.requests[0]
+    generated = cli.generate_corrected_dataset(
+        **request.generation_arguments()
+    )
+    return request, generated
+
+
+def _coherent_semantic_twin(generated):
+    from gsdiff.data.artifacts import CorrectedDataset
+
+    record = json.loads(
+        canonical_json_bytes(
+            generated.noise_calibration_record
+        ).decode("utf-8")
+    )
+    realized = record["realized_snr_db"]["train"]
+    record["realized_snr_db"]["train"] = (
+        123.0 if realized is None else float(realized) + 1.0
+    )
+    calibration_sha256 = hashlib.sha256(
+        canonical_json_bytes(record)
+    ).hexdigest()
+    identity = json.loads(
+        canonical_json_bytes(
+            generated.dataset_identity_spec
+        ).decode("utf-8")
+    )
+    identity["noise_calibration"]["sha256"] = calibration_sha256
+    dataset_identity_sha256 = hashlib.sha256(
+        canonical_json_bytes(identity)
+    ).hexdigest()
+    config = generated.resolved_generator_config
+    acquisition = replace(
+        generated.acquisition,
+        dataset_identity_sha256=dataset_identity_sha256,
+    )
+    truth = replace(
+        generated.truth,
+        dataset_identity_sha256=dataset_identity_sha256,
+        dataset_identity_spec=identity,
+        evaluator_metadata={
+            "resolved_generator_config": config,
+            "noise_calibration_record": record,
+        },
+    )
+    return CorrectedDataset(
+        dataset_identity_sha256=dataset_identity_sha256,
+        dataset_identity_spec=identity,
+        resolved_generator_config=config,
+        noise_calibration_record=record,
+        noise_calibration_sha256=calibration_sha256,
+        acquisition=acquisition,
+        truth=truth,
+    )
 
 
 def test_task3_c3a_build_datasets_cli_exposes_main():
@@ -291,12 +359,12 @@ def test_task3_c3a_real_pilot_dry_run_is_stable_and_writes_nothing(
     cli = _load_build_datasets_cli()
     controlled_state = {**cli._git_state(), "dirty": False}
     monkeypatch.setattr(cli, "_git_state", lambda: controlled_state)
-    discovery_rechecks = 0
+    active_run = 0
+    discovery_rechecked = [False, False]
     real_recheck = cli.verify_dataset_directory_discovery
 
     def observing_recheck(discovery):
-        nonlocal discovery_rechecks
-        discovery_rechecks += 1
+        discovery_rechecked[active_run] = True
         return real_recheck(discovery)
 
     monkeypatch.setattr(
@@ -315,6 +383,7 @@ def test_task3_c3a_real_pilot_dry_run_is_stable_and_writes_nothing(
 
     first_code = cli.main(arguments)
     first_capture = capsys.readouterr()
+    active_run = 1
     second_code = cli.main(arguments)
     second_capture = capsys.readouterr()
 
@@ -358,7 +427,7 @@ def test_task3_c3a_real_pilot_dry_run_is_stable_and_writes_nothing(
     }
     assert len(report["datasets"][0]["dataset_identity_sha256"]) == 64
     assert len(report["datasets"][0]["request_sha256"]) == 64
-    assert discovery_rechecks == 2
+    assert discovery_rechecked == [True, True]
     assert str(REPO_ROOT) not in first_capture.out
     assert str(tmp_path) not in first_capture.out
 
@@ -1113,12 +1182,10 @@ def test_task3_c3c_final_discovery_is_followed_by_provenance_recheck(
     cli = _load_build_datasets_cli()
     artifact_root = tmp_path / "artifacts"
     final_discovery_seen = False
-    discovery_calls = 0
     real_discovery = cli.discover_dataset_directories
 
     def observing_discovery(path):
-        nonlocal discovery_calls, final_discovery_seen
-        discovery_calls += 1
+        nonlocal final_discovery_seen
         result = real_discovery(path)
         if result.canonical_directories:
             final_discovery_seen = True
@@ -1146,7 +1213,6 @@ def test_task3_c3c_final_discovery_is_followed_by_provenance_recheck(
 
     captured = capsys.readouterr()
     assert final_discovery_seen is True
-    assert discovery_calls == 1
     assert return_code == 1
     assert json.loads(captured.out)["errors"] == [
         {"code": "provenance-changed"}
@@ -1359,3 +1425,851 @@ def test_task3_c3c_default_build_creates_then_reuses_without_byte_changes(
     )
     assert str(REPO_ROOT) not in first_capture.out + second_capture.out
     assert str(tmp_path) not in first_capture.out + second_capture.out
+
+
+def test_task3_round1_build_reuses_unique_current_without_generation_or_publish(
+    tmp_path, capsys, monkeypatch
+):
+    cli = _load_build_datasets_cli()
+    artifact_root = tmp_path / "artifacts"
+    request, publication = _publish_controlled_pilot_dataset(
+        cli, artifact_root
+    )
+    before = _artifact_inventory(artifact_root)
+    monkeypatch.setattr(cli, "_environment", lambda: CONTROLLED_RUNTIME)
+    monkeypatch.setattr(
+        cli, "_git_state", lambda: _controlled_git_state()
+    )
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError(
+            "unique current reuse attempted generation or publication"
+        )
+
+    monkeypatch.setattr(cli, "generate_corrected_dataset", forbidden)
+    monkeypatch.setattr(cli, "publish_dataset", forbidden)
+
+    return_code = cli.main(
+        [
+            "--protocol",
+            str(REPO_ROOT / "configs" / "protocols" / "pilot-v1.yaml"),
+            "--artifact-root",
+            str(artifact_root),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    report = json.loads(captured.out)
+    assert return_code == 0
+    assert captured.err == ""
+    assert report["datasets"] == [
+        {
+            "dataset_identity_sha256": (
+                publication.verified.dataset_identity_sha256
+            ),
+            "request_sha256": request.request_sha256,
+            "status": "reused",
+        }
+    ]
+    assert report["corrupt_count"] == 0
+    assert report["corrupt_datasets"] == []
+    assert _artifact_inventory(artifact_root) == before
+
+
+def test_task3_round1_default_build_reuses_existing_and_creates_only_missing(
+    tmp_path, capsys, monkeypatch
+):
+    cli = _load_build_datasets_cli()
+    artifact_root = tmp_path / "artifacts"
+    base_request, base_publication = _publish_controlled_pilot_dataset(
+        cli, artifact_root
+    )
+    base_identity = base_publication.verified.dataset_identity_sha256
+    base_before = _artifact_inventory(base_publication.dataset_dir)
+
+    missing_seed = base_request.seed + 1
+    missing_arguments = base_request.generation_arguments()
+    missing_arguments["seed"] = missing_seed
+    missing_semantic_content = cli.resolve_corrected_dataset_request(
+        **missing_arguments
+    )
+    missing_encoded = canonical_json_bytes(missing_semantic_content)
+    missing_request = replace(
+        base_request,
+        request_sha256=hashlib.sha256(missing_encoded).hexdigest(),
+        semantic_content=missing_semantic_content,
+        seed=missing_seed,
+    )
+    base_plan = cli.plan_campaign_datasets(
+        repo_root=REPO_ROOT,
+        protocol_path=(
+            REPO_ROOT / "configs" / "protocols" / "pilot-v1.yaml"
+        ),
+        runtime=CONTROLLED_RUNTIME,
+        generator_commit=CONTROLLED_COMMIT,
+    )
+    mixed_plan = replace(
+        base_plan,
+        expanded_cells=2,
+        expected_datasets=2,
+        requests=tuple(
+            sorted(
+                (base_request, missing_request),
+                key=lambda request: request.request_sha256,
+            )
+        ),
+    )
+
+    real_generate = cli.generate_corrected_dataset
+    real_publish = cli.publish_dataset
+    generated_calls = []
+    published_calls = []
+
+    def observing_generate(**kwargs):
+        generated = real_generate(**kwargs)
+        generated_calls.append(
+            (kwargs["seed"], generated.dataset_identity_sha256)
+        )
+        return generated
+
+    def observing_publish(root, generated):
+        publication = real_publish(root, generated)
+        published_calls.append(
+            (
+                generated.dataset_identity_sha256,
+                publication.status,
+            )
+        )
+        return publication
+
+    monkeypatch.setattr(cli, "_environment", lambda: CONTROLLED_RUNTIME)
+    monkeypatch.setattr(
+        cli, "_git_state", lambda: _controlled_git_state()
+    )
+    monkeypatch.setattr(
+        cli, "plan_campaign_datasets", lambda **kwargs: mixed_plan
+    )
+    monkeypatch.setattr(
+        cli, "generate_corrected_dataset", observing_generate
+    )
+    monkeypatch.setattr(cli, "publish_dataset", observing_publish)
+
+    return_code = cli.main(
+        [
+            "--protocol",
+            str(REPO_ROOT / "configs" / "protocols" / "pilot-v1.yaml"),
+            "--artifact-root",
+            str(artifact_root),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    report = json.loads(captured.out)
+    assert return_code == 0
+    assert captured.err == ""
+    assert len(generated_calls) == len(published_calls) == 1
+    missing_identity = generated_calls[0][1]
+    assert generated_calls == [(missing_seed, missing_identity)]
+    assert published_calls == [(missing_identity, "created")]
+    assert {
+        record["request_sha256"]: (
+            record["dataset_identity_sha256"],
+            record["status"],
+        )
+        for record in report["datasets"]
+    } == {
+        base_request.request_sha256: (base_identity, "reused"),
+        missing_request.request_sha256: (missing_identity, "created"),
+    }
+    assert report["observed_datasets"] == report["expected_datasets"] == 2
+    assert {
+        path.name
+        for path in (artifact_root / "datasets").iterdir()
+    } == {base_identity, missing_identity}
+    assert _artifact_inventory(base_publication.dataset_dir) == base_before
+
+
+def test_task3_round1_build_rejects_real_coherent_twins_before_any_write(
+    tmp_path, capsys, monkeypatch
+):
+    from gsdiff.data.artifacts import publish_dataset
+
+    cli = _load_build_datasets_cli()
+    artifact_root = tmp_path / "artifacts"
+    request, generated = _controlled_pilot_request_and_generated(cli)
+    first = publish_dataset(artifact_root, generated)
+    twin = _coherent_semantic_twin(generated)
+    second = publish_dataset(artifact_root, twin)
+    assert first.verified.dataset_identity_sha256 != (
+        second.verified.dataset_identity_sha256
+    )
+    assert cli._semantic_projection_from_manifest(
+        first.verified.manifest
+    ) == cli._semantic_projection_from_manifest(second.verified.manifest)
+    before = _artifact_inventory(artifact_root)
+    monkeypatch.setattr(cli, "_environment", lambda: CONTROLLED_RUNTIME)
+    monkeypatch.setattr(
+        cli, "_git_state", lambda: _controlled_git_state()
+    )
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError(
+            "ambiguous current datasets attempted generation or publication"
+        )
+
+    monkeypatch.setattr(cli, "generate_corrected_dataset", forbidden)
+    monkeypatch.setattr(cli, "publish_dataset", forbidden)
+
+    return_code = cli.main(
+        [
+            "--protocol",
+            str(REPO_ROOT / "configs" / "protocols" / "pilot-v1.yaml"),
+            "--artifact-root",
+            str(artifact_root),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    report = json.loads(captured.out)
+    assert return_code == 1
+    assert report["errors"] == [{"code": "ambiguous-current-dataset"}]
+    assert captured.err == (
+        "dataset build failed: ambiguous-current-dataset\n"
+    )
+    assert _artifact_inventory(artifact_root) == before
+    assert len(request.request_sha256) == 64
+
+
+def test_task3_round1_build_reuses_valid_current_and_reports_corrupt_unrelated(
+    tmp_path, capsys, monkeypatch
+):
+    cli = _load_build_datasets_cli()
+    artifact_root = tmp_path / "artifacts"
+    request, publication = _publish_controlled_pilot_dataset(
+        cli, artifact_root
+    )
+    corrupt_identity = "e" * 64
+    corrupt_dir = (
+        artifact_root / "datasets" / corrupt_identity
+    )
+    shutil.copytree(publication.dataset_dir, corrupt_dir)
+    before = _artifact_inventory(artifact_root)
+    monkeypatch.setattr(cli, "_environment", lambda: CONTROLLED_RUNTIME)
+    monkeypatch.setattr(
+        cli, "_git_state", lambda: _controlled_git_state()
+    )
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError(
+            "valid current plus corrupt unrelated attempted generation"
+        )
+
+    monkeypatch.setattr(cli, "generate_corrected_dataset", forbidden)
+    monkeypatch.setattr(cli, "publish_dataset", forbidden)
+
+    return_code = cli.main(
+        [
+            "--protocol",
+            str(REPO_ROOT / "configs" / "protocols" / "pilot-v1.yaml"),
+            "--artifact-root",
+            str(artifact_root),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    report = json.loads(captured.out)
+    assert return_code == 0
+    assert captured.err == ""
+    assert report["datasets"] == [
+        {
+            "dataset_identity_sha256": (
+                publication.verified.dataset_identity_sha256
+            ),
+            "request_sha256": request.request_sha256,
+            "status": "reused",
+        }
+    ]
+    assert report["corrupt_count"] == 1
+    assert report["corrupt_datasets"] == [
+        {"dataset_identity_sha256": corrupt_identity}
+    ]
+    assert _artifact_inventory(artifact_root) == before
+
+
+def test_task3_round1_build_does_not_repair_corrupt_exact_final(
+    tmp_path, capsys, monkeypatch
+):
+    cli = _load_build_datasets_cli()
+    artifact_root = tmp_path / "artifacts"
+    _, publication = _publish_controlled_pilot_dataset(
+        cli, artifact_root
+    )
+    payload = publication.dataset_dir / "measurements.npz"
+    payload.chmod(0o600)
+    damaged = bytearray(payload.read_bytes())
+    damaged[-1] ^= 1
+    payload.write_bytes(damaged)
+    before = _artifact_inventory(artifact_root)
+    generated_calls = 0
+    publish_calls = 0
+    real_generate = cli.generate_corrected_dataset
+    real_publish = cli.publish_dataset
+
+    def counting_generate(**kwargs):
+        nonlocal generated_calls
+        generated_calls += 1
+        return real_generate(**kwargs)
+
+    def counting_publish(root, generated):
+        nonlocal publish_calls
+        publish_calls += 1
+        return real_publish(root, generated)
+
+    monkeypatch.setattr(cli, "_environment", lambda: CONTROLLED_RUNTIME)
+    monkeypatch.setattr(
+        cli, "_git_state", lambda: _controlled_git_state()
+    )
+    monkeypatch.setattr(
+        cli, "generate_corrected_dataset", counting_generate
+    )
+    monkeypatch.setattr(cli, "publish_dataset", counting_publish)
+
+    return_code = cli.main(
+        [
+            "--protocol",
+            str(REPO_ROOT / "configs" / "protocols" / "pilot-v1.yaml"),
+            "--artifact-root",
+            str(artifact_root),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert return_code == 1
+    assert json.loads(captured.out)["errors"] == [
+        {"code": "artifact-validation-error"}
+    ]
+    assert generated_calls == publish_calls == 1
+    assert _artifact_inventory(artifact_root) == before
+
+
+def test_task3_round1_build_handles_winner_after_initial_scan_in_publisher(
+    tmp_path, capsys, monkeypatch
+):
+    from gsdiff.data.artifacts import publish_dataset as real_publish
+
+    cli = _load_build_datasets_cli()
+    artifact_root = tmp_path / "artifacts"
+    initial_scan_seen = False
+    publisher_calls = 0
+    real_discover = cli.discover_dataset_directories
+    real_generate = cli.generate_corrected_dataset
+
+    def observing_discover(path):
+        nonlocal initial_scan_seen
+        discovery = real_discover(path)
+        if not initial_scan_seen:
+            assert discovery.canonical_directories == ()
+            initial_scan_seen = True
+        return discovery
+
+    def generate_after_winner(**kwargs):
+        assert initial_scan_seen is True
+        generated = real_generate(**kwargs)
+        real_publish(artifact_root, generated)
+        return generated
+
+    def observing_publish(root, generated):
+        nonlocal publisher_calls
+        publisher_calls += 1
+        return real_publish(root, generated)
+
+    monkeypatch.setattr(cli, "_environment", lambda: CONTROLLED_RUNTIME)
+    monkeypatch.setattr(
+        cli, "_git_state", lambda: _controlled_git_state()
+    )
+    monkeypatch.setattr(
+        cli, "discover_dataset_directories", observing_discover
+    )
+    monkeypatch.setattr(
+        cli, "generate_corrected_dataset", generate_after_winner
+    )
+    monkeypatch.setattr(cli, "publish_dataset", observing_publish)
+
+    return_code = cli.main(
+        [
+            "--protocol",
+            str(REPO_ROOT / "configs" / "protocols" / "pilot-v1.yaml"),
+            "--artifact-root",
+            str(artifact_root),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert return_code == 0
+    assert captured.err == ""
+    assert initial_scan_seen is True
+    assert publisher_calls == 1
+    assert json.loads(captured.out)["datasets"][0]["status"] == "reused"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["disappear", "replace", "exact-replace"],
+)
+def test_task3_round1_build_fails_closed_when_unique_candidate_changes(
+    tmp_path, capsys, monkeypatch, mutation
+):
+    cli = _load_build_datasets_cli()
+    artifact_root = tmp_path / "artifacts"
+    _, publication = _publish_controlled_pilot_dataset(
+        cli, artifact_root
+    )
+    dataset_dir = publication.dataset_dir
+    real_verify = cli.verify_dataset_directory
+    verify_calls = 0
+
+    def verify_then_mutate(*args, **kwargs):
+        nonlocal verify_calls
+        verify_calls += 1
+        verified = real_verify(*args, **kwargs)
+        if verify_calls == 1:
+            if mutation == "disappear":
+                dataset_dir.rename(tmp_path / "removed-dataset")
+            elif mutation == "replace":
+                dataset_dir.rename(tmp_path / "replaced-dataset")
+                dataset_dir.mkdir()
+            else:
+                clone_source = tmp_path / "clone-source"
+                shutil.copytree(dataset_dir, clone_source)
+                dataset_dir.rename(tmp_path / "replaced-dataset")
+                shutil.copytree(clone_source, dataset_dir)
+        return verified
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError(
+            "changed unique candidate attempted generation or publication"
+        )
+
+    monkeypatch.setattr(cli, "_environment", lambda: CONTROLLED_RUNTIME)
+    monkeypatch.setattr(
+        cli, "_git_state", lambda: _controlled_git_state()
+    )
+    monkeypatch.setattr(
+        cli, "verify_dataset_directory", verify_then_mutate
+    )
+    monkeypatch.setattr(cli, "generate_corrected_dataset", forbidden)
+    monkeypatch.setattr(cli, "publish_dataset", forbidden)
+
+    return_code = cli.main(
+        [
+            "--protocol",
+            str(REPO_ROOT / "configs" / "protocols" / "pilot-v1.yaml"),
+            "--artifact-root",
+            str(artifact_root),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert return_code == 1
+    assert json.loads(captured.out)["errors"] == [
+        {"code": "artifact-validation-error"}
+    ]
+    assert captured.err == (
+        "dataset build failed: artifact-validation-error\n"
+    )
+    assert verify_calls == 2
+
+
+def test_task3_round1_final_catalog_rejects_twin_injected_after_publication(
+    tmp_path, capsys, monkeypatch
+):
+    from gsdiff.data.artifacts import publish_dataset as real_publish
+
+    cli = _load_build_datasets_cli()
+    artifact_root = tmp_path / "artifacts"
+    injected_identities = []
+    generated_for_twin = None
+    real_verify = cli.verify_dataset_directory
+    verify_calls = 0
+
+    def observing_publish(root, generated):
+        nonlocal generated_for_twin
+        publication = real_publish(root, generated)
+        generated_for_twin = generated
+        injected_identities.append(
+            publication.verified.dataset_identity_sha256
+        )
+        return publication
+
+    def verify_then_inject_twin(*args, **kwargs):
+        nonlocal verify_calls
+        verify_calls += 1
+        verified = real_verify(*args, **kwargs)
+        if verify_calls == 1:
+            assert generated_for_twin is not None
+            twin = _coherent_semantic_twin(generated_for_twin)
+            twin_publication = real_publish(artifact_root, twin)
+            injected_identities.append(
+                twin_publication.verified.dataset_identity_sha256
+            )
+        return verified
+
+    monkeypatch.setattr(cli, "_environment", lambda: CONTROLLED_RUNTIME)
+    monkeypatch.setattr(
+        cli, "_git_state", lambda: _controlled_git_state()
+    )
+    monkeypatch.setattr(cli, "publish_dataset", observing_publish)
+    monkeypatch.setattr(
+        cli, "verify_dataset_directory", verify_then_inject_twin
+    )
+
+    return_code = cli.main(
+        [
+            "--protocol",
+            str(REPO_ROOT / "configs" / "protocols" / "pilot-v1.yaml"),
+            "--artifact-root",
+            str(artifact_root),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert return_code == 1
+    assert json.loads(captured.out)["errors"] == [
+        {"code": "ambiguous-current-dataset"}
+    ]
+    assert len(set(injected_identities)) == 2
+    assert {
+        path.name for path in (artifact_root / "datasets").iterdir()
+    } == set(injected_identities)
+
+
+def test_task3_round1_final_catalog_rechecks_replaced_corrupt_addition(
+    tmp_path, capsys, monkeypatch
+):
+    from gsdiff.data.artifacts import (
+        ArtifactValidationError,
+        publish_dataset as real_publish,
+    )
+
+    cli = _load_build_datasets_cli()
+    artifact_root = tmp_path / "artifacts"
+    generated_for_twin = None
+    original_dir = None
+    twin = None
+    twin_dir = None
+    injected = False
+    replacement_installed = False
+    real_verify = cli.verify_dataset_directory
+
+    def observing_publish(root, generated):
+        nonlocal generated_for_twin, original_dir
+        publication = real_publish(root, generated)
+        generated_for_twin = generated
+        original_dir = publication.dataset_dir
+        return publication
+
+    def verify_with_replaced_addition(*args, **kwargs):
+        nonlocal twin, twin_dir, injected, replacement_installed
+        path = Path(args[0])
+        if path == original_dir:
+            verified = real_verify(*args, **kwargs)
+            if not injected:
+                assert generated_for_twin is not None
+                twin = _coherent_semantic_twin(generated_for_twin)
+                twin_dir = (
+                    artifact_root
+                    / "datasets"
+                    / twin.dataset_identity_sha256
+                )
+                twin_dir.mkdir()
+                injected = True
+            return verified
+        if path == twin_dir and not replacement_installed:
+            with pytest.raises(ArtifactValidationError):
+                real_verify(*args, **kwargs)
+            twin_dir.rmdir()
+            real_publish(artifact_root, twin)
+            replacement_installed = True
+            raise ArtifactValidationError(
+                "injected corrupt addition verification failure"
+            )
+        return real_verify(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "_environment", lambda: CONTROLLED_RUNTIME)
+    monkeypatch.setattr(
+        cli, "_git_state", lambda: _controlled_git_state()
+    )
+    monkeypatch.setattr(cli, "publish_dataset", observing_publish)
+    monkeypatch.setattr(
+        cli, "verify_dataset_directory", verify_with_replaced_addition
+    )
+
+    return_code = cli.main(
+        [
+            "--protocol",
+            str(REPO_ROOT / "configs" / "protocols" / "pilot-v1.yaml"),
+            "--artifact-root",
+            str(artifact_root),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert injected is replacement_installed is True
+    assert return_code == 1
+    assert json.loads(captured.out)["errors"] == [
+        {"code": "ambiguous-current-dataset"}
+    ]
+
+
+def test_task3_round1_final_catalog_rechecks_corrupt_candidate_leaf_recovery(
+    tmp_path, capsys, monkeypatch
+):
+    from gsdiff.data.artifacts import (
+        ArtifactValidationError,
+        publish_dataset,
+    )
+
+    cli = _load_build_datasets_cli()
+    artifact_root = tmp_path / "artifacts"
+    _, generated = _controlled_pilot_request_and_generated(cli)
+    first = publish_dataset(artifact_root, generated)
+    twin = _coherent_semantic_twin(generated)
+    second = publish_dataset(artifact_root, twin)
+    payload = second.dataset_dir / "measurements.npz"
+    payload.chmod(0o600)
+    original_payload = payload.read_bytes()
+    damaged = bytearray(original_payload)
+    damaged[-1] ^= 1
+    payload.write_bytes(damaged)
+    real_verify = cli.verify_dataset_directory
+    corrupt_attempts = 0
+    restored = False
+
+    def verify_then_restore(*args, **kwargs):
+        nonlocal corrupt_attempts, restored
+        if Path(args[0]) != second.dataset_dir:
+            return real_verify(*args, **kwargs)
+        corrupt_attempts += 1
+        try:
+            return real_verify(*args, **kwargs)
+        except ArtifactValidationError:
+            if corrupt_attempts == 2:
+                payload.write_bytes(original_payload)
+                restored = True
+            raise
+
+    monkeypatch.setattr(cli, "_environment", lambda: CONTROLLED_RUNTIME)
+    monkeypatch.setattr(
+        cli, "_git_state", lambda: _controlled_git_state()
+    )
+    monkeypatch.setattr(cli, "verify_dataset_directory", verify_then_restore)
+
+    return_code = cli.main(
+        [
+            "--protocol",
+            str(REPO_ROOT / "configs" / "protocols" / "pilot-v1.yaml"),
+            "--artifact-root",
+            str(artifact_root),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert restored is True
+    assert return_code == 1
+    assert json.loads(captured.out)["errors"] == [
+        {"code": "ambiguous-current-dataset"}
+    ]
+    assert cli._semantic_projection_from_manifest(
+        first.verified.manifest
+    ) == cli._semantic_projection_from_manifest(second.verified.manifest)
+
+
+def test_task3_round1_final_catalog_consumes_last_anchor_addition(
+    tmp_path, capsys, monkeypatch
+):
+    from gsdiff.data.artifacts import publish_dataset as real_publish
+
+    cli = _load_build_datasets_cli()
+    artifact_root = tmp_path / "artifacts"
+    generated_for_twin = None
+    injected = False
+    real_recheck = cli.verify_canonical_dataset_directory_discovery
+
+    def observing_publish(root, generated):
+        nonlocal generated_for_twin
+        publication = real_publish(root, generated)
+        generated_for_twin = generated
+        return publication
+
+    def recheck_then_inject(discovery):
+        nonlocal injected
+        if (
+            not injected
+            and generated_for_twin is not None
+            and discovery.datasets_dir_exists
+            and tuple(
+                path.name for path in discovery.canonical_directories
+            )
+            == (generated_for_twin.dataset_identity_sha256,)
+        ):
+            real_publish(
+                artifact_root,
+                _coherent_semantic_twin(generated_for_twin),
+            )
+            injected = True
+        return real_recheck(discovery)
+
+    monkeypatch.setattr(cli, "_environment", lambda: CONTROLLED_RUNTIME)
+    monkeypatch.setattr(
+        cli, "_git_state", lambda: _controlled_git_state()
+    )
+    monkeypatch.setattr(cli, "publish_dataset", observing_publish)
+    monkeypatch.setattr(
+        cli,
+        "verify_canonical_dataset_directory_discovery",
+        recheck_then_inject,
+    )
+
+    return_code = cli.main(
+        [
+            "--protocol",
+            str(REPO_ROOT / "configs" / "protocols" / "pilot-v1.yaml"),
+            "--artifact-root",
+            str(artifact_root),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert injected is True
+    assert return_code == 1
+    assert json.loads(captured.out)["errors"] == [
+        {"code": "ambiguous-current-dataset"}
+    ]
+
+
+def test_task3_round1_initial_stabilization_absorbs_missing_root_winner(
+    tmp_path, capsys, monkeypatch
+):
+    from gsdiff.data.artifacts import publish_dataset as real_publish
+
+    cli = _load_build_datasets_cli()
+    artifact_root = tmp_path / "artifacts"
+    request, generated = _controlled_pilot_request_and_generated(cli)
+    injected = False
+    real_recheck = cli.verify_canonical_dataset_directory_discovery
+
+    def inject_winner_before_missing_recheck(discovery):
+        nonlocal injected
+        if not discovery.datasets_dir_exists and not injected:
+            real_publish(artifact_root, generated)
+            injected = True
+        return real_recheck(discovery)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError(
+            "missing-root winner absorption attempted generation/publication"
+        )
+
+    monkeypatch.setattr(cli, "_environment", lambda: CONTROLLED_RUNTIME)
+    monkeypatch.setattr(
+        cli, "_git_state", lambda: _controlled_git_state()
+    )
+    monkeypatch.setattr(
+        cli,
+        "verify_canonical_dataset_directory_discovery",
+        inject_winner_before_missing_recheck,
+    )
+    monkeypatch.setattr(cli, "generate_corrected_dataset", forbidden)
+    monkeypatch.setattr(cli, "publish_dataset", forbidden)
+
+    return_code = cli.main(
+        [
+            "--protocol",
+            str(REPO_ROOT / "configs" / "protocols" / "pilot-v1.yaml"),
+            "--artifact-root",
+            str(artifact_root),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    report = json.loads(captured.out)
+    assert injected is True
+    assert return_code == 0
+    assert captured.err == ""
+    assert report["datasets"] == [
+        {
+            "dataset_identity_sha256": (
+                generated.dataset_identity_sha256
+            ),
+            "request_sha256": request.request_sha256,
+            "status": "reused",
+        }
+    ]
+
+
+@pytest.mark.parametrize("mutation", ["add", "remove"])
+def test_task3_round1_unique_reuse_ignores_unrelated_staging_churn(
+    tmp_path, capsys, monkeypatch, mutation
+):
+    cli = _load_build_datasets_cli()
+    artifact_root = tmp_path / "artifacts"
+    _, publication = _publish_controlled_pilot_dataset(
+        cli, artifact_root
+    )
+    staging = (
+        artifact_root
+        / "datasets"
+        / f".{'f' * 64}.staging-round1"
+    )
+    if mutation == "remove":
+        staging.mkdir()
+    real_verify = cli.verify_dataset_directory
+    verify_calls = 0
+
+    def verify_then_churn(*args, **kwargs):
+        nonlocal verify_calls
+        verify_calls += 1
+        verified = real_verify(*args, **kwargs)
+        if verify_calls == 1:
+            if mutation == "add":
+                staging.mkdir()
+            else:
+                staging.rmdir()
+        return verified
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError(
+            "staging churn blocked no-generation unique reuse"
+        )
+
+    monkeypatch.setattr(cli, "_environment", lambda: CONTROLLED_RUNTIME)
+    monkeypatch.setattr(
+        cli, "_git_state", lambda: _controlled_git_state()
+    )
+    monkeypatch.setattr(
+        cli, "verify_dataset_directory", verify_then_churn
+    )
+    monkeypatch.setattr(cli, "generate_corrected_dataset", forbidden)
+    monkeypatch.setattr(cli, "publish_dataset", forbidden)
+
+    return_code = cli.main(
+        [
+            "--protocol",
+            str(REPO_ROOT / "configs" / "protocols" / "pilot-v1.yaml"),
+            "--artifact-root",
+            str(artifact_root),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    report = json.loads(captured.out)
+    assert return_code == 0
+    assert captured.err == ""
+    assert report["datasets"][0]["status"] == "reused"
+    assert report["datasets"][0]["dataset_identity_sha256"] == (
+        publication.verified.dataset_identity_sha256
+    )
+    assert report["stale_staging_count"] == (
+        1 if mutation == "add" else 0
+    )
+    assert verify_calls >= 3

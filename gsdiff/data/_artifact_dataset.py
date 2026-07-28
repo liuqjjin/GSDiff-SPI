@@ -17,6 +17,7 @@ from ._artifact_identity import (
     sha256_bytes,
     validate_acquisition_identity_spec,
     validate_array_descriptor,
+    validate_exact_json_native,
     validate_exact_keys,
     validate_exact_int,
     validate_generation_config,
@@ -237,6 +238,53 @@ def _validate_blind_acquisition(value: object) -> Mapping[str, object]:
             "acquisition.noise_sigma_absolute must be a finite nonnegative number"
         )
     canonical_json_bytes(value)
+    return value
+
+
+def _validate_blind_acquisition_spec(
+    value: object,
+) -> Mapping[str, object]:
+    if type(value) not in (dict, MappingProxyType):
+        raise ArtifactValidationError(
+            "expected acquisition spec must be an exact object"
+        )
+    validate_exact_json_native(value, "expected acquisition spec")
+    validate_exact_keys(
+        value,
+        {"schema_version", "dimensions", "acquisition"},
+        "expected acquisition spec",
+    )
+    if value["schema_version"] != BLIND_ACQUISITION_SPEC_SCHEMA:
+        raise ArtifactValidationError(
+            "expected acquisition spec schema mismatch"
+        )
+    dimensions = value["dimensions"]
+    if type(dimensions) not in (dict, MappingProxyType):
+        raise ArtifactValidationError(
+            "expected acquisition dimensions must be an exact object"
+        )
+    validate_exact_keys(
+        dimensions,
+        {"H", "W", "T", "K", "holdout_K"},
+        "expected acquisition dimensions",
+    )
+    for name in ("H", "W", "T", "K"):
+        validate_exact_int(
+            dimensions[name],
+            f"expected acquisition dimensions.{name}",
+            minimum=1,
+        )
+    validate_exact_int(
+        dimensions["holdout_K"],
+        "expected acquisition dimensions.holdout_K",
+        minimum=0,
+    )
+    try:
+        _validate_blind_acquisition(value["acquisition"])
+    except (ArtifactValidationError, TypeError) as error:
+        raise ArtifactValidationError(
+            "expected acquisition spec is invalid"
+        ) from error
     return value
 
 
@@ -565,6 +613,10 @@ def _load_acquisition_members(
     expected_dataset_identity_sha256: str,
     expected_acquisition_spec: Mapping[str, object] | None,
 ) -> SPIAcquisitionData:
+    if type(expected_dataset_identity_sha256) is not str:
+        raise ArtifactValidationError(
+            "expected dataset identity must be an exact string"
+        )
     validate_sha256(
         expected_dataset_identity_sha256, "expected dataset identity"
     )
@@ -630,22 +682,9 @@ def _load_acquisition_members(
     )
     acquisition = _validate_blind_acquisition(metadata["acquisition"])
     if expected_acquisition_spec is not None:
-        if not isinstance(expected_acquisition_spec, Mapping):
-            raise ArtifactValidationError(
-                "expected acquisition spec must be an object"
-            )
-        validate_exact_keys(
-            expected_acquisition_spec,
-            {"schema_version", "dimensions", "acquisition"},
-            "expected acquisition spec",
+        expected_acquisition_spec = _validate_blind_acquisition_spec(
+            expected_acquisition_spec
         )
-        if (
-            expected_acquisition_spec["schema_version"]
-            != BLIND_ACQUISITION_SPEC_SCHEMA
-        ):
-            raise ArtifactValidationError(
-                "expected acquisition spec schema mismatch"
-            )
         stored_spec = {
             "schema_version": BLIND_ACQUISITION_SPEC_SCHEMA,
             "dimensions": dimensions,
