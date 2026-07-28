@@ -411,6 +411,92 @@ class TargetSnapshot:
         )
 
 
+@dataclass(frozen=True)
+class _OwnedTargetSnapshot:
+    target_id: str
+    descriptor: str
+    assets_sha256: Mapping[str, object]
+    canonical_image: np.ndarray
+    renderer: Mapping[str, object]
+
+
+def _owned_exact_json_snapshot(value: object, field: str) -> object:
+    """Copy exact JSON containers before validating the private copy."""
+
+    def capture(item: object) -> object:
+        if type(item) in (dict, MappingProxyType):
+            try:
+                items = tuple(item.items())  # type: ignore[union-attr]
+            except RuntimeError as error:
+                raise ArtifactValidationError(
+                    f"{field} changed during snapshot capture"
+                ) from error
+            return {key: capture(child) for key, child in items}
+        if type(item) in (list, tuple):
+            return [capture(child) for child in tuple(item)]  # type: ignore[arg-type]
+        return item
+
+    owned = capture(value)
+    validate_exact_json_native(owned, field)
+    return owned
+
+
+def _capture_owned_target_snapshot(
+    target_snapshot: TargetSnapshot,
+) -> _OwnedTargetSnapshot:
+    (
+        target_id,
+        descriptor,
+        assets_source,
+        canonical_source,
+        renderer_source,
+    ) = (
+        target_snapshot.target_id,
+        target_snapshot.descriptor,
+        target_snapshot.assets_sha256,
+        target_snapshot.canonical_image,
+        target_snapshot.renderer,
+    )
+    assets_native = _owned_exact_json_snapshot(
+        assets_source, "assets_sha256"
+    )
+    renderer_native = _owned_exact_json_snapshot(
+        renderer_source, "renderer"
+    )
+    image_copy = np.array(
+        canonical_source,
+        copy=True,
+        order="C",
+        subok=False,
+    )
+    validated_renderer, validated_image = _validate_target_snapshot_fields(
+        target_id=target_id,
+        descriptor=descriptor,
+        assets_sha256=assets_native,
+        canonical_image=image_copy,
+        renderer=renderer_native,
+    )
+    assert isinstance(assets_native, dict)
+    frozen_assets = deep_freeze_json(
+        {
+            name: assets_native[name]
+            for name in sorted(assets_native)
+        }
+    )
+    frozen_renderer = deep_freeze_json(validated_renderer)
+    assert isinstance(frozen_assets, Mapping)
+    assert isinstance(frozen_renderer, Mapping)
+    return _OwnedTargetSnapshot(
+        target_id=target_id,
+        descriptor=descriptor,
+        assets_sha256=frozen_assets,
+        canonical_image=readonly_array(
+            validated_image, "canonical_image"
+        ),
+        renderer=frozen_renderer,
+    )
+
+
 @dataclass(frozen=True, kw_only=True)
 class CorrectedDataset:
     dataset_identity_sha256: str
@@ -691,6 +777,7 @@ def _validate_generation_inputs(
     runtime: Mapping[str, object],
 ) -> tuple[
     dict[str, object],
+    _OwnedTargetSnapshot,
     dict[str, object],
     dict[str, object],
     dict[str, object],
@@ -712,13 +799,7 @@ def _validate_generation_inputs(
     }
     if type(target_snapshot) is not TargetSnapshot:
         raise TypeError("target_snapshot must be an exact TargetSnapshot")
-    _, target_image = _validate_target_snapshot_fields(
-        target_id=target_snapshot.target_id,
-        descriptor=target_snapshot.descriptor,
-        assets_sha256=target_snapshot.assets_sha256,
-        canonical_image=target_snapshot.canonical_image,
-        renderer=target_snapshot.renderer,
-    )
+    owned_target = _capture_owned_target_snapshot(target_snapshot)
     motion_map = _require_mapping(motion, "motion", _MOTION_KEYS)
     velocity = [
         _require_number(item, f"motion.velocity[{index}]")
@@ -758,7 +839,7 @@ def _validate_generation_inputs(
         )
     ]
     H, W = image_size
-    if target_image.shape != (H, W):
+    if owned_target.canonical_image.shape != (H, W):
         raise ArtifactValidationError(
             "target snapshot dimensions disagree with acquisition config"
         )
@@ -880,6 +961,7 @@ def _validate_generation_inputs(
     }
     return (
         contract_native,
+        owned_target,
         motion_native,
         acquisition_native,
         calibration_native,
@@ -889,7 +971,7 @@ def _validate_generation_inputs(
 
 
 def _resolved_generator_config(
-    target: TargetSnapshot,
+    target: _OwnedTargetSnapshot,
     motion: Mapping[str, object],
     acquisition: Mapping[str, object],
 ) -> dict[str, object]:
@@ -948,7 +1030,7 @@ def _resolved_generator_config(
     }
 
 
-def resolve_corrected_dataset_request(
+def _resolve_corrected_dataset_request_owned(
     *,
     scientific_contract: Mapping[str, object],
     target_snapshot: TargetSnapshot,
@@ -958,11 +1040,11 @@ def resolve_corrected_dataset_request(
     noise_calibration_entry: Mapping[str, object],
     generator: Mapping[str, object],
     runtime: Mapping[str, object],
-) -> dict[str, object]:
-    """Resolve immutable scientific content without generating measurements."""
+) -> tuple[dict[str, object], _OwnedTargetSnapshot]:
 
     (
         contract,
+        owned_target,
         motion_native,
         acquisition_native,
         calibration,
@@ -979,7 +1061,7 @@ def resolve_corrected_dataset_request(
         runtime=runtime,
     )
     config = _resolved_generator_config(
-        target_snapshot,
+        owned_target,
         motion_native,
         acquisition_native,
     )
@@ -987,10 +1069,10 @@ def resolve_corrected_dataset_request(
         "schema_version": "corrected-dataset-request-v1",
         "scientific_contract": contract,
         "target": {
-            "id": target_snapshot.target_id,
-            "descriptor": target_snapshot.descriptor,
-            "assets_sha256": target_snapshot.assets_sha256,
-            "renderer": target_snapshot.renderer,
+            "id": owned_target.target_id,
+            "descriptor": owned_target.descriptor,
+            "assets_sha256": owned_target.assets_sha256,
+            "renderer": owned_target.renderer,
         },
         "motion": motion_native,
         "seed": seed,
@@ -1007,7 +1089,33 @@ def resolve_corrected_dataset_request(
     native = _strict_native(request)
     if type(native) is not dict:
         raise RuntimeError("resolved corrected request is not an object")
-    return native
+    return native, owned_target
+
+
+def resolve_corrected_dataset_request(
+    *,
+    scientific_contract: Mapping[str, object],
+    target_snapshot: TargetSnapshot,
+    motion: Mapping[str, object],
+    seed: int,
+    acquisition_config: Mapping[str, object],
+    noise_calibration_entry: Mapping[str, object],
+    generator: Mapping[str, object],
+    runtime: Mapping[str, object],
+) -> dict[str, object]:
+    """Resolve immutable scientific content without generating measurements."""
+
+    request, _ = _resolve_corrected_dataset_request_owned(
+        scientific_contract=scientific_contract,
+        target_snapshot=target_snapshot,
+        motion=motion,
+        seed=seed,
+        acquisition_config=acquisition_config,
+        noise_calibration_entry=noise_calibration_entry,
+        generator=generator,
+        runtime=runtime,
+    )
+    return request
 
 
 def _ranked_patterns(
@@ -1143,7 +1251,7 @@ def _realized_snr(
 def _build_dataset_identity_spec(
     *,
     scientific_contract: Mapping[str, object],
-    target: TargetSnapshot,
+    target: _OwnedTargetSnapshot,
     motion_id: str,
     seed: int,
     generator_config_sha256: str,
@@ -1667,7 +1775,7 @@ def generate_corrected_dataset(
     generator: Mapping[str, object],
     runtime: Mapping[str, object],
 ) -> CorrectedDataset:
-    request = resolve_corrected_dataset_request(
+    request, owned_target = _resolve_corrected_dataset_request_owned(
         scientific_contract=scientific_contract,
         target_snapshot=target_snapshot,
         motion=motion,
@@ -1702,7 +1810,7 @@ def generate_corrected_dataset(
     K = int(dimensions["K"])
     holdout_K = int(dimensions["holdout_K"])
     frames, translation, rotation = _generate_frames(
-        target_snapshot.canonical_image, T, motion_native
+        owned_target.canonical_image, T, motion_native
     )
     time_grid = np.linspace(0.0, 1.0, T).astype(np.float32)
     train_pattern_rng = acquisition_rng(seed, 0)
@@ -1776,8 +1884,8 @@ def generate_corrected_dataset(
         "schema_version": "noise-reference-cell-v1",
         "scientific_contract": contract,
         "target": {
-            "id": target_snapshot.target_id,
-            "assets_sha256": target_snapshot.assets_sha256,
+            "id": owned_target.target_id,
+            "assets_sha256": owned_target.assets_sha256,
         },
         "motion": {"id": motion_native["id"]},
         "seed": seed,
@@ -1796,7 +1904,7 @@ def generate_corrected_dataset(
             "registry_entry_sha256": _sha256_json(calibration),
         },
         "scientific_contract": contract,
-        "target_id": target_snapshot.target_id,
+        "target_id": owned_target.target_id,
         "motion_id": motion_native["id"],
         "seed": seed,
         "reference_cell_sha256": _sha256_json(reference_cell),
@@ -1822,7 +1930,7 @@ def generate_corrected_dataset(
     calibration_sha256 = _sha256_json(calibration_record)
     identity_spec = _build_dataset_identity_spec(
         scientific_contract=contract,
-        target=target_snapshot,
+        target=owned_target,
         motion_id=str(motion_native["id"]),
         seed=seed,
         generator_config_sha256=config_sha256,
@@ -1877,7 +1985,7 @@ def generate_corrected_dataset(
     truth = EvaluationTruth(
         dataset_identity_sha256=dataset_identity_sha256,
         dataset_identity_spec=identity_spec,
-        canonical_image=target_snapshot.canonical_image,
+        canonical_image=owned_target.canonical_image,
         gt_frames=frames,
         translation_trajectory=translation,
         rotation_trajectory=rotation,

@@ -6488,6 +6488,118 @@ def test_task3_round1_request_revalidates_all_tampered_target_fields(
         resolve_corrected_dataset_request(**inputs)
 
 
+def test_task3_round2_resolver_owns_target_after_validation(monkeypatch):
+    import gsdiff.data._corrected_generation as corrected
+
+    inputs = _phase3b_generation_inputs()
+    target = inputs["target_snapshot"]
+    caller_assets = _mutable_json(target.assets_sha256)
+    caller_renderer = _mutable_json(target.renderer)
+    object.__setattr__(target, "assets_sha256", caller_assets)
+    object.__setattr__(target, "renderer", caller_renderer)
+    expected_target = {
+        "id": target.target_id,
+        "descriptor": target.descriptor,
+        "assets_sha256": _mutable_json(target.assets_sha256),
+        "renderer": _mutable_json(target.renderer),
+    }
+    real_validator = corrected._validate_generation_inputs
+    validation_calls = 0
+
+    def validate_then_mutate(**kwargs):
+        nonlocal validation_calls
+        validated = real_validator(**kwargs)
+        validation_calls += 1
+        object.__setattr__(target, "target_id", "mutated-target")
+        object.__setattr__(target, "descriptor", "mutated.png")
+        caller_assets.clear()
+        caller_assets["in-place.png"] = "e" * 64
+        caller_renderer.clear()
+        caller_renderer.update(
+            {"color_mode": "grayscale", "resample": "lanczos"}
+        )
+        object.__setattr__(
+            target, "assets_sha256", {"mutated.png": "f" * 64}
+        )
+        object.__setattr__(
+            target,
+            "renderer",
+            {"color_mode": "grayscale", "resample": "lanczos"},
+        )
+        return validated
+
+    monkeypatch.setattr(
+        corrected, "_validate_generation_inputs", validate_then_mutate
+    )
+    request = corrected.resolve_corrected_dataset_request(**inputs)
+
+    assert validation_calls == 1
+    assert request["target"] == expected_target
+    assert request["resolved_generator_config"]["target"] == expected_target
+
+
+def test_task3_round2_generator_owns_target_after_validation(monkeypatch):
+    import gsdiff.data._corrected_generation as corrected
+
+    baseline = corrected.generate_corrected_dataset(
+        **_phase3b_generation_inputs()
+    )
+    inputs = _phase3b_generation_inputs()
+    target = inputs["target_snapshot"]
+    caller_image = np.array(target.canonical_image, copy=True)
+    object.__setattr__(target, "canonical_image", caller_image)
+    real_validator = corrected._validate_generation_inputs
+    validation_calls = 0
+
+    def validate_then_mutate(**kwargs):
+        nonlocal validation_calls
+        validated = real_validator(**kwargs)
+        validation_calls += 1
+        object.__setattr__(target, "target_id", "mutated-target")
+        object.__setattr__(target, "descriptor", "mutated.png")
+        object.__setattr__(
+            target, "assets_sha256", {"mutated.png": "f" * 64}
+        )
+        object.__setattr__(
+            target,
+            "renderer",
+            {"color_mode": "grayscale", "resample": "lanczos"},
+        )
+        caller_image[...] = 1.0
+        object.__setattr__(
+            target,
+            "canonical_image",
+            np.ones((8, 8), dtype=np.float32),
+        )
+        return validated
+
+    monkeypatch.setattr(
+        corrected, "_validate_generation_inputs", validate_then_mutate
+    )
+    generated = corrected.generate_corrected_dataset(**inputs)
+
+    assert validation_calls == 1
+    assert (
+        generated.dataset_identity_sha256
+        == baseline.dataset_identity_sha256
+    )
+    assert (
+        generated.noise_calibration_sha256
+        == baseline.noise_calibration_sha256
+    )
+    assert generated.dataset_identity_spec == baseline.dataset_identity_spec
+    assert (
+        generated.resolved_generator_config
+        == baseline.resolved_generator_config
+    )
+    assert (
+        generated.noise_calibration_record
+        == baseline.noise_calibration_record
+    )
+    _assert_dataclass_equal(baseline.acquisition, generated.acquisition)
+    _assert_dataclass_equal(baseline.truth, generated.truth)
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
