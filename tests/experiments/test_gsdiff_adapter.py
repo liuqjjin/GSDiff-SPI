@@ -28,6 +28,20 @@ CHECKPOINT_SHA256 = (
     "667948800911acb9f9a7271e20af5692b0f007007d0fc32a15ac169eba32c5dd"
 )
 GSDIFF_IDS = ("siren", "recinr_se2", "gsdiff_tv", "gsdiff_diffusion")
+EXPECTED_DIFFUSION_CONFIG = {
+    "denoise_steps": 1,
+    "clamp_range": (0.0, 1.0),
+    "in_channels": 1,
+    "base_channels": 32,
+    "channel_mults": (1, 2, 4),
+    "emb_dim": 128,
+    "sigma_min": 0.002,
+    "sigma_max": 0.5,
+    "sigma_start": 0.3,
+    "sigma_end": 0.05,
+    "renoise": False,
+    "ddim_spacing": "linear",
+}
 EXPECTED_PARAMETER_COUNTS = {
     "siren": 33_540,
     "recinr_se2": 16_004,
@@ -35,10 +49,11 @@ EXPECTED_PARAMETER_COUNTS = {
 }
 
 
-@pytest.fixture
-def blind_acquisition() -> SPIAcquisitionData:
+def _make_blind_acquisition(
+    *, T: int = 4, H: int = 8, W: int = 8
+) -> SPIAcquisitionData:
     rng = np.random.default_rng(19)
-    T, H, W, rows = 3, 8, 8, 3
+    rows = 3
     patterns = rng.random((T * rows, H, W), dtype=np.float32)
     frame_indices = np.repeat(np.arange(T, dtype=np.int64), rows)
     source = rng.random((T, H, W), dtype=np.float32)
@@ -83,6 +98,11 @@ def blind_acquisition() -> SPIAcquisitionData:
             for name, array in arrays.items()
         },
     )
+
+
+@pytest.fixture
+def blind_acquisition() -> SPIAcquisitionData:
+    return _make_blind_acquisition()
 
 
 def _resolve(
@@ -357,6 +377,155 @@ def test_diffusion_construction_loads_exact_checkpoint_and_schedule(
     assert len(runtime.checkpoint_snapshots) == 1
     assert runtime.checkpoint_snapshots[0].sha256 == CHECKPOINT_SHA256
     assert unique_optimizer_parameter_count(runtime.solver.optimizer) == 6_003
+
+
+def test_diffusion_constructor_receives_all_declared_scientific_values(
+    blind_acquisition: SPIAcquisitionData,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from gsdiff.experiments.gsdiff_adapter import _construct_gsdiff_runtime
+    from gsdiff.prior import diffusion as diffusion_module
+
+    captured: dict[str, object] = {}
+
+    class CapturingPrior:
+        def __init__(
+            self,
+            checkpoint_path,
+            device,
+            denoise_steps,
+            clamp_range,
+            in_channels,
+            base_channels,
+            channel_mults,
+            emb_dim,
+            sigma_min,
+            sigma_max,
+            sigma_start,
+            sigma_end,
+            renoise,
+            ddim_spacing,
+        ):
+            del checkpoint_path, device
+            captured.update(
+                {
+                    "denoise_steps": denoise_steps,
+                    "clamp_range": tuple(clamp_range),
+                    "in_channels": in_channels,
+                    "base_channels": base_channels,
+                    "channel_mults": tuple(channel_mults),
+                    "emb_dim": emb_dim,
+                    "sigma_min": sigma_min,
+                    "sigma_max": sigma_max,
+                    "sigma_start": sigma_start,
+                    "sigma_end": sigma_end,
+                    "renoise": renoise,
+                    "ddim_spacing": ddim_spacing,
+                }
+            )
+
+        def set_n_steps(self, count):
+            self._n_steps = count
+
+    monkeypatch.setattr(diffusion_module, "DiffusionPrior", CapturingPrior)
+    method = _resolve("gsdiff_diffusion", blind_acquisition)
+
+    runtime = _construct_gsdiff_runtime(
+        method,
+        blind_acquisition,
+        checkpoint_paths=_checkpoint_paths(method.method_id),
+        device="cpu",
+    )
+
+    assert runtime.prior._n_steps == 1
+    assert captured == EXPECTED_DIFFUSION_CONFIG
+
+
+@pytest.mark.parametrize(
+    ("dimension", "shape"),
+    [
+        ("T", {"T": 3, "H": 8, "W": 8}),
+        ("H", {"T": 4, "H": 3, "W": 8}),
+        ("W", {"T": 4, "H": 8, "W": 3}),
+    ],
+)
+def test_diffusion_rejects_small_geometry_before_checkpoint_validation(
+    dimension: str,
+    shape: dict[str, int],
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from gsdiff.experiments import gsdiff_adapter
+
+    acquisition = _make_blind_acquisition(**shape)
+    method = _resolve("gsdiff_diffusion", acquisition)
+
+    def forbidden_checkpoint_validation(*args, **kwargs):
+        raise AssertionError("checkpoint validation preceded geometry rejection")
+
+    monkeypatch.setattr(
+        gsdiff_adapter,
+        "_validate_checkpoint_contract",
+        forbidden_checkpoint_validation,
+    )
+    with pytest.raises(
+        ValueError,
+        match=rf"{dimension}.*at least 4",
+    ):
+        gsdiff_adapter._construct_gsdiff_runtime(
+            method,
+            acquisition,
+            checkpoint_paths=_checkpoint_paths(method.method_id),
+            device="cpu",
+        )
+
+
+def test_diffusion_real_one_step_t4_writes_valid_child_outputs(
+    blind_acquisition: SPIAcquisitionData,
+    tmp_path: Path,
+):
+    from gsdiff.experiments.gsdiff_adapter import run_gsdiff_method
+
+    assert blind_acquisition.T == 4
+    method = _resolve("gsdiff_diffusion", blind_acquisition)
+    assert dict(method.semantic_config["diffusion"]) == (
+        EXPECTED_DIFFUSION_CONFIG
+    )
+    seed = _seed(method, blind_acquisition)
+    result = run_gsdiff_method(
+        method,
+        blind_acquisition,
+        algorithm_seed=seed,
+        checkpoint_paths=_checkpoint_paths(method.method_id),
+        device="cpu",
+    )
+
+    assert result.method_id == "gsdiff_diffusion"
+    assert result.reconstruction.shape == (4, 8, 8)
+    assert len(result.history) == 1
+    assert result.info["parameter_count"] == 6_003
+    child_outputs._validate_result(result, blind_acquisition, method)
+
+    output_dir = tmp_path / "diffusion-child"
+    child_outputs.write_method_child_outputs_v2(
+        output_dir,
+        method=method,
+        acquisition=blind_acquisition,
+        measurements_file_sha256="c" * 64,
+        algorithm_seed=seed,
+        result=result,
+        child_started_at_utc="2026-07-28T00:00:00Z",
+        child_finished_at_utc="2026-07-28T00:00:01Z",
+    )
+    child_outputs.validate_method_child_outputs_v2(
+        output_dir,
+        expected_method=method,
+        expected_acquisition=blind_acquisition,
+        expected_dataset_identity_sha256=(
+            blind_acquisition.dataset_identity_sha256
+        ),
+        expected_measurements_file_sha256="c" * 64,
+        expected_algorithm_seed=seed,
+    )
 
 
 @pytest.mark.parametrize(

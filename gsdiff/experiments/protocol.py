@@ -57,11 +57,25 @@ _METHOD_PROFILE_SEMANTIC_DIGESTS = {
     "siren": ("cc1773d78bcb005cdf6ca049a3b20d641a66dd75b2d50750b44f4963492bac39", "068ae79f110320fa209cb317a27b362392051a1792e38b708ca7463e44eff7a4", "96e8e763676f162bf902f18242f530d8e256b347ef89b8cbc016599a8332109f"),
     "recinr_se2": ("e5ed145b33a028e568f24dfbf1985ff2ff33120e730578e17b04d62a6ede8cf4", "08ecea4d8243771a0e9e077156efc010d6655e463ad4bb6fe17f32677e9e4540", "96e8e763676f162bf902f18242f530d8e256b347ef89b8cbc016599a8332109f"),
     "gsdiff_tv": ("cc7b8b968367b5671a3cb906abee7d88b975ef83b1857120b5f71883c9c0436e", "93f5876cdfe2111e62babed734ef69ac462606b1409a007dac59707ff8440246", "b35e21f70c6b3a2a32235709a2f5a9bf16cbe3fe0917ed178565c89982a8c905"),
-    "gsdiff_diffusion": ("77d71af07e653f9e7a5fe69e8fb981942959013196be3d580aa5ec52c279eeed", "5391552fc212c91c66fe11dc336fc9152b34f95f5c02d3eda5a6d27d7bcfb1fd", "fe76b8f92ba4ba6fc735648d6c528c43d1dbf2c17b91b46dd5fe8d0d1a376477"),
+    "gsdiff_diffusion": ("fcc63a0465d2988bbe13bbe98ea7dd7907d09dce8c235bbc6b102f5e88ffbc41", "e6c975275565fd7dbf0690f8408974036b8c8d8982e38518deefd82dfc6b9b52", "fe76b8f92ba4ba6fc735648d6c528c43d1dbf2c17b91b46dd5fe8d0d1a376477"),
 }
 _METHOD_PROFILE_SEMANTIC_SHA256 = {
     method_id: dict(zip(_METHOD_PROFILE_NAMES, digests, strict=True))
     for method_id, digests in _METHOD_PROFILE_SEMANTIC_DIGESTS.items()
+}
+_GSDIFF_DIFFUSION_CONFIG = {
+    "denoise_steps": 1,
+    "clamp_range": [0.0, 1.0],
+    "in_channels": 1,
+    "base_channels": 32,
+    "channel_mults": [1, 2, 4],
+    "emb_dim": 128,
+    "sigma_min": 0.002,
+    "sigma_max": 0.5,
+    "sigma_start": 0.3,
+    "sigma_end": 0.05,
+    "renoise": False,
+    "ddim_spacing": "linear",
 }
 _TARGETS = {
     "tank": "assets/tank.png",
@@ -865,6 +879,23 @@ def _validate_methods_registry(protocol: Mapping[str, object]) -> None:
             )
             if not isinstance(profile["semantic_config"], Mapping):
                 raise ValueError("method semantic config must be a mapping")
+            if (
+                method["id"] == "gsdiff_diffusion"
+                and profile_name
+                in ("publication-v1", "controller-cpu-smoke-v1")
+            ):
+                diffusion_config = _require_exact_keys(
+                    "GSDiff diffusion semantic config",
+                    profile["semantic_config"].get("diffusion"),
+                    set(_GSDIFF_DIFFUSION_CONFIG),
+                )
+                if not _canonical_equal(
+                    diffusion_config, _GSDIFF_DIFFUSION_CONFIG
+                ):
+                    raise ValueError(
+                        "GSDiff diffusion semantic config does not match "
+                        "locked constructor values"
+                    )
             for field in (
                 "publication_eligible",
                 "selection_eligible",

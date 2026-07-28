@@ -60,6 +60,39 @@ def _normalize_01(array: np.ndarray) -> np.ndarray:
     return (values - low) / (high - low)
 
 
+def _validate_diffusion_geometry(
+    method: ResolvedMethod,
+    acquisition: SPIAcquisitionData,
+) -> None:
+    if method.method_id != "gsdiff_diffusion":
+        return
+    diffusion_config = _require_mapping(
+        method.semantic_config.get("diffusion"), "diffusion"
+    )
+    channel_mults = diffusion_config.get("channel_mults")
+    if (
+        not isinstance(channel_mults, (list, tuple))
+        or not channel_mults
+        or any(type(value) is not int or value <= 0 for value in channel_mults)
+    ):
+        raise ValueError(
+            "diffusion channel_mults must be a nonempty positive-integer sequence"
+        )
+    pooling_stages = len(channel_mults) - 1
+    minimum_extent = 2**pooling_stages
+    for dimension, extent in (
+        ("T", acquisition.T),
+        ("H", acquisition.H),
+        ("W", acquisition.W),
+    ):
+        if extent < minimum_extent:
+            raise ValueError(
+                f"gsdiff_diffusion requires {dimension} to be at least "
+                f"{minimum_extent} for {pooling_stages} factor-two pooling "
+                "stages"
+            )
+
+
 def _validate_checkpoint_contract(
     method: ResolvedMethod,
     checkpoint_paths: Mapping[str, Path],
@@ -126,10 +159,11 @@ def _construct_gsdiff_runtime(
         raise TypeError("acquisition must be SPIAcquisitionData")
     if type(device) is not str or not device:
         raise ValueError("device must be a nonempty string")
+    _validate_acquisition(acquisition, require_holdout=True)
+    _validate_diffusion_geometry(method, acquisition)
     validated_paths, snapshots = _validate_checkpoint_contract(
         method, checkpoint_paths
     )
-    _validate_acquisition(acquisition, require_holdout=True)
     return _construct_validated_runtime(
         method,
         acquisition,
@@ -349,6 +383,12 @@ def _construct_validated_runtime(
                 device=str(torch_device),
                 denoise_steps=diffusion_config["denoise_steps"],
                 clamp_range=tuple(diffusion_config["clamp_range"]),
+                in_channels=diffusion_config["in_channels"],
+                base_channels=diffusion_config["base_channels"],
+                channel_mults=list(diffusion_config["channel_mults"]),
+                emb_dim=diffusion_config["emb_dim"],
+                sigma_min=diffusion_config["sigma_min"],
+                sigma_max=diffusion_config["sigma_max"],
                 sigma_start=diffusion_config["sigma_start"],
                 sigma_end=diffusion_config["sigma_end"],
                 renoise=diffusion_config["renoise"],

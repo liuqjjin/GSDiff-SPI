@@ -20,6 +20,20 @@ METHODS = (
     "dgi", "static_cs", "perframe_cs", "tv3d", "monin", "gidc3dtv",
     "recinr", "siren", "recinr_se2", "gsdiff_tv", "gsdiff_diffusion",
 )
+EXPECTED_DIFFUSION_CONFIG = {
+    "denoise_steps": 1,
+    "clamp_range": (0.0, 1.0),
+    "in_channels": 1,
+    "base_channels": 32,
+    "channel_mults": (1, 2, 4),
+    "emb_dim": 128,
+    "sigma_min": 0.002,
+    "sigma_max": 0.5,
+    "sigma_start": 0.3,
+    "sigma_end": 0.05,
+    "renoise": False,
+    "ddim_spacing": "linear",
+}
 
 
 def _measurements_metadata() -> dict[str, object]:
@@ -76,6 +90,31 @@ def test_tv_and_diffusion_resolve_to_distinct_semantics() -> None:
     assert diffusion.method_id == "gsdiff_diffusion"
     assert diffusion.semantic_config["solver"]["prior_type"] == "diffusion"
     assert tv.method_config_sha256 != diffusion.method_config_sha256
+
+
+@pytest.mark.parametrize(
+    ("profile", "config_id"),
+    [
+        ("publication-v1", "default"),
+        ("controller-cpu-smoke-v1", "smoke-default-v1"),
+    ],
+)
+def test_diffusion_profiles_declare_every_scientific_constructor_value(
+    profile: str,
+    config_id: str,
+) -> None:
+    method = resolve_method_semantics(
+        "gsdiff_diffusion",
+        method_config_id=config_id,
+        base_config={"gaussian_count": 1000},
+        measurements_metadata=_measurements_metadata(),
+        execution_profile=profile,
+        registry_path=REGISTRY,
+    )
+
+    assert dict(method.semantic_config["diffusion"]) == (
+        EXPECTED_DIFFUSION_CONFIG
+    )
 
 
 def test_absolute_path_cannot_enter_semantic_identity() -> None:

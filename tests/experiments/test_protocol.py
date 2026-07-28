@@ -38,6 +38,20 @@ METHODS = (
     "gsdiff_tv",
     "gsdiff_diffusion",
 )
+EXPECTED_DIFFUSION_CONFIG = {
+    "denoise_steps": 1,
+    "clamp_range": [0.0, 1.0],
+    "in_channels": 1,
+    "base_channels": 32,
+    "channel_mults": [1, 2, 4],
+    "emb_dim": 128,
+    "sigma_min": 0.002,
+    "sigma_max": 0.5,
+    "sigma_start": 0.3,
+    "sigma_end": 0.05,
+    "renoise": False,
+    "ddim_spacing": "linear",
+}
 
 
 def _canonical_sha(value: object) -> str:
@@ -575,6 +589,33 @@ def test_method_registry_nested_contract_mutations_fail_after_rehash(mutate, mes
     mutate(invalid)
     _refresh_hashes(invalid)
     with pytest.raises(ValueError, match=message):
+        protocol.validate_protocol(invalid)
+
+
+@pytest.mark.parametrize(
+    "profile_name",
+    ("publication-v1", "controller-cpu-smoke-v1"),
+)
+def test_diffusion_registry_requires_complete_constructor_semantics(
+    profile_name: str,
+) -> None:
+    invalid = copy.deepcopy(_load("methods-v1.yaml"))
+    entry = next(
+        item
+        for item in invalid["methods"]
+        if item["id"] == "gsdiff_diffusion"
+    )
+    diffusion = entry["profiles"][profile_name]["semantic_config"][
+        "diffusion"
+    ]
+    diffusion.update(copy.deepcopy(EXPECTED_DIFFUSION_CONFIG))
+    diffusion.pop("sigma_max")
+    _refresh_hashes(invalid)
+
+    with pytest.raises(
+        ValueError,
+        match="GSDiff diffusion semantic config keys",
+    ):
         protocol.validate_protocol(invalid)
 
 

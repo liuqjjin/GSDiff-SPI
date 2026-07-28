@@ -526,8 +526,9 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "denoise_steps", "clamp_range", "sigma_start", "sigma_end",
-        "renoise", "ddim_spacing"
+        "denoise_steps", "clamp_range", "in_channels", "base_channels",
+        "channel_mults", "emb_dim", "sigma_min", "sigma_max",
+        "sigma_start", "sigma_end", "renoise", "ddim_spacing"
       ],
       "properties": {
         "denoise_steps": {"type": "integer", "minimum": 1},
@@ -535,6 +536,12 @@
           "type": "array", "minItems": 2, "maxItems": 2,
           "items": {"type": "number"}
         },
+        "in_channels": {"const": 1},
+        "base_channels": {"const": 32},
+        "channel_mults": {"const": [1, 2, 4]},
+        "emb_dim": {"const": 128},
+        "sigma_min": {"const": 0.002},
+        "sigma_max": {"const": 0.5},
         "sigma_start": {"type": "number"},
         "sigma_end": {"type": "number"},
         "renoise": {"type": "boolean"},
