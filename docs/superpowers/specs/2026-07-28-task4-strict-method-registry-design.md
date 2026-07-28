@@ -197,6 +197,7 @@ class AlgorithmSeed:
 
 @dataclass(frozen=True)
 class MaterializedMethodExecution:
+    canonical_method: ResolvedMethod
     argv: tuple[str, ...]
     cwd: Path
     env: Mapping[str, str]
@@ -229,6 +230,9 @@ class MaterializedMethodRequest:
     checkpoint_paths: Mapping[str, Path]
     requested_runtime_device: str
     child_runtime_device: str
+    methods_registry_protocol_sha256: str = (
+        METHODS_REGISTRY_PROTOCOL_SHA256
+    )
 ```
 
 `semantic_config` contains only JSON-compatible scientific values. It cannot
@@ -453,6 +457,45 @@ any denied event even if child code caught `PermissionError`.
 `MaterializedMethodExecution` exposes the exact `audit_policy_path` and
 `audit_policy_sha256` alongside the log path, so the parent never infers the
 expected hash from an untyped record.
+
+### Formal-review boundary locks
+
+The resolved method presented by a controller is a claim, not an authority.
+Before any stage path is created, the materializer reconstructs an immutable
+`MethodResolutionRequest` from the five raw resolution inputs, independently
+calls the canonical resolver against a parent-owned registry path, and compares
+all `ResolvedMethod` fields. The registry must carry protocol SHA-256
+`ef3d613267360538f4ac0e6301f6a854b8d0487eecde5ed98cf51ee6a8a0275c`.
+The protocol digest is transported to the child request, but the registry file
+is not. A byte-identical copy is acceptable; a modified copy or forged claim
+fails before staging.
+
+On Windows, lexical parsing rejects `:` in every component after the drive or
+UNC anchor. Directory-inventory capture and verification use
+`FindFirstStreamW`/`FindNextStreamW`, close every valid enumeration handle, and
+accept only `::$DATA` case-insensitively. A named stream on the output root or
+either required child file invalidates the run.
+
+The audit hook denies the exact eleven CPython 3.12.13 `socket.*` event shapes
+and fails closed on unknown socket names. It records only event names and
+arities, never addresses or socket objects. The first socket attempt poisons
+the boundary; finalization emits one `audit-socket-poisoned` denial and an
+error terminal even when child code caught the first `PermissionError`.
+Torch's import-time `platform.machine()` path is kept socket-free by disabling
+the standard-library hostname lookup before the hook is installed. The
+sanitized Windows platform view leaves node and processor empty, derives
+machine from the interpreter build signature, and bypasses WMI and
+system-command fallbacks, including their `nul` handles. This is not a socket
+allowlist and does not cache a hostname value.
+
+Audit records use one immutable descriptor table keyed by exact
+`(operation, decision)`. The same table validates a record before it is
+written and validates canonical JSONL before header, terminal, or aggregate
+denial checks. Descriptors fix the total key set, exact Python types,
+operation-specific decisions, enums, arities, and malformed sentinels.
+Unknown OS and process prefixes are converted to fixed denial records with a
+`source_operation`; arbitrary unknown operations have no valid log schema.
+The compatibility policy field `logged_unrelated_events` must equal `[]`.
 
 This is a reproducible procedural boundary for trusted research code. The
 documentation must not call it an adversarial OS sandbox.

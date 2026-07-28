@@ -11,6 +11,7 @@ from jsonschema import Draft202012Validator
 import numpy as np
 import pytest
 
+import gsdiff.data._artifact_io as artifact_io
 from gsdiff.data._artifact_identity import array_descriptor, canonical_json_bytes
 from gsdiff.data._artifact_io import (
     METADATA_MEMBER,
@@ -1070,6 +1071,144 @@ def test_extra_inventory_and_interrupted_output_are_rejected(
     (tmp_path / "method-info.json").unlink()
     with pytest.raises(ValueError, match="exactly two"):
         validate_valid(tmp_path, method, data, seed)
+
+
+@pytest.mark.parametrize(
+    "artifact_name",
+    ["reconstruction.npz", "method-info.json"],
+)
+def test_validator_rejects_named_stream_on_required_child_output(
+    tmp_path: Path,
+    artifact_name: str,
+) -> None:
+    method, data, seed, _ = write_valid(tmp_path)
+    artifact = tmp_path / artifact_name
+    primary_bytes = artifact.read_bytes()
+    stream = Path(f"{artifact}:undeclared-child-payload")
+    stream.write_bytes(b"named-stream-payload")
+    assert stream.read_bytes() == b"named-stream-payload"
+
+    with pytest.raises(ValueError, match="stream|alternate|ADS"):
+        validate_valid(tmp_path, method, data, seed)
+    assert artifact.read_bytes() == primary_bytes
+
+
+def test_validator_rejects_named_stream_on_child_output_root(
+    tmp_path: Path,
+) -> None:
+    method, data, seed, _ = write_valid(tmp_path)
+    stream = Path(f"{tmp_path}:undeclared-root-payload")
+    stream.write_bytes(b"named-stream-payload")
+    assert stream.read_bytes() == b"named-stream-payload"
+
+    with pytest.raises(ValueError, match="stream|alternate|ADS"):
+        validate_valid(tmp_path, method, data, seed)
+
+
+def test_validator_accepts_only_primary_streams(
+    tmp_path: Path,
+) -> None:
+    method, data, seed, hashes = write_valid(tmp_path)
+
+    assert validate_valid(tmp_path, method, data, seed) == hashes
+
+
+class _FakeWin32Function:
+    def __init__(self, implementation: Callable[..., object]) -> None:
+        self._implementation = implementation
+        self.argtypes: object = None
+        self.restype: object = None
+
+    def __call__(self, *args: object) -> object:
+        return self._implementation(*args)
+
+
+class _FakeStreamKernel32:
+    def __init__(self, scenario: str, error_state: dict[str, int]) -> None:
+        self.scenario = scenario
+        self.error_state = error_state
+        self.close_calls: list[object] = []
+        self.FindFirstStreamW = _FakeWin32Function(self._find_first)
+        self.FindNextStreamW = _FakeWin32Function(self._find_next)
+        self.FindClose = _FakeWin32Function(self._find_close)
+
+    def _find_first(
+        self,
+        _path: object,
+        _level: object,
+        data: object,
+        _flags: object,
+    ) -> object:
+        if self.scenario in {"first-error", "first-eof"}:
+            self.error_state["value"] = (
+                artifact_io._ERROR_HANDLE_EOF
+                if self.scenario == "first-eof"
+                else 5
+            )
+            return artifact_io._INVALID_HANDLE_VALUE
+        data._obj.cStreamName = "::$DATA"  # type: ignore[attr-defined]
+        return 17
+
+    def _find_next(self, _handle: object, data: object) -> object:
+        if self.scenario == "named":
+            data._obj.cStreamName = ":hidden:$DATA"  # type: ignore[attr-defined]
+            return 1
+        self.error_state["value"] = (
+            5
+            if self.scenario == "next-error"
+            else artifact_io._ERROR_HANDLE_EOF
+        )
+        return 0
+
+    def _find_close(self, handle: object) -> object:
+        self.close_calls.append(handle)
+        return 0 if self.scenario == "close-error" else 1
+
+
+@pytest.mark.parametrize(
+    ("scenario", "accepted", "expected_close_calls"),
+    [
+        ("primary", True, 1),
+        ("first-eof", True, 0),
+        ("first-error", False, 0),
+        ("next-error", False, 1),
+        ("named", False, 1),
+        ("close-error", False, 1),
+    ],
+)
+def test_windows_stream_enumerator_fails_closed_and_closes_handles(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+    accepted: bool,
+    expected_close_calls: int,
+) -> None:
+    target = tmp_path / "ordinary.bin"
+    target.write_bytes(b"primary")
+    error_state = {"value": 0}
+    kernel32 = _FakeStreamKernel32(scenario, error_state)
+    monkeypatch.setattr(
+        artifact_io.ctypes,
+        "WinDLL",
+        lambda *_args, **_kwargs: kernel32,
+    )
+    monkeypatch.setattr(
+        artifact_io.ctypes,
+        "set_last_error",
+        lambda value: error_state.__setitem__("value", value),
+    )
+    monkeypatch.setattr(
+        artifact_io.ctypes,
+        "get_last_error",
+        lambda: error_state["value"],
+    )
+
+    if accepted:
+        artifact_io._reject_windows_named_streams(target)
+    else:
+        with pytest.raises(ValueError, match="stream|enumerate|close"):
+            artifact_io._reject_windows_named_streams(target)
+    assert len(kernel32.close_calls) == expected_close_calls
 
 
 def test_directory_inventory_is_reverified_before_success(

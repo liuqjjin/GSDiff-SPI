@@ -8,20 +8,28 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 from types import SimpleNamespace
 
 import pytest
 
+import gsdiff.experiments.audit as audit_module
 from gsdiff.experiments.identity import canonical_json_bytes
-from gsdiff.experiments.audit import validate_audit_log
+from gsdiff.experiments.audit import (
+    validate_audit_log,
+    validate_audit_policy,
+)
 from gsdiff.experiments.execution import (
+    MaterializedMethodRequest,
     load_materialized_method_request,
     materialize_method_execution,
 )
 from gsdiff.experiments.methods import (
     CheckpointRequirement,
+    METHODS_REGISTRY_PROTOCOL_SHA256,
+    MethodResolutionRequest,
     ResolvedMethod,
     derive_algorithm_seed,
     resolve_method_semantics,
@@ -33,6 +41,8 @@ SOURCE_ROOT = Path(__file__).resolve().parents[2]
 REGISTRY = SOURCE_ROOT / "configs" / "protocols" / "methods-v1.yaml"
 PYTHON = Path(r"D:\conda\envs\spi\python.exe")
 DATASET_IDENTITY_SHA256 = "1" * 64
+DIFFUSION_CHECKPOINT_ID = "gsdiff-diffusion-prior-v1"
+DIFFUSION_CHECKPOINT = SOURCE_ROOT / "checkpoints" / "diffusion_prior.pt"
 TRUTH_SEEKING_CHILD = (
     SOURCE_ROOT
     / "tests"
@@ -40,6 +50,19 @@ TRUTH_SEEKING_CHILD = (
     / "fixtures"
     / "truth_seeking_child.py"
 )
+SOCKET_AUDIT_EVENT_ARITIES = {
+    "socket.__new__": 4,
+    "socket.bind": 2,
+    "socket.connect": 2,
+    "socket.getaddrinfo": 5,
+    "socket.gethostbyaddr": 1,
+    "socket.gethostbyname": 1,
+    "socket.gethostname": 0,
+    "socket.getnameinfo": 1,
+    "socket.getservbyname": 2,
+    "socket.getservbyport": 2,
+    "socket.sendto": 2,
+}
 
 
 def acquisition_spec() -> dict[str, object]:
@@ -87,6 +110,53 @@ def algorithm_seed(method: ResolvedMethod | None = None):
         dataset_identity_sha256=DATASET_IDENTITY_SHA256,
         method_id=selected.method_id,
         method_config_sha256=selected.method_config_sha256,
+    )
+
+
+def resolution_request(
+    *,
+    method_id: str = "dgi",
+    method_config_id: str = "smoke-default-v1",
+    base_config: dict[str, object] | None = None,
+    execution_profile: str = "controller-cpu-smoke-v1",
+) -> MethodResolutionRequest:
+    return MethodResolutionRequest(
+        requested_method_id=method_id,
+        requested_method_config_id=method_config_id,
+        base_config={} if base_config is None else base_config,
+        measurements_metadata={
+            "H": 8,
+            "W": 8,
+            "T": 4,
+            "K": 16,
+            "holdout_K": 4,
+        },
+        requested_execution_profile=execution_profile,
+    )
+
+
+def diffusion_resolution_request() -> MethodResolutionRequest:
+    return resolution_request(
+        method_id="gsdiff_diffusion",
+        method_config_id="smoke-default-v1",
+        base_config={"gaussian_count": 1000},
+        execution_profile="controller-cpu-smoke-v1",
+    )
+
+
+def install_test_canonical_resolver(
+    monkeypatch: pytest.MonkeyPatch,
+    method: ResolvedMethod,
+) -> None:
+    from gsdiff.experiments import execution
+
+    def resolve_test_method(*_args, **_kwargs) -> ResolvedMethod:
+        return method
+
+    monkeypatch.setattr(
+        execution,
+        "resolve_method_semantics",
+        resolve_test_method,
     )
 
 
@@ -145,10 +215,18 @@ def materialize(
     requested_runtime_device: str = "cpu",
     source_root: Path = SOURCE_ROOT,
     python_executable: Path = PYTHON,
+    method_resolution_request: MethodResolutionRequest | None = None,
+    registry_path: Path = REGISTRY,
 ):
     selected = resolved_dgi() if method is None else method
     return materialize_method_execution(
         selected,
+        resolution_request=(
+            resolution_request()
+            if method_resolution_request is None
+            else method_resolution_request
+        ),
+        registry_path=registry_path,
         stage_root=stage_root,
         measurements_source=measurements_source,
         measurements_file_sha256=measurements_sha256,
@@ -182,6 +260,437 @@ def test_materializer_rejects_non_windows_before_inspecting_inputs(
             source_root=object(),
             requested_runtime_device=object(),
         )
+
+
+def test_materializer_requires_independent_resolution_request_before_staging(
+    tmp_path: Path,
+) -> None:
+    source, digest = measurement_source(tmp_path)
+    stage = tmp_path / "stage"
+
+    with pytest.raises(TypeError, match="resolution_request"):
+        materialize_method_execution(
+            resolved_dgi(),
+            stage_root=stage,
+            measurements_source=source,
+            measurements_file_sha256=digest,
+            dataset_identity_sha256=DATASET_IDENTITY_SHA256,
+            expected_acquisition_spec=acquisition_spec(),
+            algorithm_seed=algorithm_seed(),
+            checkpoint_store={},
+            python_executable=PYTHON,
+            source_root=SOURCE_ROOT,
+            requested_runtime_device="cpu",
+        )
+
+    assert not stage.exists()
+
+
+def _mutated_dgi_claim(field: str) -> ResolvedMethod:
+    method = resolved_dgi()
+    if field == "method_id":
+        changed = replace(method, method_id="static_cs")
+    elif field == "requested_method_config_id":
+        changed = replace(method, requested_method_config_id="default")
+    elif field == "method_config_id":
+        changed = replace(method, method_config_id="default")
+    elif field == "execution_family":
+        changed = replace(method, execution_family="gsdiff")
+    elif field == "command_template":
+        changed = replace(
+            method,
+            command_template=(*method.command_template, "--undeclared"),
+        )
+    elif field == "semantic_config":
+        changed = replace(
+            method,
+            semantic_config={
+                **thaw_json(method.semantic_config),
+                "native_budget": 2,
+            },
+        )
+    elif field == "method_config_sha256":
+        return replace(method, method_config_sha256="0" * 64)
+    elif field == "required_child_outputs":
+        changed = replace(
+            method,
+            required_child_outputs=("method-info.json", "reconstruction.npz"),
+        )
+    elif field == "checkpoint_requirements":
+        changed = replace(
+            method,
+            checkpoint_requirements=(
+                CheckpointRequirement(
+                    logical_id="forged-v1",
+                    sha256="3" * 64,
+                    provenance_status="verified",
+                ),
+            ),
+        )
+    elif field == "execution_profile":
+        changed = replace(method, execution_profile="publication-v1")
+    elif field == "publication_eligible":
+        changed = replace(method, publication_eligible=True)
+    elif field == "selection_eligible":
+        changed = replace(method, selection_eligible=True)
+    elif field == "promotion_eligible":
+        changed = replace(method, promotion_eligible=True)
+    elif field == "convergence_status":
+        changed = replace(method, convergence_status="not-applicable")
+    elif field == "execution_ready":
+        changed = replace(method, execution_ready=False)
+    elif field == "execution_blockers":
+        changed = replace(
+            method,
+            execution_blockers=("forged-blocker",),
+        )
+    else:  # pragma: no cover - test table controls this helper
+        raise AssertionError(field)
+    return rehash_method(changed)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "method_id",
+        "requested_method_config_id",
+        "method_config_id",
+        "execution_family",
+        "command_template",
+        "semantic_config",
+        "method_config_sha256",
+        "required_child_outputs",
+        "checkpoint_requirements",
+        "execution_profile",
+        "publication_eligible",
+        "selection_eligible",
+        "promotion_eligible",
+        "convergence_status",
+        "execution_ready",
+        "execution_blockers",
+    ],
+)
+def test_materializer_compares_every_resolved_method_field_before_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+) -> None:
+    from gsdiff.experiments import execution
+
+    source, digest = measurement_source(tmp_path)
+    stage = tmp_path / "stage"
+
+    def stage_was_reached(_stage_root: Path):
+        raise RuntimeError("stage validation was reached")
+
+    monkeypatch.setattr(
+        execution,
+        "_validate_stage_root_candidate",
+        stage_was_reached,
+    )
+    with pytest.raises(
+        ValueError,
+        match="resolved method does not match canonical registry",
+    ):
+        materialize(
+            stage,
+            source,
+            digest,
+            method=_mutated_dgi_claim(field),
+        )
+    assert not stage.exists()
+
+
+def test_materializer_accepts_exact_copied_registry_but_rejects_modified_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gsdiff.experiments import execution
+
+    source, digest = measurement_source(tmp_path)
+    copied = tmp_path / "methods-v1.yaml"
+    shutil.copyfile(REGISTRY, copied)
+
+    class ReachedStageValidation(Exception):
+        pass
+
+    def stage_was_reached(_stage_root: Path):
+        raise ReachedStageValidation
+
+    monkeypatch.setattr(
+        execution,
+        "_validate_stage_root_candidate",
+        stage_was_reached,
+    )
+    with pytest.raises(ReachedStageValidation):
+        materialize(
+            tmp_path / "accepted-stage",
+            source,
+            digest,
+            registry_path=copied,
+        )
+
+    copied.write_text(
+        copied.read_text(encoding="utf-8").replace(
+            METHODS_REGISTRY_PROTOCOL_SHA256,
+            "0" * 64,
+            1,
+        ),
+        encoding="utf-8",
+    )
+    rejected_stage = tmp_path / "rejected-stage"
+    with pytest.raises(ValueError, match="protocol|hash|registry"):
+        materialize(
+            rejected_stage,
+            source,
+            digest,
+            registry_path=copied,
+        )
+    assert not rejected_stage.exists()
+
+
+@pytest.mark.parametrize(
+    (
+        "requested_method_id",
+        "requested_method_config_id",
+        "base_config",
+        "requested_execution_profile",
+    ),
+    [
+        (
+            "gsdiff_diff",
+            "smoke-default-v1",
+            {"gaussian_count": 1000},
+            "controller-cpu-smoke-v1",
+        ),
+        ("dgi", "default", {}, "primary-full-v1"),
+        ("dgi", "default", {}, "supplement-full-v1"),
+        ("dgi", "default", {}, "ood-full-v1"),
+        ("dgi", "default", {}, "failure-budget-v1"),
+        ("dgi", "default", {}, "pilot-smoke-v1"),
+        (
+            "dgi",
+            "smoke-default-v1",
+            {},
+            "controller-cpu-smoke-v1",
+        ),
+    ],
+)
+def test_materializer_re_resolves_alias_and_profile_matrix_from_raw_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requested_method_id: str,
+    requested_method_config_id: str,
+    base_config: dict[str, object],
+    requested_execution_profile: str,
+) -> None:
+    from gsdiff.experiments import execution
+
+    raw_request = resolution_request(
+        method_id=requested_method_id,
+        method_config_id=requested_method_config_id,
+        base_config=base_config,
+        execution_profile=requested_execution_profile,
+    )
+    claim = resolve_method_semantics(
+        requested_method_id,
+        method_config_id=requested_method_config_id,
+        base_config=base_config,
+        measurements_metadata=raw_request.measurements_metadata,
+        execution_profile=requested_execution_profile,
+        registry_path=REGISTRY,
+    )
+    source, digest = measurement_source(tmp_path)
+
+    class ReachedStageValidation(Exception):
+        pass
+
+    def stage_was_reached(_stage_root: Path):
+        raise ReachedStageValidation
+
+    monkeypatch.setattr(
+        execution,
+        "_validate_stage_root_candidate",
+        stage_was_reached,
+    )
+    with pytest.raises(ReachedStageValidation):
+        materialize(
+            tmp_path / "stage",
+            source,
+            digest,
+            method=claim,
+            method_resolution_request=raw_request,
+        )
+
+
+_ABLATION_REQUESTS = (
+    (
+        "gsdiff_diffusion",
+        "ablation-j1-v1",
+        {
+            "representation": "recinr_se2",
+            "solver": "hqs",
+            "prior": "diffusion",
+            "motion_warmup_fraction": 0.2,
+            "temporal_tv_weight": 0.1,
+            "gaussian_count": None,
+        },
+    ),
+    (
+        "gsdiff_diffusion",
+        "ablation-j2-v1",
+        {
+            "representation": "grid",
+            "solver": "admm",
+            "prior": "diffusion",
+            "motion_warmup_fraction": 0.2,
+            "temporal_tv_weight": 0.1,
+            "gaussian_count": None,
+        },
+    ),
+    (
+        "gsdiff_tv",
+        "ablation-j3-v1",
+        {
+            "representation": "siren",
+            "solver": "sgd",
+            "prior": "tv3d_corrected",
+            "motion_warmup_fraction": 0.1,
+            "temporal_tv_weight": 0.05,
+            "gaussian_count": None,
+        },
+    ),
+    (
+        "gsdiff_tv",
+        "ablation-j4-v1",
+        {
+            "representation": "gaussian",
+            "solver": "hqs",
+            "prior": "tv2d",
+            "motion_warmup_fraction": 0.1,
+            "temporal_tv_weight": 0.05,
+            "gaussian_count": 1500,
+        },
+    ),
+    (
+        "gsdiff_tv",
+        "ablation-j5-v1",
+        {
+            "representation": "recinr_se2",
+            "solver": "sgd",
+            "prior": "tv2d",
+            "motion_warmup_fraction": 0.4,
+            "temporal_tv_weight": 0.3,
+            "gaussian_count": None,
+        },
+    ),
+    (
+        "gsdiff_tv",
+        "ablation-j6-v1",
+        {
+            "representation": "grid",
+            "solver": "hqs",
+            "prior": "tv3d_corrected",
+            "motion_warmup_fraction": 0.4,
+            "temporal_tv_weight": 0.05,
+            "gaussian_count": None,
+        },
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    ("method_id", "method_config_id", "base_config"),
+    _ABLATION_REQUESTS,
+)
+def test_materializer_genuine_ablation_reaches_canonical_budget_blocker(
+    tmp_path: Path,
+    method_id: str,
+    method_config_id: str,
+    base_config: dict[str, object],
+) -> None:
+    raw_request = resolution_request(
+        method_id=method_id,
+        method_config_id=method_config_id,
+        base_config=base_config,
+        execution_profile="ablation-selection-v1",
+    )
+    method = resolve_method_semantics(
+        method_id,
+        method_config_id=method_config_id,
+        base_config=base_config,
+        measurements_metadata=raw_request.measurements_metadata,
+        execution_profile="ablation-selection-v1",
+        registry_path=REGISTRY,
+    )
+    source, digest = measurement_source(tmp_path)
+    stage = tmp_path / "stage"
+
+    with pytest.raises(
+        ValueError,
+        match="missing-versioned-ablation-native-budgets",
+    ):
+        materialize(
+            stage,
+            source,
+            digest,
+            method=method,
+            method_resolution_request=raw_request,
+        )
+    assert not stage.exists()
+
+
+def test_materializer_rejects_forged_ready_ablation_before_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gsdiff.experiments import execution
+
+    method_id, method_config_id, base_config = _ABLATION_REQUESTS[0]
+    raw_request = resolution_request(
+        method_id=method_id,
+        method_config_id=method_config_id,
+        base_config=base_config,
+        execution_profile="ablation-selection-v1",
+    )
+    blocked = resolve_method_semantics(
+        method_id,
+        method_config_id=method_config_id,
+        base_config=base_config,
+        measurements_metadata=raw_request.measurements_metadata,
+        execution_profile="ablation-selection-v1",
+        registry_path=REGISTRY,
+    )
+    forged_ready = rehash_method(
+        replace(
+            blocked,
+            execution_ready=True,
+            execution_blockers=(),
+        )
+    )
+    source, digest = measurement_source(tmp_path)
+    stage = tmp_path / "stage"
+
+    def stage_was_reached(_stage_root: Path):
+        raise RuntimeError("stage validation was reached")
+
+    monkeypatch.setattr(
+        execution,
+        "_validate_stage_root_candidate",
+        stage_was_reached,
+    )
+    with pytest.raises(
+        ValueError,
+        match="resolved method does not match canonical registry",
+    ):
+        materialize(
+            stage,
+            source,
+            digest,
+            method=forged_ready,
+            method_resolution_request=raw_request,
+        )
+    assert not stage.exists()
 
 
 def test_bootstrap_rejects_non_windows_before_parsing_or_reading(
@@ -221,28 +730,10 @@ def minimal_source_root(tmp_path: Path) -> Path:
 def checkpoint_method_and_store(
     tmp_path: Path,
 ) -> tuple[ResolvedMethod, dict[str, Path]]:
-    checkpoint = tmp_path / "checkpoint.pt"
-    checkpoint.write_bytes(b"checkpoint-loader-v1")
-    digest = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
-    base = resolved_dgi()
-    method = rehash_method(
-        replace(
-            base,
-            command_template=(
-                *base.command_template,
-                "--checkpoint",
-                "${CHECKPOINT:model-v1}",
-            ),
-            checkpoint_requirements=(
-                CheckpointRequirement(
-                    logical_id="model-v1",
-                    sha256=digest,
-                    provenance_status="verified",
-                ),
-            ),
-        )
-    )
-    return method, {"model-v1": checkpoint}
+    del tmp_path
+    return resolved_diffusion(), {
+        DIFFUSION_CHECKPOINT_ID: DIFFUSION_CHECKPOINT,
+    }
 
 
 def rewrite_method_config(
@@ -461,47 +952,31 @@ def test_materialized_measurements_and_checkpoints_are_copied_and_hashed(
     tmp_path: Path,
 ) -> None:
     source, digest = measurement_source(tmp_path)
-    checkpoint = tmp_path / "checkpoint.pt"
-    checkpoint.write_bytes(b"checkpoint-v1")
-    checkpoint_digest = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
-    base = resolved_dgi()
-    method = rehash_method(
-        replace(
-            base,
-            command_template=(
-                *base.command_template,
-                "--checkpoint",
-                "${CHECKPOINT:model-v1}",
-            ),
-            checkpoint_requirements=(
-                CheckpointRequirement(
-                    logical_id="model-v1",
-                    sha256=checkpoint_digest,
-                    provenance_status="verified",
-                ),
-            ),
-        )
-    )
+    method, checkpoint_store = checkpoint_method_and_store(tmp_path)
     execution = materialize(
         tmp_path / "stage",
         source,
         digest,
         method=method,
-        checkpoint_store={"model-v1": checkpoint},
+        checkpoint_store=checkpoint_store,
+        method_resolution_request=diffusion_resolution_request(),
     )
     config = json.loads(execution.method_config_path.read_text(encoding="utf-8"))
     staged_checkpoint = (
         execution.method_config_path.parents[1]
-        / config["runtime"]["checkpoints"]["model-v1"]["path"]
+        / config["runtime"]["checkpoints"][DIFFUSION_CHECKPOINT_ID]["path"]
     )
 
     assert execution.measurements_path.read_bytes() == source.read_bytes()
     assert execution.measurements_path != source
-    assert staged_checkpoint.read_bytes() == checkpoint.read_bytes()
+    assert staged_checkpoint.read_bytes() == DIFFUSION_CHECKPOINT.read_bytes()
     execution.measurements_path.write_bytes(b"changed-copy")
     staged_checkpoint.write_bytes(b"changed-copy")
     assert source.read_bytes() == b"blind-measurements-v1\x00payload"
-    assert checkpoint.read_bytes() == b"checkpoint-v1"
+    assert (
+        hashlib.sha256(DIFFUSION_CHECKPOINT.read_bytes()).hexdigest()
+        == method.checkpoint_requirements[0].sha256
+    )
 
 
 def test_materialized_real_diffusion_checkpoint_assignment_is_exact(
@@ -515,10 +990,9 @@ def test_materialized_real_diffusion_checkpoint_assignment_is_exact(
         digest,
         method=method,
         checkpoint_store={
-            "gsdiff-diffusion-prior-v1": (
-                SOURCE_ROOT / "checkpoints" / "diffusion_prior.pt"
-            )
+            DIFFUSION_CHECKPOINT_ID: DIFFUSION_CHECKPOINT
         },
+        method_resolution_request=diffusion_resolution_request(),
     )
     checkpoint_argument = next(
         argument
@@ -544,6 +1018,7 @@ def test_materialized_real_diffusion_checkpoint_assignment_is_exact(
 )
 def test_materialized_rejects_nonexact_checkpoint_assignment(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     bad_assignment: str,
 ) -> None:
     source, digest = measurement_source(tmp_path)
@@ -557,6 +1032,7 @@ def test_materialized_rejects_nonexact_checkpoint_assignment(
             ),
         )
     )
+    install_test_canonical_resolver(monkeypatch, method)
     stage = tmp_path / "stage"
     with pytest.raises(ValueError, match="token|checkpoint"):
         materialize(
@@ -565,10 +1041,9 @@ def test_materialized_rejects_nonexact_checkpoint_assignment(
             digest,
             method=method,
             checkpoint_store={
-                "gsdiff-diffusion-prior-v1": (
-                    SOURCE_ROOT / "checkpoints" / "diffusion_prior.pt"
-                )
+                DIFFUSION_CHECKPOINT_ID: DIFFUSION_CHECKPOINT
             },
+            method_resolution_request=diffusion_resolution_request(),
         )
     assert not stage.exists()
 
@@ -598,6 +1073,7 @@ def test_materialized_rejects_measurement_source_toctou(
 
 def test_materialized_rejects_nonempty_stage_and_blocked_method(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source, digest = measurement_source(tmp_path)
     nonempty = tmp_path / "nonempty"
@@ -613,6 +1089,7 @@ def test_materialized_rejects_nonempty_stage_and_blocked_method(
         execution_ready=False,
         execution_blockers=(blocker,),
     )
+    install_test_canonical_resolver(monkeypatch, blocked)
     stage = tmp_path / "blocked"
     with pytest.raises(ValueError, match=blocker):
         materialize(stage, source, digest, method=blocked)
@@ -666,6 +1143,7 @@ def test_materialized_rejects_reparse_inside_source_closure_before_staging(
 )
 def test_materialized_replaces_only_exact_approved_tokens(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     bad_token: str,
 ) -> None:
     source, digest = measurement_source(tmp_path)
@@ -675,6 +1153,7 @@ def test_materialized_replaces_only_exact_approved_tokens(
             command_template=(*resolved_dgi().command_template, bad_token),
         )
     )
+    install_test_canonical_resolver(monkeypatch, method)
     stage = tmp_path / "stage"
     with pytest.raises(ValueError, match="token|checkpoint"):
         materialize(stage, source, digest, method=method)
@@ -1021,6 +1500,7 @@ def test_materialized_detects_existing_stage_root_replacement_before_pin(
 
 def test_materialized_checkpoint_physical_names_are_win32_collision_free(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source, digest = measurement_source(tmp_path)
     logical_ids = ("model", "MODEL", "x.", "CON")
@@ -1056,6 +1536,7 @@ def test_materialized_checkpoint_physical_names_are_win32_collision_free(
             checkpoint_requirements=tuple(requirements),
         )
     )
+    install_test_canonical_resolver(monkeypatch, method)
     execution = materialize(
         tmp_path / "stage",
         source,
@@ -1088,27 +1569,7 @@ def test_materialized_rehashes_all_staged_inputs_before_return(
     from gsdiff.experiments import execution
 
     source, digest = measurement_source(tmp_path)
-    checkpoint = tmp_path / "checkpoint.pt"
-    checkpoint.write_bytes(b"checkpoint-v1")
-    checkpoint_digest = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
-    base = resolved_dgi()
-    method = rehash_method(
-        replace(
-            base,
-            command_template=(
-                *base.command_template,
-                "--checkpoint",
-                "${CHECKPOINT:model-v1}",
-            ),
-            checkpoint_requirements=(
-                CheckpointRequirement(
-                    logical_id="model-v1",
-                    sha256=checkpoint_digest,
-                    provenance_status="verified",
-                ),
-            ),
-        )
-    )
+    method, checkpoint_store = checkpoint_method_and_store(tmp_path)
     stage = tmp_path / "stage"
     original = execution._fresh_child_environment
     tampered = False
@@ -1130,7 +1591,8 @@ def test_materialized_rehashes_all_staged_inputs_before_return(
             source,
             digest,
             method=method,
-            checkpoint_store={"model-v1": checkpoint},
+            checkpoint_store=checkpoint_store,
+            method_resolution_request=diffusion_resolution_request(),
         )
     assert tampered
 
@@ -1284,6 +1746,7 @@ def test_materialized_rejects_fake_existing_windows_system_root(
 )
 def test_materialized_method_identity_rejects_absolute_path_literals(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     field: str,
 ) -> None:
     source, digest = measurement_source(tmp_path)
@@ -1305,6 +1768,7 @@ def test_materialized_method_identity_rejects_absolute_path_literals(
     else:
         changed = replace(base, execution_profile=absolute)
     method = rehash_method(changed)
+    install_test_canonical_resolver(monkeypatch, method)
     with pytest.raises(ValueError, match="absolute|path-free|path"):
         materialize(tmp_path / "stage", source, digest, method=method)
 
@@ -1322,6 +1786,7 @@ def test_materialized_method_identity_rejects_absolute_path_literals(
 )
 def test_materialized_method_identity_rejects_embedded_absolute_paths(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     literal: str,
 ) -> None:
     source, digest = measurement_source(tmp_path)
@@ -1331,6 +1796,7 @@ def test_materialized_method_identity_rejects_embedded_absolute_paths(
             semantic_config={"description": literal},
         )
     )
+    install_test_canonical_resolver(monkeypatch, method)
     with pytest.raises(ValueError, match="absolute|path-free|path"):
         materialize(tmp_path / "stage", source, digest, method=method)
 
@@ -1353,17 +1819,17 @@ def test_materialized_snapshots_mutable_semantic_config_once(
     from gsdiff.experiments import execution
 
     source, digest = measurement_source(tmp_path)
-    mutable_config: dict[str, object] = {"iterations": 1}
-    method = rehash_method(
-        replace(resolved_dgi(), semantic_config=mutable_config)
-    )
+    base = resolved_dgi()
+    mutable_config = thaw_json(base.semantic_config)
+    assert isinstance(mutable_config, dict)
+    method = replace(base, semantic_config=mutable_config)
     original = execution._validate_stage_root_candidate
     mutated = False
 
     def mutate_after_validation(stage_root: Path) -> Path:
         nonlocal mutated
         result = original(stage_root)
-        mutable_config["iterations"] = 2
+        mutable_config["native_budget"] = 2
         mutated = True
         return result
 
@@ -1377,7 +1843,7 @@ def test_materialized_snapshots_mutable_semantic_config_once(
         execution_result.method_config_path.read_text(encoding="utf-8")
     )
     assert mutated
-    assert config["semantic"]["semantic_config"] == {"iterations": 1}
+    assert config["semantic"]["semantic_config"]["native_budget"] == 1
 
 
 @pytest.mark.parametrize("overlap", ["stage", "source"])
@@ -1418,6 +1884,7 @@ def test_materialized_request_loader_returns_frozen_bound_request(
         method=method,
         checkpoint_store=checkpoint_store,
         requested_runtime_device="cuda:1",
+        method_resolution_request=diffusion_resolution_request(),
     )
 
     request = load_materialized_method_request(
@@ -1431,10 +1898,10 @@ def test_materialized_request_loader_returns_frozen_bound_request(
     assert thaw_json(request.expected_acquisition_spec) == acquisition_spec()
     assert request.measurements_path == execution.measurements_path
     assert request.child_output_dir == execution.child_output_dir
-    assert set(request.checkpoint_paths) == {"model-v1"}
+    assert set(request.checkpoint_paths) == {DIFFUSION_CHECKPOINT_ID}
     assert (
-        request.checkpoint_paths["model-v1"].read_bytes()
-        == checkpoint_store["model-v1"].read_bytes()
+        request.checkpoint_paths[DIFFUSION_CHECKPOINT_ID].read_bytes()
+        == checkpoint_store[DIFFUSION_CHECKPOINT_ID].read_bytes()
     )
     assert request.requested_runtime_device == "cuda:1"
     assert request.child_runtime_device == "cuda:0"
@@ -1442,6 +1909,70 @@ def test_materialized_request_loader_returns_frozen_bound_request(
         request.checkpoint_paths["other"] = tmp_path  # type: ignore[index]
     with pytest.raises(TypeError):
         request.expected_acquisition_spec["other"] = 1  # type: ignore[index]
+
+
+def test_materialized_transport_retains_canonical_registry_authority(
+    tmp_path: Path,
+) -> None:
+    source, digest = measurement_source(tmp_path)
+    claim = resolved_dgi()
+    execution = materialize(
+        tmp_path / "stage",
+        source,
+        digest,
+        method=claim,
+        source_root=minimal_source_root(tmp_path),
+    )
+    document = json.loads(
+        execution.method_config_path.read_text(encoding="utf-8")
+    )
+    request = load_materialized_method_request(execution.method_config_path)
+
+    assert execution.canonical_method == claim
+    assert execution.canonical_method is not claim
+    assert document["methods_registry_protocol_sha256"] == (
+        METHODS_REGISTRY_PROTOCOL_SHA256
+    )
+    assert document["request"]["methods_registry_protocol_sha256"] == (
+        METHODS_REGISTRY_PROTOCOL_SHA256
+    )
+    assert request.methods_registry_protocol_sha256 == (
+        METHODS_REGISTRY_PROTOCOL_SHA256
+    )
+    assert request.method == execution.canonical_method
+
+
+def test_materialized_request_compatibility_default_is_locked_protocol() -> None:
+    field = MaterializedMethodRequest.__dataclass_fields__[
+        "methods_registry_protocol_sha256"
+    ]
+    assert field.default == METHODS_REGISTRY_PROTOCOL_SHA256
+
+
+@pytest.mark.parametrize("location", ["document", "request"])
+def test_materialized_loader_rejects_registry_anchor_tampering(
+    tmp_path: Path,
+    location: str,
+) -> None:
+    source, digest = measurement_source(tmp_path)
+    execution = materialize(
+        tmp_path / "stage",
+        source,
+        digest,
+        source_root=minimal_source_root(tmp_path),
+    )
+
+    def corrupt(document: dict[str, object]) -> None:
+        if location == "document":
+            document["methods_registry_protocol_sha256"] = "0" * 64
+        else:
+            document["request"][
+                "methods_registry_protocol_sha256"
+            ] = "0" * 64
+
+    rewrite_method_config(execution.method_config_path, corrupt)
+    with pytest.raises(ValueError, match="registry|protocol|crosslock|hash"):
+        load_materialized_method_request(execution.method_config_path)
 
 
 def test_method_execution_interfaces_are_public() -> None:
@@ -1638,6 +2169,7 @@ def test_materialized_request_loader_rejects_checkpoint_disagreement(
         digest,
         method=method,
         checkpoint_store=checkpoint_store,
+        method_resolution_request=diffusion_resolution_request(),
     )
     if case == "file_hash":
         staged = next((tmp_path / "stage" / "checkpoints").iterdir())
@@ -1646,13 +2178,17 @@ def test_materialized_request_loader_rejects_checkpoint_disagreement(
         def corrupt(document: dict[str, object]) -> None:
             checkpoints = document["runtime"]["checkpoints"]
             if case == "ids":
-                checkpoints["undeclared"] = checkpoints.pop("model-v1")
+                checkpoints["undeclared"] = checkpoints.pop(
+                    DIFFUSION_CHECKPOINT_ID
+                )
             elif case == "record_hash":
-                checkpoints["model-v1"]["sha256"] = "0" * 64
+                checkpoints[DIFFUSION_CHECKPOINT_ID]["sha256"] = "0" * 64
             elif case == "path_mismatch":
-                checkpoints["model-v1"]["path"] = "input/measurements.npz"
+                checkpoints[DIFFUSION_CHECKPOINT_ID][
+                    "path"
+                ] = "input/measurements.npz"
             else:
-                checkpoints["model-v1"]["unexpected"] = True
+                checkpoints[DIFFUSION_CHECKPOINT_ID]["unexpected"] = True
 
         rewrite_method_config(execution.method_config_path, corrupt)
     with pytest.raises(
@@ -1675,6 +2211,7 @@ def test_materialized_request_loader_rejects_paths_outside_stage(
         digest,
         method=method,
         checkpoint_store=checkpoint_store,
+        method_resolution_request=diffusion_resolution_request(),
     )
     (tmp_path / "outside").mkdir()
 
@@ -1685,8 +2222,8 @@ def test_materialized_request_loader_rejects_paths_outside_stage(
         elif field == "output":
             runtime["child_output_dir"] = "../outside"
         else:
-            runtime["checkpoints"]["model-v1"]["path"] = str(
-                checkpoint_store["model-v1"].resolve()
+            runtime["checkpoints"][DIFFUSION_CHECKPOINT_ID]["path"] = str(
+                checkpoint_store[DIFFUSION_CHECKPOINT_ID].resolve()
             )
 
     rewrite_method_config(execution.method_config_path, escape)
@@ -1817,6 +2354,36 @@ def test_audit_allows_write_then_read_only_in_declared_roots(
         encoding="utf-8", errors="strict"
     )
     assert target.read_text(encoding="utf-8", errors="strict") == "盲态验证"
+
+
+def test_audit_denies_named_stream_write_inside_allowed_output_root(
+    tmp_path: Path,
+) -> None:
+    source, digest = measurement_source(tmp_path)
+    execution = materialize(tmp_path / "stage", source, digest)
+    primary = execution.child_output_dir / "reconstruction.npz"
+    primary.write_bytes(b"primary-stream")
+    stream = Path(f"{primary}:undeclared-child-payload")
+
+    result = run_audited_child(
+        execution,
+        action="write-read",
+        target=stream,
+        expect_denied=True,
+    )
+
+    assert result.returncode == 0, execution.stderr_path.read_text(
+        encoding="utf-8",
+        errors="strict",
+    )
+    assert b"DENIED-CAUGHT" in execution.stdout_path.read_bytes()
+    assert primary.read_bytes() == b"primary-stream"
+    assert not stream.exists()
+    with pytest.raises(ValueError, match="denied"):
+        validate_audit_log(
+            execution.audit_log_path,
+            expected_policy_sha256=execution.audit_policy_sha256,
+        )
 
 
 @pytest.mark.parametrize(
@@ -2139,9 +2706,19 @@ def test_audit_denies_extended_and_unknown_mutation_events_outside_roots(
         encoding="utf-8", errors="strict"
     )
     assert outside.read_bytes() == b"must-remain"
+    recorded_operation = (
+        "os-unknown"
+        if operation
+        in {"os.mknod", "os.future_filesystem_mutation"}
+        else operation
+    )
     assert any(
-        event.get("operation") == operation
+        event.get("operation") == recorded_operation
         and event.get("decision") == "deny"
+        and (
+            recorded_operation != "os-unknown"
+            or event.get("source_operation") == operation
+        )
         for event in load_audit_events(execution.audit_log_path)
     )
 
@@ -2585,6 +3162,459 @@ def test_audit_hook_is_installed_before_strict_child_code(
     assert any(event.get("decision") == "deny" for event in events)
 
 
+def test_target_interpreter_socket_audit_event_arity_contract() -> None:
+    script = r"""
+import json
+import socket
+import sys
+
+class Seen(Exception):
+    pass
+
+state = {"target": None, "events": []}
+
+def hook(event, arguments):
+    if event == state["target"]:
+        state["events"].append([event, len(arguments)])
+        raise Seen(event)
+
+probe_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sys.addaudithook(hook)
+calls = {
+    "socket.__new__": lambda: socket.socket(
+        socket.AF_INET, socket.SOCK_STREAM
+    ),
+    "socket.bind": lambda: probe_socket.bind(("127.0.0.1", 0)),
+    "socket.connect": lambda: probe_socket.connect(("127.0.0.1", 9)),
+    "socket.getaddrinfo": lambda: socket.getaddrinfo("127.0.0.1", 9),
+    "socket.gethostbyaddr": lambda: socket.gethostbyaddr("127.0.0.1"),
+    "socket.gethostbyname": lambda: socket.gethostbyname("localhost"),
+    "socket.gethostname": socket.gethostname,
+    "socket.getnameinfo": lambda: socket.getnameinfo(
+        ("127.0.0.1", 9), 0
+    ),
+    "socket.getservbyname": lambda: socket.getservbyname("http", "tcp"),
+    "socket.getservbyport": lambda: socket.getservbyport(80, "tcp"),
+    "socket.sendto": lambda: probe_socket.sendto(
+        b"x", ("127.0.0.1", 9)
+    ),
+}
+for event, call in calls.items():
+    state["target"] = event
+    try:
+        call()
+    except Seen:
+        pass
+    else:
+        raise RuntimeError(f"target event not observed: {event}")
+state["target"] = None
+probe_socket.close()
+print(
+    json.dumps(
+        {
+            "version": list(sys.version_info[:3]),
+            "events": state["events"],
+        },
+        separators=(",", ":"),
+    )
+)
+"""
+    result = subprocess.run(
+        [str(PYTHON), "-I", "-c", script],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        shell=False,
+        check=False,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr.decode(
+        "utf-8", errors="strict"
+    )
+    observed = json.loads(result.stdout.decode("utf-8", errors="strict"))
+    assert observed["version"] == [3, 12, 13]
+    assert observed["events"] == [
+        [operation, arity]
+        for operation, arity in SOCKET_AUDIT_EVENT_ARITIES.items()
+    ]
+
+
+@pytest.mark.parametrize(
+    ("operation", "expected_arity"),
+    list(SOCKET_AUDIT_EVENT_ARITIES.items()),
+)
+def test_audit_denies_known_socket_events_with_exact_arity_and_poison(
+    tmp_path: Path,
+    operation: str,
+    expected_arity: int,
+) -> None:
+    source, digest = measurement_source(tmp_path)
+    execution = materialize(tmp_path / "stage", source, digest)
+
+    result = run_audited_child(
+        execution,
+        action=f"audit-socket-known-{operation}",
+        expect_denied=True,
+    )
+
+    assert result.returncode == 0, execution.stderr_path.read_text(
+        encoding="utf-8", errors="strict"
+    )
+    events = load_audit_events(execution.audit_log_path)
+    denied = [
+        event for event in events if event.get("operation") == operation
+    ]
+    assert len(denied) == 1
+    assert set(denied[0]) == {
+        "sequence",
+        "timestamp_utc",
+        "operation",
+        "decision",
+        "expected_arity",
+        "observed_arity",
+    }
+    assert denied[0]["decision"] == "deny"
+    assert denied[0]["expected_arity"] == expected_arity
+    assert denied[0]["observed_arity"] == expected_arity
+    poison = events[-2]
+    assert set(poison) == {
+        "sequence",
+        "timestamp_utc",
+        "operation",
+        "decision",
+        "denied_operation",
+    }
+    assert poison["operation"] == "audit-socket-poisoned"
+    assert poison["decision"] == "deny"
+    assert poison["denied_operation"] == operation
+    assert events[-1]["operation"] == "bootstrap-finished"
+    assert events[-1]["status"] == "error"
+
+
+@pytest.mark.parametrize(
+    ("operation", "expected_arity"),
+    list(SOCKET_AUDIT_EVENT_ARITIES.items()),
+)
+def test_audit_records_observed_socket_arities_independently(
+    tmp_path: Path,
+    operation: str,
+    expected_arity: int,
+) -> None:
+    source, digest = measurement_source(tmp_path)
+    execution = materialize(tmp_path / "stage", source, digest)
+
+    result = run_audited_child(
+        execution,
+        action=f"audit-socket-malformed-{operation}",
+        expect_denied=True,
+    )
+
+    assert result.returncode == 0, execution.stderr_path.read_text(
+        encoding="utf-8", errors="strict"
+    )
+    events = load_audit_events(execution.audit_log_path)
+    denied = [
+        event
+        for event in events
+        if event.get("operation") == operation
+    ]
+    assert len(denied) == 1
+    assert denied[0]["expected_arity"] == expected_arity
+    assert denied[0]["observed_arity"] == expected_arity + 1
+
+
+def test_audit_denies_real_socket_creation_before_native_operation(
+    tmp_path: Path,
+) -> None:
+    source, digest = measurement_source(tmp_path)
+    execution = materialize(tmp_path / "stage", source, digest)
+
+    result = run_audited_child(
+        execution,
+        action="socket-real-new",
+        expect_denied=True,
+    )
+
+    assert result.returncode == 0, execution.stderr_path.read_text(
+        encoding="utf-8", errors="strict"
+    )
+    events = load_audit_events(execution.audit_log_path)
+    denied = [
+        event
+        for event in events
+        if event.get("operation") == "socket.__new__"
+    ]
+    assert len(denied) == 1
+    assert denied[0]["expected_arity"] == 4
+    assert denied[0]["observed_arity"] == 4
+
+
+def test_audit_unknown_socket_event_fails_closed_without_argument_leak(
+    tmp_path: Path,
+) -> None:
+    source, digest = measurement_source(tmp_path)
+    execution = materialize(tmp_path / "stage", source, digest)
+
+    result = run_audited_child(
+        execution,
+        action="audit-socket-unknown",
+        expect_denied=True,
+    )
+
+    assert result.returncode == 0, execution.stderr_path.read_text(
+        encoding="utf-8", errors="strict"
+    )
+    events = load_audit_events(execution.audit_log_path)
+    denied = [
+        event
+        for event in events
+        if event.get("operation") == "socket-unknown"
+    ]
+    assert len(denied) == 1
+    assert set(denied[0]) == {
+        "sequence",
+        "timestamp_utc",
+        "operation",
+        "decision",
+        "source_operation",
+        "observed_arity",
+    }
+    assert denied[0]["decision"] == "deny"
+    assert denied[0]["source_operation"] == "socket.future_transport"
+    assert denied[0]["observed_arity"] == 3
+    assert "secret-address" not in execution.audit_log_path.read_text(
+        encoding="utf-8", errors="strict"
+    )
+    assert events[-2]["operation"] == "audit-socket-poisoned"
+    assert (
+        events[-2]["denied_operation"] == "socket.future_transport"
+    )
+    assert events[-1]["status"] == "error"
+
+
+def test_caught_socket_denial_blocks_later_governed_event_and_poison_fails(
+    tmp_path: Path,
+) -> None:
+    source, digest = measurement_source(tmp_path)
+    execution = materialize(tmp_path / "stage", source, digest)
+
+    result = run_audited_child(
+        execution,
+        action="socket-caught-poison",
+    )
+
+    assert result.returncode == 0, execution.stderr_path.read_text(
+        encoding="utf-8", errors="strict"
+    )
+    stdout = execution.stdout_path.read_text(
+        encoding="utf-8", errors="strict"
+    )
+    assert "SOCKET-DENIED-CAUGHT" in stdout
+    assert "POISONED-GOVERNED-DENIED-CAUGHT" in stdout
+    events = load_audit_events(execution.audit_log_path)
+    assert events[-2]["operation"] == "audit-socket-poisoned"
+    assert events[-2]["decision"] == "deny"
+    assert events[-2]["denied_operation"] == "socket.gethostname"
+    assert events[-1]["operation"] == "bootstrap-finished"
+    assert events[-1]["status"] == "error"
+    with pytest.raises(ValueError, match="denied|unsuccessful|terminal"):
+        validate_audit_log(
+            execution.audit_log_path,
+            expected_policy_sha256=execution.audit_policy_sha256,
+        )
+
+
+def test_audit_disables_platform_hostname_probe_without_cached_leak(
+    tmp_path: Path,
+) -> None:
+    source, digest = measurement_source(tmp_path)
+    execution = materialize(tmp_path / "stage", source, digest)
+
+    result = run_audited_child(
+        execution,
+        action="platform-node",
+    )
+
+    assert result.returncode == 0, execution.stderr_path.read_text(
+        encoding="utf-8", errors="strict"
+    )
+    assert execution.stdout_path.read_text(
+        encoding="utf-8", errors="strict"
+    ) == "PLATFORM-NODE=\n"
+    events = load_audit_events(execution.audit_log_path)
+    assert not any(
+        str(event.get("operation", "")).startswith("socket.")
+        or event.get("operation")
+        in {"socket-unknown", "audit-socket-poisoned"}
+        for event in events
+    )
+    assert validate_audit_log(
+        execution.audit_log_path,
+        expected_policy_sha256=execution.audit_policy_sha256,
+    )["terminal_status"] == "success"
+
+
+def test_audit_platform_probe_is_stable_when_windows_wmi_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    source, digest = measurement_source(tmp_path)
+    execution = materialize(tmp_path / "stage", source, digest)
+
+    result = run_audited_child(
+        execution,
+        action="platform-wmi-unavailable",
+    )
+
+    assert result.returncode == 0, execution.stderr_path.read_text(
+        encoding="utf-8", errors="strict"
+    )
+    machine = (
+        "AMD64"
+        if "amd64" in sys.version.lower()
+        else "ARM64"
+        if "(arm64)" in sys.version.lower()
+        else "ARM"
+        if "(arm)" in sys.version.lower()
+        else ""
+    )
+    assert execution.stdout_path.read_text(
+        encoding="utf-8", errors="strict"
+    ) == (
+        "PLATFORM-NODE=\n"
+        f"PLATFORM-MACHINE={machine}\n"
+        "PLATFORM-PROCESSOR=\n"
+    )
+    events = load_audit_events(execution.audit_log_path)
+    assert not any(
+        event.get("decision") == "deny"
+        or str(event.get("operation", "")).startswith("socket.")
+        or event.get("operation") == "socket-unknown"
+        or str(event.get("resolved_path", "")).casefold().endswith(
+            "\\nul"
+        )
+        for event in events
+    )
+    assert validate_audit_log(
+        execution.audit_log_path,
+        expected_policy_sha256=execution.audit_policy_sha256,
+    )["terminal_status"] == "success"
+
+
+@pytest.mark.parametrize(
+    ("action", "operation", "resolved_path"),
+    [
+        (
+            "audit-arity-open",
+            "open",
+            "<invalid-open-arguments>",
+        ),
+        (
+            "audit-arity-listdir",
+            "os.listdir",
+            "<invalid-arguments>",
+        ),
+        (
+            "audit-arity-scandir",
+            "os.scandir",
+            "<invalid-arguments>",
+        ),
+        (
+            "audit-arity-add-dll-directory",
+            "os.add_dll_directory",
+            "<invalid-arguments>",
+        ),
+        (
+            "audit-arity-chdir",
+            "os.chdir",
+            "<invalid-arguments>",
+        ),
+        (
+            "audit-arity-create-file",
+            "_winapi.CreateFile",
+            "<invalid-arguments>",
+        ),
+        (
+            "audit-arity-create-junction",
+            "_winapi.CreateJunction",
+            "<invalid-arguments>",
+        ),
+        (
+            "audit-arity-copy-file2",
+            "_winapi.CopyFile2",
+            "<invalid-arguments>",
+        ),
+    ],
+)
+def test_audit_denies_wrong_governed_event_arities_exactly(
+    tmp_path: Path,
+    action: str,
+    operation: str,
+    resolved_path: str,
+) -> None:
+    source, digest = measurement_source(tmp_path)
+    execution = materialize(tmp_path / "stage", source, digest)
+
+    result = run_audited_child(
+        execution,
+        action=action,
+        target=execution.cwd,
+        expect_denied=True,
+    )
+
+    assert result.returncode == 0, execution.stderr_path.read_text(
+        encoding="utf-8", errors="strict"
+    )
+    matching = [
+        event
+        for event in load_audit_events(execution.audit_log_path)
+        if event.get("operation") == operation
+        and event.get("decision") == "deny"
+        and event.get("resolved_path") == resolved_path
+    ]
+    assert len(matching) == 1
+
+
+def test_audit_maps_unknown_process_event_to_fixed_denial_without_leak(
+    tmp_path: Path,
+) -> None:
+    source, digest = measurement_source(tmp_path)
+    execution = materialize(tmp_path / "stage", source, digest)
+
+    result = run_audited_child(
+        execution,
+        action="audit-unknown-process",
+        expect_denied=True,
+    )
+
+    assert result.returncode == 0, execution.stderr_path.read_text(
+        encoding="utf-8", errors="strict"
+    )
+    events = load_audit_events(execution.audit_log_path)
+    matching = [
+        event
+        for event in events
+        if event.get("operation") == "process-unknown"
+    ]
+    assert len(matching) == 1
+    assert set(matching[0]) == {
+        "sequence",
+        "timestamp_utc",
+        "operation",
+        "decision",
+        "source_operation",
+    }
+    assert matching[0]["decision"] == "deny"
+    assert (
+        matching[0]["source_operation"]
+        == "subprocess.future_spawn"
+    )
+    assert "secret-command-payload" not in (
+        execution.audit_log_path.read_text(
+            encoding="utf-8", errors="strict"
+        )
+    )
+
+
 @pytest.mark.parametrize(
     ("action", "reentered_operation"),
     [
@@ -2802,6 +3832,794 @@ def _valid_log_lines(policy_sha256: str) -> list[dict[str, object]]:
             "status": "success",
         },
     ]
+
+
+_AUDIT_SINGLE_PATH_OPERATIONS = (
+    "os.listdir",
+    "os.scandir",
+    "os.add_dll_directory",
+    "os.chdir",
+    "os.remove",
+    "os.rmdir",
+    "os.mkdir",
+    "os.truncate",
+    "os.chmod",
+    "os.chown",
+    "os.chflags",
+    "os.utime",
+    "os.setxattr",
+    "os.removexattr",
+)
+_AUDIT_PROCESS_OPERATIONS = (
+    "subprocess.Popen",
+    "os.system",
+    "os.posix_spawn",
+    "os.posix_spawnp",
+    "os.exec",
+    "os.spawn",
+    "os.fork",
+    "os.forkpty",
+    "os.startfile",
+    "os.startfile/2",
+    "pty.spawn",
+)
+
+
+def _audit_schema_cases() -> list[tuple[str, dict[str, object]]]:
+    path = r"C:\strict-audit\target.bin"
+    destination = r"C:\strict-audit\destination.bin"
+    cases: list[tuple[str, dict[str, object]]] = [
+        (
+            "audit-reentry-deny",
+            {
+                "operation": "audit-reentry",
+                "decision": "deny",
+                "reentered_operation": "open",
+            },
+        ),
+        (
+            "audit-socket-poisoned-deny",
+            {
+                "operation": "audit-socket-poisoned",
+                "decision": "deny",
+                "denied_operation": "socket.gethostname",
+            },
+        ),
+        (
+            "socket-unknown-deny",
+            {
+                "operation": "socket-unknown",
+                "decision": "deny",
+                "source_operation": "socket.future_transport",
+                "observed_arity": 3,
+            },
+        ),
+        (
+            "open-allow",
+            {
+                "operation": "open",
+                "decision": "allow",
+                "resolved_path": path,
+                "access": "read",
+            },
+        ),
+        (
+            "open-deny",
+            {
+                "operation": "open",
+                "decision": "deny",
+                "resolved_path": path,
+            },
+        ),
+        (
+            "open-malformed-deny",
+            {
+                "operation": "open",
+                "decision": "deny",
+                "resolved_path": "<invalid-open-arguments>",
+            },
+        ),
+        (
+            "rename-allow",
+            {
+                "operation": "os.rename",
+                "decision": "allow",
+                "resolved_path": path,
+                "destination_path": destination,
+            },
+        ),
+        (
+            "rename-deny",
+            {
+                "operation": "os.rename",
+                "decision": "deny",
+                "resolved_path": path,
+                "destination_path": destination,
+            },
+        ),
+        (
+            "rename-malformed-deny",
+            {
+                "operation": "os.rename",
+                "decision": "deny",
+                "resolved_path": "<invalid-two-path-operation>",
+            },
+        ),
+        (
+            "link-deny",
+            {
+                "operation": "os.link",
+                "decision": "deny",
+                "resolved_path": path,
+                "destination_path": destination,
+            },
+        ),
+        (
+            "link-malformed-deny",
+            {
+                "operation": "os.link",
+                "decision": "deny",
+                "resolved_path": "<invalid-arguments>",
+            },
+        ),
+        (
+            "symlink-deny",
+            {
+                "operation": "os.symlink",
+                "decision": "deny",
+                "resolved_path": path,
+                "destination_path": destination,
+            },
+        ),
+        (
+            "symlink-malformed-deny",
+            {
+                "operation": "os.symlink",
+                "decision": "deny",
+                "resolved_path": "<invalid-arguments>",
+            },
+        ),
+        (
+            "copy-file2-allow",
+            {
+                "operation": "_winapi.CopyFile2",
+                "decision": "allow",
+                "resolved_path": path,
+                "destination_path": destination,
+                "flags": 0,
+            },
+        ),
+        (
+            "copy-file2-deny",
+            {
+                "operation": "_winapi.CopyFile2",
+                "decision": "deny",
+                "resolved_path": path,
+                "destination_path": destination,
+                "flags": 0,
+            },
+        ),
+        (
+            "copy-file2-invalid-flags-deny",
+            {
+                "operation": "_winapi.CopyFile2",
+                "decision": "deny",
+                "resolved_path": path,
+                "destination_path": destination,
+                "flags": "<invalid>",
+            },
+        ),
+        (
+            "copy-file2-malformed-deny",
+            {
+                "operation": "_winapi.CopyFile2",
+                "decision": "deny",
+                "resolved_path": "<invalid-arguments>",
+            },
+        ),
+        (
+            "create-file-deny",
+            {
+                "operation": "_winapi.CreateFile",
+                "decision": "deny",
+                "resolved_path": path,
+                "desired_access": 0x40000000,
+                "creation_disposition": 1,
+            },
+        ),
+        (
+            "create-file-malformed-deny",
+            {
+                "operation": "_winapi.CreateFile",
+                "decision": "deny",
+                "resolved_path": "<invalid-arguments>",
+            },
+        ),
+        (
+            "create-file-invalid-intent-deny",
+            {
+                "operation": "_winapi.CreateFile",
+                "decision": "deny",
+                "resolved_path": "<invalid-access-intent>",
+            },
+        ),
+        (
+            "create-junction-deny",
+            {
+                "operation": "_winapi.CreateJunction",
+                "decision": "deny",
+                "resolved_path": path,
+                "destination_path": destination,
+            },
+        ),
+        (
+            "create-junction-malformed-deny",
+            {
+                "operation": "_winapi.CreateJunction",
+                "decision": "deny",
+                "resolved_path": "<invalid-arguments>",
+            },
+        ),
+        (
+            "putenv-allow",
+            {
+                "operation": "os.putenv",
+                "decision": "allow",
+            },
+        ),
+        (
+            "putenv-malformed-deny",
+            {
+                "operation": "os.putenv",
+                "decision": "deny",
+                "resolved_path": "<invalid-arguments>",
+            },
+        ),
+        (
+            "unsetenv-allow",
+            {
+                "operation": "os.unsetenv",
+                "decision": "allow",
+            },
+        ),
+        (
+            "unsetenv-malformed-deny",
+            {
+                "operation": "os.unsetenv",
+                "decision": "deny",
+                "resolved_path": "<invalid-arguments>",
+            },
+        ),
+        (
+            "os-unknown-deny",
+            {
+                "operation": "os-unknown",
+                "decision": "deny",
+                "source_operation": "os.future_filesystem_mutation",
+                "resolved_path": path,
+            },
+        ),
+        (
+            "process-unknown-deny",
+            {
+                "operation": "process-unknown",
+                "decision": "deny",
+                "source_operation": "subprocess.future_spawn",
+            },
+        ),
+    ]
+    for operation, arity in SOCKET_AUDIT_EVENT_ARITIES.items():
+        cases.append(
+            (
+                f"{operation}-deny",
+                {
+                    "operation": operation,
+                    "decision": "deny",
+                    "expected_arity": arity,
+                    "observed_arity": arity,
+                },
+            )
+        )
+    for operation in _AUDIT_SINGLE_PATH_OPERATIONS:
+        for decision in ("allow", "deny"):
+            cases.append(
+                (
+                    f"{operation}-{decision}",
+                    {
+                        "operation": operation,
+                        "decision": decision,
+                        "resolved_path": path,
+                    },
+                )
+            )
+        cases.append(
+            (
+                f"{operation}-malformed-deny",
+                {
+                    "operation": operation,
+                    "decision": "deny",
+                    "resolved_path": (
+                        "<directory-descriptor>"
+                        if operation
+                        not in {
+                            "os.listdir",
+                            "os.scandir",
+                            "os.add_dll_directory",
+                            "os.chdir",
+                        }
+                        else "<invalid-arguments>"
+                    ),
+                },
+            )
+        )
+    for operation in _AUDIT_PROCESS_OPERATIONS:
+        cases.append(
+            (
+                f"{operation}-deny",
+                {
+                    "operation": operation,
+                    "decision": "deny",
+                    "command_class": operation,
+                },
+            )
+        )
+    return cases
+
+
+_AUDIT_SCHEMA_CASES = _audit_schema_cases()
+_AUDIT_SCHEMA_CASE_IDS = [case_id for case_id, _ in _AUDIT_SCHEMA_CASES]
+
+
+def _audit_fixture_events(
+    policy_sha256: str,
+    *middle: dict[str, object],
+) -> list[dict[str, object]]:
+    header, terminal = _valid_log_lines(policy_sha256)
+    events = [dict(header), *(dict(event) for event in middle), dict(terminal)]
+    for sequence, event in enumerate(events):
+        event["sequence"] = sequence
+        event["timestamp_utc"] = (
+            f"2026-07-28T00:00:{sequence:02d}.000000Z"
+        )
+    return events
+
+
+def _write_canonical_audit_fixture(
+    path: Path,
+    events: list[dict[str, object]],
+) -> None:
+    path.write_bytes(
+        b"".join(canonical_json_bytes(event) + b"\n" for event in events)
+    )
+
+
+@pytest.mark.parametrize(
+    ("_case_id", "middle"),
+    _AUDIT_SCHEMA_CASES,
+    ids=_AUDIT_SCHEMA_CASE_IDS,
+)
+def test_audit_validator_recognizes_every_closed_world_schema_fixture(
+    tmp_path: Path,
+    _case_id: str,
+    middle: dict[str, object],
+) -> None:
+    policy_sha256 = "a" * 64
+    path = tmp_path / "audit.jsonl"
+    _write_canonical_audit_fixture(
+        path,
+        _audit_fixture_events(policy_sha256, middle),
+    )
+    if middle["decision"] == "deny":
+        with pytest.raises(ValueError, match="contains a denied event"):
+            validate_audit_log(
+                path,
+                expected_policy_sha256=policy_sha256,
+            )
+    else:
+        assert validate_audit_log(
+            path,
+            expected_policy_sha256=policy_sha256,
+        )["terminal_status"] == "success"
+
+
+def test_audit_validator_accepts_error_terminal_schema_before_aggregate_check(
+    tmp_path: Path,
+) -> None:
+    policy_sha256 = "a" * 64
+    events = _audit_fixture_events(policy_sha256)
+    events[-1]["status"] = "error"
+    path = tmp_path / "audit.jsonl"
+    _write_canonical_audit_fixture(path, events)
+
+    with pytest.raises(ValueError, match="terminal"):
+        validate_audit_log(
+            path,
+            expected_policy_sha256=policy_sha256,
+        )
+
+
+@pytest.mark.parametrize(
+    ("_case_id", "middle"),
+    _AUDIT_SCHEMA_CASES,
+    ids=_AUDIT_SCHEMA_CASE_IDS,
+)
+@pytest.mark.parametrize("mutation", ["missing", "extra", "wrong-type"])
+def test_audit_validator_rejects_field_mutation_for_every_schema_fixture(
+    tmp_path: Path,
+    _case_id: str,
+    middle: dict[str, object],
+    mutation: str,
+) -> None:
+    policy_sha256 = "a" * 64
+    events = _audit_fixture_events(policy_sha256, middle)
+    target = events[1]
+    additional = sorted(
+        set(target)
+        - {"sequence", "timestamp_utc", "operation", "decision"}
+    )
+    if mutation == "missing":
+        del target[additional[0] if additional else "timestamp_utc"]
+    elif mutation == "extra":
+        target["unexpected_field"] = "forbidden"
+    else:
+        field = additional[0] if additional else "sequence"
+        value = target[field]
+        target[field] = (
+            True
+            if type(value) is int
+            else 7
+            if type(value) is str
+            else "wrong-type"
+        )
+    path = tmp_path / "audit.jsonl"
+    _write_canonical_audit_fixture(path, events)
+
+    with pytest.raises(ValueError, match="schema"):
+        validate_audit_log(
+            path,
+            expected_policy_sha256=policy_sha256,
+        )
+
+
+@pytest.mark.parametrize(
+    ("middle", "field", "value"),
+    [
+        (
+            {
+                "operation": "open",
+                "decision": "allow",
+                "resolved_path": r"C:\strict-audit\target.bin",
+                "access": "read",
+            },
+            "access",
+            "execute",
+        ),
+        (
+            {
+                "operation": "socket.gethostname",
+                "decision": "deny",
+                "expected_arity": 0,
+                "observed_arity": 0,
+            },
+            "expected_arity",
+            True,
+        ),
+    ],
+)
+def test_audit_validator_rejects_invalid_enum_and_bool_as_int(
+    tmp_path: Path,
+    middle: dict[str, object],
+    field: str,
+    value: object,
+) -> None:
+    policy_sha256 = "a" * 64
+    events = _audit_fixture_events(policy_sha256, middle)
+    events[1][field] = value
+    path = tmp_path / "audit.jsonl"
+    _write_canonical_audit_fixture(path, events)
+
+    with pytest.raises(ValueError, match="schema"):
+        validate_audit_log(
+            path,
+            expected_policy_sha256=policy_sha256,
+        )
+
+
+def _same_type_schema_constant_mutations() -> list[
+    tuple[str, dict[str, object], str, object]
+]:
+    mutations: list[tuple[str, dict[str, object], str, object]] = []
+    for case_id, middle in _AUDIT_SCHEMA_CASES:
+        if "malformed" in case_id or case_id == (
+            "create-file-invalid-intent-deny"
+        ):
+            mutations.append(
+                (
+                    case_id,
+                    middle,
+                    "resolved_path",
+                    "<different-invalid-sentinel>",
+                )
+            )
+    for operation, arity in SOCKET_AUDIT_EVENT_ARITIES.items():
+        mutations.append(
+            (
+                f"{operation}-expected-arity",
+                {
+                    "operation": operation,
+                    "decision": "deny",
+                    "expected_arity": arity,
+                    "observed_arity": arity,
+                },
+                "expected_arity",
+                arity + 1,
+            )
+        )
+    mutations.extend(
+        [
+            (
+                "copy-file2-allow-flags",
+                {
+                    "operation": "_winapi.CopyFile2",
+                    "decision": "allow",
+                    "resolved_path": r"C:\strict-audit\source",
+                    "destination_path": r"C:\strict-audit\destination",
+                    "flags": 0,
+                },
+                "flags",
+                1,
+            ),
+            (
+                "copy-file2-invalid-flag-sentinel",
+                {
+                    "operation": "_winapi.CopyFile2",
+                    "decision": "deny",
+                    "resolved_path": r"C:\strict-audit\source",
+                    "destination_path": r"C:\strict-audit\destination",
+                    "flags": "<invalid>",
+                },
+                "flags",
+                "<different-invalid-sentinel>",
+            ),
+            (
+                "process-command-class",
+                {
+                    "operation": "subprocess.Popen",
+                    "decision": "deny",
+                    "command_class": "subprocess.Popen",
+                },
+                "command_class",
+                "os.system",
+            ),
+        ]
+    )
+    return mutations
+
+
+_SAME_TYPE_SCHEMA_CONSTANT_MUTATIONS = (
+    _same_type_schema_constant_mutations()
+)
+
+
+@pytest.mark.parametrize(
+    ("_case_id", "middle", "field", "replacement"),
+    _SAME_TYPE_SCHEMA_CONSTANT_MUTATIONS,
+    ids=[
+        case_id
+        for case_id, _, _, _ in _SAME_TYPE_SCHEMA_CONSTANT_MUTATIONS
+    ],
+)
+def test_audit_validator_rejects_wrong_same_type_schema_constants(
+    tmp_path: Path,
+    _case_id: str,
+    middle: dict[str, object],
+    field: str,
+    replacement: object,
+) -> None:
+    policy_sha256 = "a" * 64
+    events = _audit_fixture_events(policy_sha256, middle)
+    events[1][field] = replacement
+    path = tmp_path / "audit.jsonl"
+    _write_canonical_audit_fixture(path, events)
+
+    with pytest.raises(ValueError, match="schema"):
+        validate_audit_log(
+            path,
+            expected_policy_sha256=policy_sha256,
+        )
+
+
+@pytest.mark.parametrize("decision", ["allow", "deny"])
+def test_audit_validator_rejects_unknown_operation_before_aggregate_denial(
+    tmp_path: Path,
+    decision: str,
+) -> None:
+    policy_sha256 = "a" * 64
+    events = _audit_fixture_events(
+        policy_sha256,
+        {
+            "operation": "future.audit.operation",
+            "decision": decision,
+        },
+    )
+    path = tmp_path / "audit.jsonl"
+    _write_canonical_audit_fixture(path, events)
+
+    with pytest.raises(ValueError, match="schema|unknown"):
+        validate_audit_log(
+            path,
+            expected_policy_sha256=policy_sha256,
+        )
+
+
+@pytest.mark.parametrize(
+    ("operation", "decision", "fields"),
+    [
+        ("hook-installed", "deny", {"policy_sha256": "a" * 64}),
+        ("bootstrap-finished", "deny", {"status": "success"}),
+        ("audit-reentry", "allow", {"reentered_operation": "open"}),
+        (
+            "socket.gethostname",
+            "allow",
+            {"expected_arity": 0, "observed_arity": 0},
+        ),
+        (
+            "os.link",
+            "allow",
+            {
+                "resolved_path": r"C:\strict-audit\source",
+                "destination_path": r"C:\strict-audit\destination",
+            },
+        ),
+        (
+            "subprocess.Popen",
+            "allow",
+            {"command_class": "subprocess.Popen"},
+        ),
+        ("os.putenv", "deny", {}),
+    ],
+)
+def test_audit_validator_rejects_operation_specific_disallowed_decision(
+    tmp_path: Path,
+    operation: str,
+    decision: str,
+    fields: dict[str, object],
+) -> None:
+    policy_sha256 = "a" * 64
+    middle = {
+        "operation": operation,
+        "decision": decision,
+        **fields,
+    }
+    path = tmp_path / "audit.jsonl"
+    _write_canonical_audit_fixture(
+        path,
+        _audit_fixture_events(policy_sha256, middle),
+    )
+
+    with pytest.raises(ValueError, match="schema"):
+        validate_audit_log(
+            path,
+            expected_policy_sha256=policy_sha256,
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "header-extra",
+        "terminal-extra",
+        "duplicate-header",
+        "invalid-terminal-status",
+    ],
+)
+def test_audit_validator_requires_exact_header_and_terminal_schema(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    policy_sha256 = "a" * 64
+    events = _audit_fixture_events(policy_sha256)
+    if mutation == "header-extra":
+        events[0]["unexpected_field"] = "forbidden"
+    elif mutation == "terminal-extra":
+        events[-1]["unexpected_field"] = "forbidden"
+    elif mutation == "duplicate-header":
+        duplicate = dict(events[0])
+        events.insert(1, duplicate)
+        for sequence, event in enumerate(events):
+            event["sequence"] = sequence
+    else:
+        events[-1]["status"] = "complete"
+    path = tmp_path / "audit.jsonl"
+    _write_canonical_audit_fixture(path, events)
+
+    with pytest.raises(ValueError, match="schema|header|terminal"):
+        validate_audit_log(
+            path,
+            expected_policy_sha256=policy_sha256,
+        )
+
+
+def test_audit_validator_rejects_noncanonical_json_bytes(
+    tmp_path: Path,
+) -> None:
+    policy_sha256 = "a" * 64
+    path = tmp_path / "audit.jsonl"
+    _write_canonical_audit_fixture(
+        path,
+        _audit_fixture_events(policy_sha256),
+    )
+    raw = path.read_bytes()
+    path.write_bytes(raw.replace(b"{", b"{ ", 1))
+
+    with pytest.raises(ValueError, match="canonical"):
+        validate_audit_log(
+            path,
+            expected_policy_sha256=policy_sha256,
+        )
+
+
+def test_audit_policy_rejects_dynamic_logged_unrelated_events(
+    tmp_path: Path,
+) -> None:
+    source, digest = measurement_source(tmp_path)
+    execution = materialize(tmp_path / "stage", source, digest)
+    policy = json.loads(
+        execution.audit_policy_path.read_text(
+            encoding="utf-8", errors="strict"
+        )
+    )
+    policy["logged_unrelated_events"] = ["future.audit.operation"]
+
+    with pytest.raises(ValueError, match="logged_unrelated_events"):
+        validate_audit_policy(policy)
+
+
+def test_audit_recorder_validates_schema_before_writing(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path.resolve()
+    policy = validate_audit_policy(
+        {
+            "schema": "method-audit-policy-v1",
+            "audit_log_path": str(root / "audit.jsonl"),
+            "exact_read_paths": [str(root / "input.bin")],
+            "read_roots": [str(root)],
+            "write_roots": [str(root)],
+            "chdir_roots": [str(root)],
+            "python_runtime_root": str(root),
+            "windows_system_read_root": str(root),
+            "runtime_site_package_roots": [],
+            "logged_unrelated_events": [],
+        }
+    )
+    path = root / "audit.jsonl"
+    path.write_bytes(b"")
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_APPEND | getattr(os, "O_BINARY", 0),
+    )
+    try:
+        boundary = audit_module._AuditBoundary(
+            policy,
+            descriptor,
+            "a" * 64,
+        )
+        with pytest.raises(ValueError, match="schema"):
+            boundary.record(
+                "os.putenv",
+                decision="allow",
+                unexpected_field="forbidden",
+            )
+        boundary.record("os.putenv", decision="allow")
+    finally:
+        os.close(descriptor)
+
+    raw = path.read_bytes()
+    assert raw.endswith(b"\n")
+    event = json.loads(raw.decode("utf-8", errors="strict"))
+    assert event["sequence"] == 0
+    assert raw == canonical_json_bytes(event) + b"\n"
 
 
 @pytest.mark.parametrize(

@@ -16,8 +16,10 @@ import json
 import math
 import os
 from pathlib import Path
+import platform
 import re
 import stat
+import sys
 import threading
 from types import MappingProxyType
 
@@ -25,6 +27,10 @@ from types import MappingProxyType
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z", flags=re.ASCII)
 _UTC_TIMESTAMP = re.compile(
     r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z\Z",
+    flags=re.ASCII,
+)
+_DISPLAY_PATH_SENTINEL = re.compile(
+    r"<(?:file-descriptor:-?\d+|unsupported:[^<>:]+)>\Z",
     flags=re.ASCII,
 )
 _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
@@ -107,8 +113,403 @@ _DIRECT_WINDOWS_FILESYSTEM_EVENT_ARITIES = MappingProxyType(
         "_winapi.CopyFile2": 3,
     }
 )
+_SOCKET_EVENT_ARITIES = MappingProxyType(
+    {
+        "socket.__new__": 4,
+        "socket.bind": 2,
+        "socket.connect": 2,
+        "socket.getaddrinfo": 5,
+        "socket.gethostbyaddr": 1,
+        "socket.gethostbyname": 1,
+        "socket.gethostname": 0,
+        "socket.getnameinfo": 1,
+        "socket.getservbyname": 2,
+        "socket.getservbyport": 2,
+        "socket.sendto": 2,
+    }
+)
+_ONE_PATH_EVENT_ARITIES = MappingProxyType(
+    {
+        "os.listdir": 1,
+        "os.scandir": 1,
+        "os.add_dll_directory": 1,
+        "os.chdir": 1,
+    }
+)
+_ALWAYS_DENIED_LINK_EVENT_ARITIES = MappingProxyType(
+    {
+        "os.link": 4,
+        "os.symlink": 3,
+    }
+)
+_ENVIRONMENT_EVENT_ARITIES = MappingProxyType(
+    {
+        "os.putenv": 2,
+        "os.unsetenv": 1,
+    }
+)
 _COPY_FILE2_ALLOWED_FLAGS = 0
 _MAX_AUDIT_LOG_BYTES = 128 * 1024 * 1024
+_BASE_AUDIT_FIELD_RULES = MappingProxyType(
+    {
+        "sequence": ("nonnegative-int",),
+        "timestamp_utc": ("utc-timestamp",),
+        "operation": ("nonempty-str",),
+        "decision": ("decision",),
+    }
+)
+_RESERVED_MALFORMED_PATHS = frozenset(
+    {
+        "<directory-descriptor>",
+        "<invalid-access-intent>",
+        "<invalid-arguments>",
+        "<invalid-open-arguments>",
+        "<invalid-two-path-operation>",
+    }
+)
+
+
+def _audit_schema_variant(
+    **additional_rules: tuple[object, ...],
+) -> Mapping[str, tuple[object, ...]]:
+    return MappingProxyType(
+        {
+            **_BASE_AUDIT_FIELD_RULES,
+            **additional_rules,
+        }
+    )
+
+
+def _build_audit_record_schemas() -> Mapping[
+    tuple[str, str],
+    tuple[Mapping[str, tuple[object, ...]], ...],
+]:
+    schemas: dict[
+        tuple[str, str],
+        tuple[Mapping[str, tuple[object, ...]], ...],
+    ] = {}
+
+    def register(
+        operation: str,
+        decision: str,
+        *variants: Mapping[str, tuple[object, ...]],
+    ) -> None:
+        key = (operation, decision)
+        if key in schemas or not variants:
+            raise RuntimeError("duplicate or empty audit schema registration")
+        schemas[key] = tuple(variants)
+
+    path = ("path-display",)
+    text = ("str",)
+    nonempty = ("nonempty-str",)
+    integer = ("int",)
+    nonnegative_integer = ("nonnegative-int",)
+    invalid_arguments = ("const", "<invalid-arguments>")
+
+    register(
+        "hook-installed",
+        "allow",
+        _audit_schema_variant(policy_sha256=("sha256",)),
+    )
+    register(
+        "bootstrap-finished",
+        "allow",
+        _audit_schema_variant(status=("status",)),
+    )
+    register(
+        "audit-reentry",
+        "deny",
+        _audit_schema_variant(reentered_operation=nonempty),
+    )
+    register(
+        "audit-socket-poisoned",
+        "deny",
+        _audit_schema_variant(denied_operation=nonempty),
+    )
+    for operation, expected_arity in _SOCKET_EVENT_ARITIES.items():
+        register(
+            operation,
+            "deny",
+            _audit_schema_variant(
+                expected_arity=("const", expected_arity),
+                observed_arity=nonnegative_integer,
+            ),
+        )
+    register(
+        "socket-unknown",
+        "deny",
+        _audit_schema_variant(
+            source_operation=("unknown-socket-operation",),
+            observed_arity=nonnegative_integer,
+        ),
+    )
+    register(
+        "open",
+        "allow",
+        _audit_schema_variant(
+            resolved_path=path,
+            access=("access",),
+        ),
+    )
+    register(
+        "open",
+        "deny",
+        _audit_schema_variant(resolved_path=path),
+        _audit_schema_variant(
+            resolved_path=("const", "<invalid-open-arguments>")
+        ),
+    )
+
+    one_path_operations = (
+        set(_ONE_PATH_EVENT_ARITIES)
+        | set(_SINGLE_WRITE_EVENTS)
+    )
+    for operation in sorted(one_path_operations):
+        malformed = (
+            "<directory-descriptor>"
+            if operation in _SINGLE_WRITE_EVENTS
+            else "<invalid-arguments>"
+        )
+        register(
+            operation,
+            "allow",
+            _audit_schema_variant(resolved_path=path),
+        )
+        register(
+            operation,
+            "deny",
+            _audit_schema_variant(resolved_path=path),
+            _audit_schema_variant(
+                resolved_path=("const", malformed)
+            ),
+        )
+
+    for operation in sorted(_TWO_WRITE_EVENTS):
+        register(
+            operation,
+            "allow",
+            _audit_schema_variant(
+                resolved_path=path,
+                destination_path=path,
+            ),
+        )
+        register(
+            operation,
+            "deny",
+            _audit_schema_variant(
+                resolved_path=path,
+                destination_path=path,
+            ),
+            _audit_schema_variant(
+                resolved_path=(
+                    "const",
+                    "<invalid-two-path-operation>",
+                )
+            ),
+        )
+
+    for operation in sorted(_ALWAYS_DENIED_LINK_EVENTS):
+        register(
+            operation,
+            "deny",
+            _audit_schema_variant(
+                resolved_path=path,
+                destination_path=path,
+            ),
+            _audit_schema_variant(resolved_path=invalid_arguments),
+        )
+
+    register(
+        "_winapi.CopyFile2",
+        "allow",
+        _audit_schema_variant(
+            resolved_path=path,
+            destination_path=path,
+            flags=("const", _COPY_FILE2_ALLOWED_FLAGS),
+        ),
+    )
+    register(
+        "_winapi.CopyFile2",
+        "deny",
+        _audit_schema_variant(
+            resolved_path=path,
+            destination_path=path,
+            flags=integer,
+        ),
+        _audit_schema_variant(
+            resolved_path=path,
+            destination_path=path,
+            flags=("const", "<invalid>"),
+        ),
+        _audit_schema_variant(resolved_path=invalid_arguments),
+    )
+    register(
+        "_winapi.CreateFile",
+        "deny",
+        _audit_schema_variant(
+            resolved_path=path,
+            desired_access=integer,
+            creation_disposition=integer,
+        ),
+        _audit_schema_variant(resolved_path=invalid_arguments),
+        _audit_schema_variant(
+            resolved_path=("const", "<invalid-access-intent>")
+        ),
+    )
+    register(
+        "_winapi.CreateJunction",
+        "deny",
+        _audit_schema_variant(
+            resolved_path=path,
+            destination_path=path,
+        ),
+        _audit_schema_variant(resolved_path=invalid_arguments),
+    )
+
+    for operation in sorted(_PROCESS_EVENTS):
+        register(
+            operation,
+            "deny",
+            _audit_schema_variant(command_class=("operation",)),
+        )
+    register(
+        "process-unknown",
+        "deny",
+        _audit_schema_variant(
+            source_operation=("unknown-process-operation",)
+        ),
+    )
+    register(
+        "os-unknown",
+        "deny",
+        _audit_schema_variant(
+            source_operation=("unknown-os-operation",),
+            resolved_path=text,
+        ),
+    )
+    for operation in sorted(_ENVIRONMENT_EVENT_ARITIES):
+        register(
+            operation,
+            "allow",
+            _audit_schema_variant(),
+        )
+        register(
+            operation,
+            "deny",
+            _audit_schema_variant(resolved_path=invalid_arguments),
+        )
+    return MappingProxyType(schemas)
+
+
+_AUDIT_RECORD_SCHEMAS = _build_audit_record_schemas()
+
+
+def _audit_field_matches(
+    rule: tuple[object, ...],
+    value: object,
+    event: Mapping[str, object],
+) -> bool:
+    kind = rule[0]
+    if kind == "str":
+        return type(value) is str
+    if kind == "nonempty-str":
+        return type(value) is str and bool(value)
+    if kind == "int":
+        return type(value) is int
+    if kind == "nonnegative-int":
+        return type(value) is int and value >= 0
+    if kind == "sha256":
+        return type(value) is str and _SHA256.fullmatch(value) is not None
+    if kind == "utc-timestamp":
+        if (
+            type(value) is not str
+            or _UTC_TIMESTAMP.fullmatch(value) is None
+        ):
+            return False
+        try:
+            datetime(
+                int(value[0:4]),
+                int(value[5:7]),
+                int(value[8:10]),
+                int(value[11:13]),
+                int(value[14:16]),
+                int(value[17:19]),
+                int(value[20:26]),
+                tzinfo=timezone.utc,
+            )
+        except ValueError:
+            return False
+        return True
+    if kind == "decision":
+        return value in {"allow", "deny"}
+    if kind == "status":
+        return value in {"success", "error"}
+    if kind == "access":
+        return value in {"read", "write", "read-write"}
+    if kind == "path-display":
+        if (
+            type(value) is not str
+            or value in _RESERVED_MALFORMED_PATHS
+        ):
+            return False
+        if value.startswith("<") or value.endswith(">"):
+            return _DISPLAY_PATH_SENTINEL.fullmatch(value) is not None
+        return True
+    if kind == "operation":
+        return (
+            type(value) is str
+            and value == event.get("operation")
+        )
+    if kind == "const":
+        expected = rule[1]
+        return type(value) is type(expected) and value == expected
+    if kind == "unknown-socket-operation":
+        return (
+            type(value) is str
+            and value.startswith("socket.")
+            and value not in _SOCKET_EVENT_ARITIES
+        )
+    if kind == "unknown-process-operation":
+        return (
+            type(value) is str
+            and value not in _PROCESS_EVENTS
+            and _is_process_event(value)
+        )
+    if kind == "unknown-os-operation":
+        return (
+            type(value) is str
+            and value.startswith("os.")
+            and (value, "allow") not in _AUDIT_RECORD_SCHEMAS
+            and (value, "deny") not in _AUDIT_RECORD_SCHEMAS
+        )
+    raise RuntimeError(f"unknown audit schema rule: {kind!r}")
+
+
+def _validate_audit_event_schema(event: Mapping[str, object]) -> None:
+    operation = event.get("operation")
+    decision = event.get("decision")
+    variants = _AUDIT_RECORD_SCHEMAS.get((operation, decision))
+    if variants is None:
+        raise ValueError("audit log record schema is unknown")
+    for variant in variants:
+        if set(event) != set(variant):
+            continue
+        if all(
+            _audit_field_matches(rule, event[field], event)
+            for field, rule in variant.items()
+        ):
+            return
+    raise ValueError("audit log record schema mismatch")
+
+
+def _canonical_audit_event_bytes(event: Mapping[str, object]) -> bytes:
+    return json.dumps(
+        event,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
 
 
 def validate_audit_policy(value: object) -> Mapping[str, object]:
@@ -150,15 +551,13 @@ def validate_audit_policy(value: object) -> Mapping[str, object]:
     if not value["read_roots"] or not value["write_roots"]:
         raise ValueError("audit policy roots must not be empty")
     logged = value["logged_unrelated_events"]
-    if type(logged) is not list or any(
-        type(event) is not str or not event for event in logged
-    ):
+    if type(logged) is not list:
         raise ValueError(
-            "audit policy logged_unrelated_events must contain strings"
+            "audit policy logged_unrelated_events must be a list"
         )
-    if len(logged) != len(set(logged)):
+    if logged:
         raise ValueError(
-            "audit policy logged_unrelated_events contains duplicates"
+            "audit policy logged_unrelated_events must be empty"
         )
     runtime_root = str(value["python_runtime_root"])
     for site_root in value["runtime_site_package_roots"]:
@@ -185,6 +584,7 @@ def build_audit_boundary(
         policy_sha256
     ) is None:
         raise ValueError("audit policy hash must be canonical SHA-256")
+    _disable_platform_hostname_lookup()
     return _AuditBoundary(validated, log_fd, policy_sha256)
 
 
@@ -202,6 +602,7 @@ class _AuditBoundary:
         self._local = threading.local()
         self._poisoned = False
         self._poisoned_event: str | None = None
+        self._poisoned_kind: str | None = None
         self._exact_reads = tuple(
             str(path) for path in policy["exact_read_paths"]
         )
@@ -213,9 +614,6 @@ class _AuditBoundary:
         )
         self._chdir_roots = tuple(
             str(path) for path in policy["chdir_roots"]
-        )
-        self._logged_unrelated = frozenset(
-            str(event) for event in policy["logged_unrelated_events"]
         )
 
     def __call__(self, event: str, arguments: tuple[object, ...]) -> None:
@@ -234,22 +632,28 @@ class _AuditBoundary:
             return
         self._local.active = True
         try:
-            if event == "open":
+            if event.startswith("socket."):
+                self._audit_socket(event, arguments)
+            elif event == "open":
                 self._audit_open(arguments)
             elif event in {
                 "os.listdir",
                 "os.scandir",
                 "os.add_dll_directory",
             }:
-                raw = arguments[0] if arguments else None
+                if len(arguments) != _ONE_PATH_EVENT_ARITIES[event]:
+                    self._deny_path(event, "<invalid-arguments>")
+                raw = arguments[0]
                 allowed, display = self._authorize_path(
-                    "." if raw is None else raw,
+                    raw,
                     exact_paths=(),
                     roots=self._read_roots,
                 )
                 self._decide_path(event, allowed, display)
             elif event == "os.chdir":
-                raw = arguments[0] if arguments else object()
+                if len(arguments) != _ONE_PATH_EVENT_ARITIES[event]:
+                    self._deny_path(event, "<invalid-arguments>")
+                raw = arguments[0]
                 allowed, display = self._authorize_path(
                     raw, exact_paths=(), roots=self._chdir_roots
                 )
@@ -303,12 +707,13 @@ class _AuditBoundary:
                         f"audit policy denied {event}: {first} -> {second}"
                     )
             elif event in _ALWAYS_DENIED_LINK_EVENTS:
-                first = _display_path(arguments[0]) if arguments else "<missing>"
-                second = (
-                    _display_path(arguments[1])
-                    if len(arguments) > 1
-                    else "<missing>"
-                )
+                if (
+                    len(arguments)
+                    != _ALWAYS_DENIED_LINK_EVENT_ARITIES[event]
+                ):
+                    self._deny_path(event, "<invalid-arguments>")
+                first = _display_path(arguments[0])
+                second = _display_path(arguments[1])
                 self.record(
                     event,
                     decision="deny",
@@ -349,7 +754,7 @@ class _AuditBoundary:
                         creation_disposition=creation_disposition,
                     )
                 raise PermissionError(f"audit policy denied {event}")
-            elif _is_process_event(event):
+            elif event in _PROCESS_EVENTS:
                 self.record(
                     event,
                     decision="deny",
@@ -358,13 +763,32 @@ class _AuditBoundary:
                 raise PermissionError(
                     f"audit policy denied nested process event {event}"
                 )
-            elif event in {"os.putenv", "os.unsetenv"}:
-                self.record(event, decision="allow")
-            elif event in self._logged_unrelated:
+            elif _is_process_event(event):
+                self.record(
+                    "process-unknown",
+                    decision="deny",
+                    source_operation=event,
+                )
+                raise PermissionError(
+                    f"audit policy denied unknown process event {event}"
+                )
+            elif event in _ENVIRONMENT_EVENT_ARITIES:
+                if len(arguments) != _ENVIRONMENT_EVENT_ARITIES[event]:
+                    self._deny_path(event, "<invalid-arguments>")
                 self.record(event, decision="allow")
             elif event.startswith("os."):
                 raw = arguments[0] if arguments else object()
-                self._deny_path(event, _display_path(raw))
+                display = _display_path(raw)
+                self.record(
+                    "os-unknown",
+                    decision="deny",
+                    source_operation=event,
+                    resolved_path=display,
+                )
+                raise PermissionError(
+                    f"audit policy denied unknown OS event {event}: "
+                    f"{display}"
+                )
             if self._poisoned:
                 raise PermissionError(
                     "audit boundary is poisoned after governed re-entry"
@@ -375,6 +799,13 @@ class _AuditBoundary:
     def _poison_reentry(self, event: str) -> None:
         if not self._poisoned:
             self._poisoned_event = event
+            self._poisoned_kind = "reentry"
+            self._poisoned = True
+
+    def _poison_socket(self, event: str) -> None:
+        if not self._poisoned:
+            self._poisoned_event = event
+            self._poisoned_kind = "socket"
             self._poisoned = True
 
     def record(
@@ -396,17 +827,9 @@ class _AuditBoundary:
                 "decision": decision,
                 **fields,
             }
+            _validate_audit_event_schema(event)
             self._sequence += 1
-            raw = (
-                json.dumps(
-                    event,
-                    allow_nan=False,
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                    sort_keys=True,
-                ).encode("utf-8")
-                + b"\n"
-            )
+            raw = _canonical_audit_event_bytes(event) + b"\n"
             _write_all(self._log_fd, raw)
 
     def record_hook_installed(self) -> None:
@@ -420,15 +843,23 @@ class _AuditBoundary:
         if status not in {"success", "error"}:
             raise ValueError("bootstrap status must be success or error")
         if self._poisoned:
-            self.record(
-                "audit-reentry",
-                decision="deny",
-                reentered_operation=(
-                    self._poisoned_event
-                    if self._poisoned_event is not None
-                    else "<unknown>"
-                ),
+            poisoned_event = (
+                self._poisoned_event
+                if self._poisoned_event is not None
+                else "<unknown>"
             )
+            if self._poisoned_kind == "socket":
+                self.record(
+                    "audit-socket-poisoned",
+                    decision="deny",
+                    denied_operation=poisoned_event,
+                )
+            else:
+                self.record(
+                    "audit-reentry",
+                    decision="deny",
+                    reentered_operation=poisoned_event,
+                )
             status = "error"
         self.record(
             "bootstrap-finished",
@@ -436,10 +867,33 @@ class _AuditBoundary:
             status=status,
         )
 
+    def _audit_socket(
+        self,
+        event: str,
+        arguments: tuple[object, ...],
+    ) -> None:
+        expected_arity = _SOCKET_EVENT_ARITIES.get(event)
+        if expected_arity is None:
+            self.record(
+                "socket-unknown",
+                decision="deny",
+                source_operation=event,
+                observed_arity=len(arguments),
+            )
+        else:
+            self.record(
+                event,
+                decision="deny",
+                expected_arity=expected_arity,
+                observed_arity=len(arguments),
+            )
+        self._poison_socket(event)
+        raise PermissionError(f"audit policy denied socket event {event}")
+
     def _audit_open(self, arguments: tuple[object, ...]) -> None:
-        if len(arguments) < 3:
+        if len(arguments) != 3:
             self._deny_path("open", "<invalid-open-arguments>")
-        raw_path, mode, flags = arguments[:3]
+        raw_path, mode, flags = arguments
         if type(raw_path) is int:
             self._deny_path(
                 "open", f"<file-descriptor:{raw_path}>"
@@ -645,34 +1099,26 @@ def validate_audit_log(
             raise ValueError("audit log contains malformed JSON") from error
         if type(value) is not dict:
             raise ValueError("audit log event must be an exact object")
+        if line.encode("utf-8") != _canonical_audit_event_bytes(value):
+            raise ValueError(
+                "audit log record is not canonical JSON bytes"
+            )
         events.append(value)
     for expected_sequence, event in enumerate(events):
-        if type(event.get("sequence")) is not int or (
-            event["sequence"] != expected_sequence
-        ):
+        _validate_audit_event_schema(event)
+        if event["sequence"] != expected_sequence:
             raise ValueError(
                 "audit log sequence is duplicate, missing, or out of order"
             )
-        timestamp = event.get("timestamp_utc")
-        if type(timestamp) is not str or _UTC_TIMESTAMP.fullmatch(
-            timestamp
-        ) is None:
-            raise ValueError("audit log timestamp is not canonical UTC")
-        try:
-            datetime.strptime(
-                timestamp, "%Y-%m-%dT%H:%M:%S.%fZ"
-            )
-        except ValueError as error:
-            raise ValueError("audit log timestamp is invalid") from error
-        if (
-            type(event.get("operation")) is not str
-            or not event["operation"]
-            or event.get("decision") not in {"allow", "deny"}
-        ):
-            raise ValueError("audit log event fields are invalid")
+    headers = [
+        event
+        for event in events
+        if event.get("operation") == "hook-installed"
+    ]
     first = events[0]
     if (
-        first.get("operation") != "hook-installed"
+        len(headers) != 1
+        or first is not headers[0]
         or first.get("decision") != "allow"
         or first.get("policy_sha256") != expected_policy_sha256
     ):
@@ -721,6 +1167,53 @@ def _open_access(mode: object, flags: object) -> tuple[bool, bool]:
     return read, write
 
 
+def _disable_platform_hostname_lookup() -> None:
+    """Keep Windows platform probes deterministic and audit-safe."""
+
+    def no_hostname(default: str = "") -> str:
+        return default
+
+    def no_system_command(
+        system: str = "",
+        release: str = "",
+        version: str = "",
+        supported_platforms: object = (),
+    ) -> tuple[str, str, str]:
+        del supported_platforms
+        return system, release, version
+
+    platform._uname_cache = None
+    platform._node = no_hostname
+    platform._syscmd_ver = no_system_command
+    if os.name != "nt":
+        return
+
+    runtime = sys.version.casefold()
+    machine = (
+        "AMD64"
+        if "amd64" in runtime
+        else "ARM64"
+        if "(arm64)" in runtime
+        else "ARM"
+        if "(arm)" in runtime
+        else ""
+    )
+    sanitized = platform.uname_result(
+        "Windows",
+        "",
+        "",
+        "",
+        machine,
+    )
+    sanitized.__dict__["processor"] = ""
+
+    def sanitized_uname() -> object:
+        return sanitized
+
+    platform._uname_cache = sanitized
+    platform.uname = sanitized_uname
+
+
 def _lexical_path(raw_path: object) -> tuple[Path, tuple[Path, ...]]:
     if isinstance(raw_path, int):
         raise TypeError("file descriptors are not paths")
@@ -749,6 +1242,10 @@ def _lexical_path(raw_path: object) -> tuple[Path, tuple[Path, ...]]:
     for component in re.split(separator_pattern, tail.lstrip("\\/")):
         if not component or component == ".":
             continue
+        if os.name == "nt" and ":" in component:
+            raise ValueError(
+                "Windows alternate data stream path component rejected"
+            )
         if component == "..":
             current = current.parent
             traversed.append(current)
@@ -862,6 +1359,7 @@ def _is_governed_event(event: str) -> bool:
     return (
         event == "open"
         or event.startswith("os.")
+        or event.startswith("socket.")
         or event in _DIRECT_WINDOWS_FILESYSTEM_EVENT_ARITIES
         or _is_process_event(event)
     )

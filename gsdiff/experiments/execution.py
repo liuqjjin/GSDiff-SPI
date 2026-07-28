@@ -8,7 +8,7 @@ materialization record, so moving a stage cannot change method identity.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 import hashlib
 import json
 import ntpath
@@ -30,8 +30,11 @@ from .identity import canonical_json_bytes
 from .methods import (
     AlgorithmSeed,
     CheckpointRequirement,
+    METHODS_REGISTRY_PROTOCOL_SHA256,
+    MethodResolutionRequest,
     ResolvedMethod,
     canonical_method_id,
+    resolve_method_semantics,
     thaw_json,
 )
 
@@ -102,6 +105,7 @@ _PLAIN_TOKENS = frozenset(
 
 @dataclass(frozen=True)
 class MaterializedMethodExecution:
+    canonical_method: ResolvedMethod
     argv: tuple[str, ...]
     cwd: Path
     env: Mapping[str, str]
@@ -134,6 +138,9 @@ class MaterializedMethodRequest:
     checkpoint_paths: Mapping[str, Path]
     requested_runtime_device: str
     child_runtime_device: str
+    methods_registry_protocol_sha256: str = (
+        METHODS_REGISTRY_PROTOCOL_SHA256
+    )
 
 
 @dataclass(frozen=True)
@@ -163,6 +170,8 @@ class _FileIdentity:
 def materialize_method_execution(
     method: ResolvedMethod,
     *,
+    resolution_request: MethodResolutionRequest | None = None,
+    registry_path: Path = Path("configs/protocols/methods-v1.yaml"),
     stage_root: Path,
     measurements_source: Path,
     measurements_file_sha256: str,
@@ -179,7 +188,44 @@ def materialize_method_execution(
     requested_device, child_device, physical_cuda = _runtime_device(
         requested_runtime_device
     )
-    method = _snapshot_resolved_method(method)
+    if resolution_request is None:
+        raise TypeError("resolution_request must be an exact MethodResolutionRequest")
+    if type(resolution_request) is not MethodResolutionRequest:
+        raise TypeError("resolution_request must be an exact MethodResolutionRequest")
+    if not isinstance(registry_path, Path):
+        raise TypeError("registry_path must be a Path")
+    raw_request = MethodResolutionRequest(
+        requested_method_id=resolution_request.requested_method_id,
+        requested_method_config_id=(
+            resolution_request.requested_method_config_id
+        ),
+        base_config=resolution_request.base_config,
+        measurements_metadata=resolution_request.measurements_metadata,
+        requested_execution_profile=(
+            resolution_request.requested_execution_profile
+        ),
+    )
+    claimed_method = _snapshot_resolved_method(method)
+    canonical_method = resolve_method_semantics(
+        raw_request.requested_method_id,
+        method_config_id=raw_request.requested_method_config_id,
+        base_config=raw_request.base_config,
+        measurements_metadata=raw_request.measurements_metadata,
+        execution_profile=raw_request.requested_execution_profile,
+        registry_path=registry_path,
+    )
+    canonical_method = _snapshot_resolved_method(canonical_method)
+    for field in fields(ResolvedMethod):
+        claimed_value = getattr(claimed_method, field.name)
+        canonical_value = getattr(canonical_method, field.name)
+        if (
+            type(claimed_value) is not type(canonical_value)
+            or claimed_value != canonical_value
+        ):
+            raise ValueError(
+                "resolved method does not match canonical registry"
+            )
+    method = canonical_method
     _validate_resolved_method(method)
     measurement_hash = _require_sha256(
         "measurements_file_sha256", measurements_file_sha256
@@ -335,6 +381,9 @@ def materialize_method_execution(
     }
     config_document = {
         "schema": "materialized-method-config-v1",
+        "methods_registry_protocol_sha256": (
+            METHODS_REGISTRY_PROTOCOL_SHA256
+        ),
         "semantic": semantic,
         "semantic_sha256": semantic_sha256,
         "request": {
@@ -342,6 +391,9 @@ def materialize_method_execution(
             "method_config_id": method.method_config_id,
             "execution_profile": method.execution_profile,
             "method_config_sha256": method.method_config_sha256,
+            "methods_registry_protocol_sha256": (
+                METHODS_REGISTRY_PROTOCOL_SHA256
+            ),
             "semantic_sha256": semantic_sha256,
             "dataset_identity_sha256": dataset_hash,
             "measurements_file_sha256": measurement_hash,
@@ -562,6 +614,9 @@ def materialize_method_execution(
         "method_config_id": method.method_config_id,
         "execution_profile": method.execution_profile,
         "method_config_sha256": method.method_config_sha256,
+        "methods_registry_protocol_sha256": (
+            METHODS_REGISTRY_PROTOCOL_SHA256
+        ),
         "semantic_sha256": semantic_sha256,
         "materialized_config_sha256": config_sha256,
         "dataset_identity_sha256": dataset_hash,
@@ -600,6 +655,7 @@ def materialize_method_execution(
         "stderr_path": str(paths["stderr"]),
     }
     return MaterializedMethodExecution(
+        canonical_method=method,
         argv=wrapped_argv,
         cwd=paths["code"],
         env=env,
@@ -668,6 +724,7 @@ def load_materialized_method_request(
         document,
         {
             "schema",
+            "methods_registry_protocol_sha256",
             "semantic",
             "semantic_sha256",
             "request",
@@ -677,6 +734,14 @@ def load_materialized_method_request(
     )
     if document["schema"] != "materialized-method-config-v1":
         raise ValueError("materialized method config schema is unsupported")
+    registry_protocol_sha256 = _require_sha256(
+        "methods_registry_protocol_sha256",
+        document["methods_registry_protocol_sha256"],
+    )
+    if registry_protocol_sha256 != METHODS_REGISTRY_PROTOCOL_SHA256:
+        raise ValueError(
+            "methods registry protocol hash is not the locked version"
+        )
 
     semantic = _require_json_object(
         document["semantic"],
@@ -708,6 +773,7 @@ def load_materialized_method_request(
             "method_config_id",
             "execution_profile",
             "method_config_sha256",
+            "methods_registry_protocol_sha256",
             "semantic_sha256",
             "dataset_identity_sha256",
             "measurements_file_sha256",
@@ -729,6 +795,10 @@ def load_materialized_method_request(
         "request method_config_sha256",
         request["method_config_sha256"],
     )
+    request_registry_protocol_sha256 = _require_sha256(
+        "request methods_registry_protocol_sha256",
+        request["methods_registry_protocol_sha256"],
+    )
     request_semantic_sha256 = _require_sha256(
         "request semantic_sha256",
         request["semantic_sha256"],
@@ -741,6 +811,11 @@ def load_materialized_method_request(
             "method_config_sha256",
             request_method_sha256,
             method.method_config_sha256,
+        ),
+        (
+            "methods_registry_protocol_sha256",
+            request_registry_protocol_sha256,
+            registry_protocol_sha256,
         ),
         (
             "semantic_sha256",
@@ -935,6 +1010,7 @@ def load_materialized_method_request(
     )
     return MaterializedMethodRequest(
         method=method,
+        methods_registry_protocol_sha256=registry_protocol_sha256,
         algorithm_seed=algorithm_seed,
         dataset_identity_sha256=dataset_identity_sha256,
         measurements_file_sha256=measurements_file_sha256,

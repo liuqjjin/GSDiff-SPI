@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 import hashlib
+import json
 from pathlib import Path
 import re
 from types import MappingProxyType
@@ -23,6 +24,9 @@ _WINDOWS_ABSOLUTE = re.compile(r"(?:[A-Za-z]:[\\/]|\\\\)")
 _STAGING_UUID = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
     flags=re.IGNORECASE,
+)
+METHODS_REGISTRY_PROTOCOL_SHA256 = (
+    "ef3d613267360538f4ac0e6301f6a854b8d0487eecde5ed98cf51ee6a8a0275c"
 )
 
 
@@ -51,6 +55,38 @@ class ResolvedMethod:
     convergence_status: str
     execution_ready: bool
     execution_blockers: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class MethodResolutionRequest:
+    requested_method_id: str
+    requested_method_config_id: str
+    base_config: Mapping[str, object]
+    measurements_metadata: Mapping[str, object]
+    requested_execution_profile: str
+
+    def __post_init__(self) -> None:
+        for name in (
+            "requested_method_id",
+            "requested_method_config_id",
+            "requested_execution_profile",
+        ):
+            value = getattr(self, name)
+            if type(value) is not str or not value:
+                raise ValueError(f"{name} must be a nonempty exact string")
+        object.__setattr__(
+            self,
+            "base_config",
+            _snapshot_json_mapping(self.base_config, name="base_config"),
+        )
+        object.__setattr__(
+            self,
+            "measurements_metadata",
+            _snapshot_json_mapping(
+                self.measurements_metadata,
+                name="measurements_metadata",
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -88,6 +124,8 @@ def resolve_method_semantics(
     _reject_unsafe_semantic_value(base_config)
 
     registry = load_protocol(registry_path)
+    if registry.get("protocol_sha256") != METHODS_REGISTRY_PROTOCOL_SHA256:
+        raise ValueError("methods registry protocol hash is not the locked version")
     aliases = registry["campaign_execution_profile_aliases"]
     assert isinstance(aliases, Mapping)
     requested_profile = execution_profile
@@ -215,6 +253,25 @@ def _freeze_json(value: object) -> object:
     if isinstance(value, list) or isinstance(value, tuple):
         return tuple(_freeze_json(child) for child in value)
     return value
+
+
+def _snapshot_json_mapping(
+    value: object,
+    *,
+    name: str,
+) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{name} must be a mapping")
+    try:
+        snapshot = json.loads(
+            canonical_json_bytes(dict(value)).decode("utf-8", errors="strict")
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{name} must contain exact JSON values") from error
+    frozen = _freeze_json(snapshot)
+    if not isinstance(frozen, Mapping):
+        raise ValueError(f"{name} must be a mapping")
+    return frozen
 
 
 def _validate_base_config(method_id: str, base_config: Mapping[str, object], semantics: Mapping[str, object]) -> None:

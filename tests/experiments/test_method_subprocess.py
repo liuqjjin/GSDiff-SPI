@@ -23,6 +23,7 @@ from gsdiff.experiments.child_outputs import (
 )
 from gsdiff.experiments.execution import materialize_method_execution
 from gsdiff.experiments.methods import (
+    MethodResolutionRequest,
     derive_algorithm_seed,
     resolve_method_semantics,
     thaw_json,
@@ -128,6 +129,18 @@ def _materialize_real(
     if not measurements_source.exists():
         save_acquisition_data(acquisition, measurements_source)
     method = _resolve_smoke(method_id, acquisition)
+    base_config = (
+        {"gaussian_count": 1000}
+        if method_id.startswith("gsdiff_")
+        else {}
+    )
+    measurements_metadata = {
+        "H": acquisition.H,
+        "W": acquisition.W,
+        "T": acquisition.T,
+        "K": acquisition.K,
+        "holdout_K": acquisition.holdout_K,
+    }
     algorithm_seed = derive_algorithm_seed(
         cell_seed=29,
         dataset_identity_sha256=acquisition.dataset_identity_sha256,
@@ -136,6 +149,13 @@ def _materialize_real(
     )
     execution = materialize_method_execution(
         method,
+        resolution_request=MethodResolutionRequest(
+            requested_method_id=method_id,
+            requested_method_config_id="smoke-default-v1",
+            base_config=base_config,
+            measurements_metadata=measurements_metadata,
+            requested_execution_profile="controller-cpu-smoke-v1",
+        ),
         stage_root=tmp_path / stage_name,
         measurements_source=measurements_source,
         measurements_file_sha256=artifact_sha256(
@@ -306,6 +326,12 @@ def test_real_strict_method_subprocess_is_blind_and_writes_v2(
     )
     assert not any(
         event.get("decision") == "deny" for event in events
+    )
+    assert not any(
+        str(event.get("operation", "")).startswith("socket.")
+        or event.get("operation")
+        in {"socket-unknown", "audit-socket-poisoned"}
+        for event in events
     )
     assert execution.stdout_path.parent != execution.child_output_dir
     assert execution.stderr_path.parent != execution.child_output_dir

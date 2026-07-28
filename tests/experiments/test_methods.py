@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from gsdiff.experiments import methods as methods_module
 from gsdiff.experiments.methods import (
     CANONICAL_METHOD_IDS,
     canonical_method_id,
@@ -38,6 +39,43 @@ EXPECTED_DIFFUSION_CONFIG = {
 
 def _measurements_metadata() -> dict[str, object]:
     return {"H": 32, "W": 32, "T": 4, "K": 128, "holdout_K": 16}
+
+
+def test_method_resolution_request_snapshots_raw_resolver_inputs() -> None:
+    base_config: dict[str, object] = {"gaussian_count": 1000}
+    metadata = _measurements_metadata()
+
+    request = methods_module.MethodResolutionRequest(
+        requested_method_id="gsdiff_diff",
+        requested_method_config_id="default",
+        base_config=base_config,
+        measurements_metadata=metadata,
+        requested_execution_profile="primary-full-v1",
+    )
+    base_config["gaussian_count"] = 5
+    metadata["T"] = 99
+
+    assert request.requested_method_id == "gsdiff_diff"
+    assert request.requested_method_config_id == "default"
+    assert dict(request.base_config) == {"gaussian_count": 1000}
+    assert dict(request.measurements_metadata) == {
+        "H": 32,
+        "W": 32,
+        "T": 4,
+        "K": 128,
+        "holdout_K": 16,
+    }
+    assert request.requested_execution_profile == "primary-full-v1"
+    with pytest.raises(TypeError):
+        request.base_config["gaussian_count"] = 7  # type: ignore[index]
+    with pytest.raises(TypeError):
+        request.measurements_metadata["T"] = 7  # type: ignore[index]
+
+
+def test_methods_registry_protocol_anchor_is_locked() -> None:
+    assert methods_module.METHODS_REGISTRY_PROTOCOL_SHA256 == (
+        "ef3d613267360538f4ac0e6301f6a854b8d0487eecde5ed98cf51ee6a8a0275c"
+    )
 
 
 def resolve_publication(method_id: str, *, base_config: dict[str, object]):

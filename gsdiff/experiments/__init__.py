@@ -11,6 +11,7 @@ from .identity import (
 from .methods import (
     AlgorithmSeed,
     CheckpointRequirement,
+    MethodResolutionRequest,
     ResolvedMethod,
     canonical_method_id,
     derive_algorithm_seed,
@@ -61,6 +62,7 @@ __all__ = [
     "sha256_bytes",
     "AlgorithmSeed",
     "CheckpointRequirement",
+    "MethodResolutionRequest",
     "ResolvedMethod",
     "canonical_method_id",
     "derive_algorithm_seed",

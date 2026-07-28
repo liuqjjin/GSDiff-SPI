@@ -121,6 +121,40 @@ code, not an OS sandbox. It tests the Python-visible access surface and staged
 closure. The claim does not cover native extensions or direct system calls;
 both can bypass Python hooks and are outside this adversarial claim.
 
+Materialization does not trust a caller-supplied resolved method. The parent
+receives a path-free `MethodResolutionRequest`, resolves its five raw fields
+against the parent-owned registry, and compares every field of the claimed
+`ResolvedMethod` before creating the stage. The locked registry protocol
+SHA-256 is
+`ef3d613267360538f4ac0e6301f6a854b8d0487eecde5ed98cf51ee6a8a0275c`.
+That digest is carried in the materialized config and request; the registry
+file itself is not exposed to the child. A byte-identical registry copy is
+valid, while any semantic or protocol change fails before staging.
+
+On Windows, the path boundary rejects alternate-data-stream syntax in every
+component after the drive or UNC anchor. Completed child-output inventories
+also enumerate NTFS streams on the root and every ordinary entry. Only the
+unnamed primary `::$DATA` stream is accepted, and enumeration errors fail
+closed.
+
+Every `socket.*` audit event is denied. The eleven event/arity pairs are
+locked to the supported CPython 3.12.13 interpreter; an unknown future event
+is recorded as `socket-unknown`. A caught denial poisons the run, produces an
+`audit-socket-poisoned` record, and forces an error terminal. Before installing
+the hook, the bootstrap gives Windows `platform` calls a sanitized view: the
+node and processor are empty, while the machine comes from the interpreter
+build signature. This bypasses both WMI and command fallbacks used by Torch
+without allowing `socket.gethostname`, opening `nul`, starting a process, or
+prefetching a hostname value.
+
+Audit JSONL is canonical UTF-8 JSON with one immutable operation/decision
+schema table shared by the recorder and parent validator. Missing, extra, or
+ill-typed fields, `bool` in an integer field, unknown operations, disallowed
+decisions, noncanonical bytes, misplaced headers or terminals, and malformed
+governed-event arities are rejected before aggregate denial checks.
+`logged_unrelated_events` remains in the policy shape for compatibility but
+must be empty.
+
 Old batch flags require the explicit `--legacy-compatibility` migration path.
 That route is visibly labelled, emits legacy v1 output rather than the strict
 two-file v2 contract, and is nonpromotable by the v2 parent validator. It

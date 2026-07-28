@@ -9,6 +9,21 @@ import subprocess
 import sys
 
 
+_SOCKET_AUDIT_EVENT_ARITIES = {
+    "socket.__new__": 4,
+    "socket.bind": 2,
+    "socket.connect": 2,
+    "socket.getaddrinfo": 5,
+    "socket.gethostbyaddr": 1,
+    "socket.gethostbyname": 1,
+    "socket.gethostname": 0,
+    "socket.getnameinfo": 1,
+    "socket.getservbyname": 2,
+    "socket.getservbyport": 2,
+    "socket.sendto": 2,
+}
+
+
 def _argument(name: str) -> str | None:
     try:
         return sys.argv[sys.argv.index(name) + 1]
@@ -193,6 +208,74 @@ def _emit_copy_file2_event(
         raise RuntimeError(f"unknown CopyFile2 audit action: {action}")
 
 
+def _emit_socket_event(action: str) -> None:
+    known_prefix = "audit-socket-known-"
+    malformed_prefix = "audit-socket-malformed-"
+    if action.startswith(malformed_prefix):
+        event = action[len(malformed_prefix) :]
+        try:
+            arity = _SOCKET_AUDIT_EVENT_ARITIES[event]
+        except KeyError as error:
+            raise RuntimeError(
+                f"unknown malformed socket event: {event}"
+            ) from error
+        sys.audit(event, *((None,) * (arity + 1)))
+    elif action.startswith(known_prefix):
+        event = action[len(known_prefix) :]
+        try:
+            arity = _SOCKET_AUDIT_EVENT_ARITIES[event]
+        except KeyError as error:
+            raise RuntimeError(
+                f"unknown synthetic socket event: {event}"
+            ) from error
+        sys.audit(event, *((None,) * arity))
+    elif action == "audit-socket-unknown":
+        sys.audit(
+            "socket.future_transport",
+            "secret-address",
+            17,
+            object(),
+        )
+    else:
+        raise RuntimeError(f"unknown socket audit action: {action}")
+
+
+def _emit_malformed_arity_event(action: str, target: Path) -> None:
+    one_path_events = {
+        "audit-arity-listdir": "os.listdir",
+        "audit-arity-scandir": "os.scandir",
+        "audit-arity-add-dll-directory": "os.add_dll_directory",
+        "audit-arity-chdir": "os.chdir",
+    }
+    if action == "audit-arity-open":
+        sys.audit("open", str(target), "r", 0, "extra")
+    elif action in one_path_events:
+        sys.audit(one_path_events[action], str(target), "extra")
+    elif action == "audit-arity-create-file":
+        sys.audit("_winapi.CreateFile", str(target), 0, 1, 0)
+    elif action == "audit-arity-create-junction":
+        sys.audit("_winapi.CreateJunction", str(target))
+    elif action == "audit-arity-copy-file2":
+        sys.audit("_winapi.CopyFile2", str(target), str(target))
+    else:
+        raise RuntimeError(f"unknown malformed arity action: {action}")
+
+
+def _trigger_caught_socket_poison() -> None:
+    try:
+        sys.audit("socket.gethostname")
+    except PermissionError:
+        print("SOCKET-DENIED-CAUGHT")
+    else:
+        raise RuntimeError("socket event unexpectedly succeeded")
+    try:
+        sys.audit("os.putenv", b"GSDIFF_SOCKET_POISON", b"1")
+    except PermissionError:
+        print("POISONED-GOVERNED-DENIED-CAUGHT")
+    else:
+        raise RuntimeError("poisoned governed event unexpectedly succeeded")
+
+
 def _trigger_reentry(
     *,
     action: str,
@@ -354,6 +437,38 @@ def main() -> None:
                 safe_path=target,
                 forbidden_path=second,
             )
+        elif action == "socket-real-new":
+            import socket
+
+            socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        elif action == "socket-caught-poison":
+            _trigger_caught_socket_poison()
+        elif action == "platform-node":
+            import platform
+
+            print(f"PLATFORM-NODE={platform.node()}")
+        elif action == "platform-wmi-unavailable":
+            import platform
+
+            def unavailable_wmi(*_arguments: object) -> tuple[object, ...]:
+                raise OSError("forced WMI outage")
+
+            platform._wmi_query = unavailable_wmi
+            print(f"PLATFORM-NODE={platform.node()}")
+            print(f"PLATFORM-MACHINE={platform.machine()}")
+            print(f"PLATFORM-PROCESSOR={platform.processor()}")
+        elif action == "audit-unknown-process":
+            sys.audit(
+                "subprocess.future_spawn",
+                "secret-command-payload",
+            )
+        elif action is not None and action.startswith("audit-arity-"):
+            assert target is not None
+            _emit_malformed_arity_event(action, target)
+        elif action is not None and action.startswith(
+            "audit-socket-"
+        ):
+            _emit_socket_event(action)
         elif action is not None and action.startswith(
             "audit-copy-file2-"
         ):

@@ -1,6 +1,8 @@
 """Deterministic NPY/ZIP and atomic file I/O for SPI artifacts."""
 
 from dataclasses import dataclass, field
+import ctypes
+from ctypes import wintypes
 import hashlib
 import io
 import json
@@ -30,6 +32,20 @@ _REPARSE_POINT = getattr(
     stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400
 )
 _StatSignature = tuple[int, int, int, int, int, int]
+_ERROR_HANDLE_EOF = 38
+_INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+_MAX_PATH = 260
+_MAX_ALTERNATE = 36
+
+
+class _WIN32_FIND_STREAM_DATA(ctypes.Structure):
+    _fields_ = [
+        ("StreamSize", ctypes.c_longlong),
+        (
+            "cStreamName",
+            wintypes.WCHAR * (_MAX_PATH + _MAX_ALTERNATE),
+        ),
+    ]
 
 
 @dataclass(frozen=True)
@@ -98,6 +114,61 @@ def _reject_linked_ancestors(path: Path) -> None:
         if parent == current:
             return
         current = parent
+
+
+def _reject_windows_named_streams(path: Path) -> None:
+    if os.name != "nt":
+        return
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    find_first = kernel32.FindFirstStreamW
+    find_first.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        ctypes.POINTER(_WIN32_FIND_STREAM_DATA),
+        wintypes.DWORD,
+    )
+    find_first.restype = wintypes.HANDLE
+    find_next = kernel32.FindNextStreamW
+    find_next.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(_WIN32_FIND_STREAM_DATA),
+    )
+    find_next.restype = wintypes.BOOL
+    find_close = kernel32.FindClose
+    find_close.argtypes = (wintypes.HANDLE,)
+    find_close.restype = wintypes.BOOL
+
+    data = _WIN32_FIND_STREAM_DATA()
+    ctypes.set_last_error(0)
+    handle = find_first(str(path), 0, ctypes.byref(data), 0)
+    if handle == _INVALID_HANDLE_VALUE:
+        error = ctypes.get_last_error()
+        if error == _ERROR_HANDLE_EOF:
+            return
+        raise ArtifactValidationError(
+            f"cannot enumerate Windows data streams: {path}"
+        )
+    try:
+        while True:
+            stream_name = str(data.cStreamName)
+            if stream_name.casefold() != "::$data":
+                raise ArtifactValidationError(
+                    f"Windows named stream rejected: {path}"
+                )
+            ctypes.set_last_error(0)
+            if find_next(handle, ctypes.byref(data)):
+                continue
+            error = ctypes.get_last_error()
+            if error == _ERROR_HANDLE_EOF:
+                break
+            raise ArtifactValidationError(
+                f"cannot enumerate Windows data streams: {path}"
+            )
+    finally:
+        if not find_close(handle):
+            raise ArtifactValidationError(
+                f"cannot close Windows stream enumeration handle: {path}"
+            )
 
 
 def _validate_regular_snapshot_stat(
@@ -248,6 +319,7 @@ def _capture_directory_entries(
                 raise ArtifactValidationError(
                     f"linked inventory path rejected: {path}"
                 )
+            _reject_windows_named_streams(path)
             relative = path.relative_to(root).as_posix()
             if stat.S_ISDIR(info.st_mode):
                 entries.append((relative, _stat_signature(info)))
@@ -271,6 +343,7 @@ def capture_directory_inventory(root: Path) -> DirectoryInventory:
         raise TypeError("inventory root must be a Path")
     absolute = root.absolute()
     _reject_linked_ancestors(absolute)
+    _reject_windows_named_streams(absolute)
     try:
         before = os.lstat(absolute)
     except OSError as error:
@@ -282,6 +355,7 @@ def capture_directory_inventory(root: Path) -> DirectoryInventory:
             "inventory root must be a real directory"
         )
     entries = _capture_directory_entries(absolute)
+    _reject_windows_named_streams(absolute)
     try:
         after = os.lstat(absolute)
     except OSError as error:

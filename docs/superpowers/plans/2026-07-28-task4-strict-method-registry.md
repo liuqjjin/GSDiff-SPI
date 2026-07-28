@@ -1571,6 +1571,7 @@ git commit -m "feat: add strict GSDiff method adapter"
 ```python
 @dataclass(frozen=True)
 class MaterializedMethodExecution:
+    canonical_method: ResolvedMethod
     argv: tuple[str, ...]
     cwd: Path
     env: Mapping[str, str]
@@ -1603,11 +1604,16 @@ class MaterializedMethodRequest:
     checkpoint_paths: Mapping[str, Path]
     requested_runtime_device: str
     child_runtime_device: str
+    methods_registry_protocol_sha256: str = (
+        METHODS_REGISTRY_PROTOCOL_SHA256
+    )
 
 
 def materialize_method_execution(
     method: ResolvedMethod,
     *,
+    resolution_request: MethodResolutionRequest | None = None,
+    registry_path: Path = Path("configs/protocols/methods-v1.yaml"),
     stage_root: Path,
     measurements_source: Path,
     measurements_file_sha256: str,
@@ -2131,3 +2137,48 @@ After clean review:
 ```powershell
 git push origin debug/admm-vs-sgd
 ```
+
+## Global formal review round 1 boundary addendum
+
+The first global review identified four boundary defects that must be fixed in
+one ordered TDD sequence without changing scientific method semantics,
+profiles, checkpoint declarations, reconstruction arrays, or publication
+claims:
+
+1. reconstruct a frozen five-field resolution request and independently
+   resolve it against the parent-owned registry before staging;
+2. reject Windows ADS syntax lexically and enumerate NTFS streams during
+   child-output inventory capture and verification;
+3. deny every locked or future `socket.*` event, poison caught attempts, and
+   keep real DGI and GSDiff-TV imports socket-free without an exception;
+4. replace open-ended audit-log parsing with one closed-world schema table
+   shared by recorder and validator.
+
+The registry protocol digest is fixed at
+`ef3d613267360538f4ac0e6301f6a854b8d0487eecde5ed98cf51ee6a8a0275c`.
+Materialized configuration and child request transport the digest, not the
+registry path. Every claimed `ResolvedMethod` field must equal the independent
+result, and any mismatch must leave the proposed stage absent.
+
+The socket contract is the eleven-event CPython 3.12.13 table recorded in the
+design review. Known events record expected and observed arity; unknown names
+use `socket-unknown`. The first attempt poisons the audit boundary, so
+finalization emits `audit-socket-poisoned` and an error terminal even if the
+child catches the denial. `platform.node()` is made empty before hook
+installation, and `platform.machine()` is derived from the interpreter build
+signature. The sanitized platform view bypasses WMI and system-command
+fallbacks, so no socket operation is allowed or prefetched and no `nul` handle
+or nested process is needed.
+
+Audit descriptors must fix exact keys, types, enums, decisions, constants, and
+malformed sentinels. `record()` validates before incrementing sequence or
+writing bytes. Parent validation requires canonical JSON bytes and performs
+schema checks before the aggregate denial check. Unknown OS/process prefix
+events are represented by fixed denial schemas carrying `source_operation`;
+arbitrary unknown operations under either decision are invalid.
+
+Final verification uses only `D:\conda\envs\spi\python.exe`, disables the
+pytest cache provider, documents every skip, proves real NTFS ADS execution,
+proves real audited DGI and GSDiff-TV CPU smoke without socket records, checks
+that `configs/protocols` has no diff from the required base, and runs the full
+non-CUDA, compile, diff, scope, independent-review, and exact-stage gates.
