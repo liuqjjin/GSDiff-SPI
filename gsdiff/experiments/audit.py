@@ -104,8 +104,10 @@ _DIRECT_WINDOWS_FILESYSTEM_EVENT_ARITIES = MappingProxyType(
     {
         "_winapi.CreateFile": 5,
         "_winapi.CreateJunction": 2,
+        "_winapi.CopyFile2": 3,
     }
 )
+_COPY_FILE2_ALLOWED_FLAGS = 0
 _MAX_AUDIT_LOG_BYTES = 128 * 1024 * 1024
 
 
@@ -314,6 +316,8 @@ class _AuditBoundary:
                     destination_path=second,
                 )
                 raise PermissionError(f"audit policy denied {event}")
+            elif event == "_winapi.CopyFile2":
+                self._audit_copy_file2(arguments)
             elif event in _DIRECT_WINDOWS_FILESYSTEM_EVENT_ARITIES:
                 if (
                     len(arguments)
@@ -482,6 +486,67 @@ class _AuditBoundary:
             )
             return
         self._deny_path("open", display)
+
+    def _audit_copy_file2(
+        self,
+        arguments: tuple[object, ...],
+    ) -> None:
+        event = "_winapi.CopyFile2"
+        if len(arguments) != _DIRECT_WINDOWS_FILESYSTEM_EVENT_ARITIES[event]:
+            self._deny_path(event, "<invalid-arguments>")
+        raw_source, raw_destination, flags = arguments
+        if (
+            type(raw_source) is not str
+            or type(raw_destination) is not str
+            or type(flags) is not int
+            or flags != _COPY_FILE2_ALLOWED_FLAGS
+        ):
+            source = (
+                raw_source
+                if type(raw_source) is str
+                else f"<unsupported:{type(raw_source).__name__}>"
+            )
+            destination = (
+                raw_destination
+                if type(raw_destination) is str
+                else f"<unsupported:{type(raw_destination).__name__}>"
+            )
+            self.record(
+                event,
+                decision="deny",
+                resolved_path=source,
+                destination_path=destination,
+                flags=flags if type(flags) is int else "<invalid>",
+            )
+            raise PermissionError(f"audit policy denied {event}")
+        read_allowed, source = self._authorize_path(
+            raw_source,
+            exact_paths=self._exact_reads,
+            roots=self._read_roots,
+        )
+        write_allowed, destination = self._authorize_path(
+            raw_destination,
+            exact_paths=(),
+            roots=self._write_roots,
+            reject_unsafe_write_leaf=True,
+        )
+        allowed = (
+            read_allowed
+            and write_allowed
+            and _is_regular_single_link_file(source)
+            and _is_safe_copy_destination(destination)
+        )
+        self.record(
+            event,
+            decision="allow" if allowed else "deny",
+            resolved_path=source,
+            destination_path=destination,
+            flags=flags,
+        )
+        if not allowed:
+            raise PermissionError(
+                f"audit policy denied {event}: {source} -> {destination}"
+            )
 
     def _authorize_path(
         self,
@@ -722,6 +787,20 @@ def _reject_unsafe_write_leaf(path: Path) -> None:
         raise ValueError(
             f"write target must be a single-link regular file: {path}"
         )
+
+
+def _is_regular_single_link_file(path: str) -> bool:
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+
+
+def _is_safe_copy_destination(path: str) -> bool:
+    if not os.path.lexists(path):
+        return True
+    return _is_regular_single_link_file(path)
 
 
 def _matches_policy_path(

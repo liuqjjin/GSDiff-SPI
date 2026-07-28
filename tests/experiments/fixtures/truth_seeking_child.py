@@ -167,6 +167,32 @@ def _emit_mutation_event(
         raise RuntimeError(f"unknown synthetic mutation action: {action}")
 
 
+def _emit_copy_file2_event(
+    action: str,
+    source: Path,
+    destination: Path,
+) -> None:
+    event = "_winapi.CopyFile2"
+    if action == "audit-copy-file2-malformed-arity":
+        sys.audit(event, str(source), str(destination))
+    elif action == "audit-copy-file2-pathlike-source":
+        sys.audit(event, source, str(destination), 0)
+    elif action == "audit-copy-file2-pathlike-destination":
+        sys.audit(event, str(source), destination, 0)
+    elif action == "audit-copy-file2-source-fd":
+        sys.audit(event, 17, str(destination), 0)
+    elif action == "audit-copy-file2-destination-fd":
+        sys.audit(event, str(source), 17, 0)
+    elif action == "audit-copy-file2-invalid-flags":
+        sys.audit(event, str(source), str(destination), "invalid")
+    elif action == "audit-copy-file2-negative-flags":
+        sys.audit(event, str(source), str(destination), -1)
+    elif action == "audit-copy-file2-unknown-flags":
+        sys.audit(event, str(source), str(destination), 0x80000000)
+    else:
+        raise RuntimeError(f"unknown CopyFile2 audit action: {action}")
+
+
 def _trigger_reentry(
     *,
     action: str,
@@ -196,6 +222,15 @@ def _trigger_reentry(
                         ],
                         check=True,
                         shell=False,
+                    )
+                elif action == "reentry-copyfile2":
+                    import _winapi
+
+                    _winapi.CopyFile2(
+                        str(safe_path),
+                        str(forbidden_path),
+                        0,
+                        None,
                     )
                 else:
                     raise RuntimeError(
@@ -295,13 +330,35 @@ def main() -> None:
             import _winapi
 
             _winapi.CreateJunction(str(target), str(second))
-        elif action in {"reentry-open", "reentry-process"}:
+        elif action in {
+            "winapi-copy-file2",
+            "winapi-copy-file2-source-write",
+        }:
+            assert target is not None and second is not None
+            import _winapi
+
+            flags = (
+                _winapi.COPY_FILE_OPEN_SOURCE_FOR_WRITE
+                if action == "winapi-copy-file2-source-write"
+                else 0
+            )
+            _winapi.CopyFile2(str(target), str(second), flags, None)
+        elif action in {
+            "reentry-open",
+            "reentry-process",
+            "reentry-copyfile2",
+        }:
             assert target is not None and second is not None
             _trigger_reentry(
                 action=action,
                 safe_path=target,
                 forbidden_path=second,
             )
+        elif action is not None and action.startswith(
+            "audit-copy-file2-"
+        ):
+            assert target is not None and second is not None
+            _emit_copy_file2_event(action, target, second)
         elif action is not None and action.startswith("audit-"):
             assert target is not None
             _emit_mutation_event(action, target)

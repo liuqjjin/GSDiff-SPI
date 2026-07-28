@@ -1759,6 +1759,15 @@ def load_audit_events(path: Path) -> list[dict[str, object]]:
     ]
 
 
+def require_windows_copy_file2() -> None:
+    if os.name != "nt":
+        pytest.skip("_winapi.CopyFile2 is Windows-only")
+    import _winapi
+
+    if not hasattr(_winapi, "CopyFile2"):
+        pytest.skip("_winapi.CopyFile2 is unavailable")
+
+
 @pytest.mark.parametrize("kind", ["measurements", "config", "code", "policy"])
 def test_audit_allows_and_logs_declared_reads(
     tmp_path: Path,
@@ -2271,6 +2280,195 @@ def test_audit_denies_direct_windows_filesystem_primitives(
 
 
 @pytest.mark.parametrize(
+    "attack",
+    ["forbidden-source", "outside-destination"],
+)
+def test_audit_denies_windows_copy_file2_policy_bypasses(
+    tmp_path: Path,
+    attack: str,
+) -> None:
+    require_windows_copy_file2()
+    outside = tmp_path / "outside-copy-file2"
+    outside.mkdir()
+    forbidden_source = outside / "forbidden-source.bin"
+    forbidden_source.write_bytes(b"SECRET")
+    source, digest = measurement_source(tmp_path)
+    execution = materialize(tmp_path / "stage", source, digest)
+    if attack == "forbidden-source":
+        copy_source = forbidden_source
+        destination = execution.child_output_dir / "copied-secret.bin"
+    else:
+        copy_source = execution.measurements_path
+        destination = outside / "escaped-measurements.bin"
+
+    result = run_audited_child(
+        execution,
+        action="winapi-copy-file2",
+        target=copy_source,
+        target2=destination,
+        expect_denied=True,
+    )
+
+    events = load_audit_events(execution.audit_log_path)
+    assert not destination.exists(), (
+        f"CopyFile2 escaped its policy boundary; audit events: {events!r}"
+    )
+    assert result.returncode == 0, execution.stderr_path.read_text(
+        encoding="utf-8", errors="strict"
+    )
+    assert any(
+        event.get("operation") == "_winapi.CopyFile2"
+        and event.get("decision") == "deny"
+        and event.get("resolved_path") == str(copy_source.resolve())
+        and event.get("destination_path") == str(destination.resolve())
+        for event in events
+    )
+
+
+def test_audit_allows_windows_copy_file2_with_declared_paths(
+    tmp_path: Path,
+) -> None:
+    require_windows_copy_file2()
+    source, digest = measurement_source(tmp_path)
+    execution = materialize(tmp_path / "stage", source, digest)
+    destination = execution.child_output_dir / "allowed-copy.bin"
+
+    result = run_audited_child(
+        execution,
+        action="winapi-copy-file2",
+        target=execution.measurements_path,
+        target2=destination,
+    )
+
+    assert result.returncode == 0, execution.stderr_path.read_text(
+        encoding="utf-8", errors="strict"
+    )
+    assert destination.read_bytes() == execution.measurements_path.read_bytes()
+    events = load_audit_events(execution.audit_log_path)
+    assert any(
+        event.get("operation") == "_winapi.CopyFile2"
+        and event.get("decision") == "allow"
+        and event.get("resolved_path")
+        == str(execution.measurements_path.resolve())
+        and event.get("destination_path") == str(destination.resolve())
+        for event in events
+    )
+    validate_audit_log(
+        execution.audit_log_path,
+        expected_policy_sha256=execution.audit_policy_sha256,
+    )
+
+
+def test_audit_denies_windows_copy_file2_source_write_flag(
+    tmp_path: Path,
+) -> None:
+    require_windows_copy_file2()
+    source, digest = measurement_source(tmp_path)
+    execution = materialize(tmp_path / "stage", source, digest)
+    destination = execution.child_output_dir / "source-write-copy.bin"
+
+    result = run_audited_child(
+        execution,
+        action="winapi-copy-file2-source-write",
+        target=execution.measurements_path,
+        target2=destination,
+        expect_denied=True,
+    )
+
+    events = load_audit_events(execution.audit_log_path)
+    assert not destination.exists(), (
+        f"source-write CopyFile2 escaped; audit events: {events!r}"
+    )
+    assert result.returncode == 0, execution.stderr_path.read_text(
+        encoding="utf-8", errors="strict"
+    )
+    assert any(
+        event.get("operation") == "_winapi.CopyFile2"
+        and event.get("decision") == "deny"
+        for event in events
+    )
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        "audit-copy-file2-malformed-arity",
+        "audit-copy-file2-pathlike-source",
+        "audit-copy-file2-pathlike-destination",
+        "audit-copy-file2-source-fd",
+        "audit-copy-file2-destination-fd",
+        "audit-copy-file2-invalid-flags",
+        "audit-copy-file2-negative-flags",
+        "audit-copy-file2-unknown-flags",
+    ],
+)
+def test_audit_denies_malformed_windows_copy_file2_events(
+    tmp_path: Path,
+    action: str,
+) -> None:
+    require_windows_copy_file2()
+    source, digest = measurement_source(tmp_path)
+    execution = materialize(tmp_path / "stage", source, digest)
+    destination = execution.child_output_dir / "malformed-copy.bin"
+
+    result = run_audited_child(
+        execution,
+        action=action,
+        target=execution.measurements_path,
+        target2=destination,
+        expect_denied=True,
+    )
+
+    assert result.returncode == 0, execution.stderr_path.read_text(
+        encoding="utf-8", errors="strict"
+    )
+    assert not destination.exists()
+    events = load_audit_events(execution.audit_log_path)
+    assert any(
+        event.get("operation") == "_winapi.CopyFile2"
+        and event.get("decision") == "deny"
+        for event in events
+    )
+
+
+@pytest.mark.parametrize(
+    "directory_side",
+    ["source", "destination"],
+)
+def test_audit_denies_windows_copy_file2_directory_shapes(
+    tmp_path: Path,
+    directory_side: str,
+) -> None:
+    require_windows_copy_file2()
+    source, digest = measurement_source(tmp_path)
+    execution = materialize(tmp_path / "stage", source, digest)
+    destination = execution.child_output_dir / "directory-copy.bin"
+    copy_source = execution.measurements_path
+    if directory_side == "source":
+        copy_source = execution.cwd
+    else:
+        destination = execution.child_output_dir
+
+    result = run_audited_child(
+        execution,
+        action="winapi-copy-file2",
+        target=copy_source,
+        target2=destination,
+        expect_denied=True,
+    )
+
+    assert result.returncode == 0, execution.stderr_path.read_text(
+        encoding="utf-8", errors="strict"
+    )
+    events = load_audit_events(execution.audit_log_path)
+    assert any(
+        event.get("operation") == "_winapi.CopyFile2"
+        and event.get("decision") == "deny"
+        for event in events
+    )
+
+
+@pytest.mark.parametrize(
     "action",
     ["chown", "chflags", "setxattr", "removexattr", "mknod"],
 )
@@ -2392,6 +2590,7 @@ def test_audit_hook_is_installed_before_strict_child_code(
     [
         ("reentry-open", "open"),
         ("reentry-process", "subprocess.Popen"),
+        ("reentry-copyfile2", "_winapi.CopyFile2"),
     ],
 )
 def test_audit_governed_reentry_poisons_caught_child_execution(
@@ -2428,7 +2627,7 @@ def test_audit_governed_reentry_poisons_caught_child_execution(
     assert "REENTRY-LEAK=" not in stdout
     assert "REENTRY-DENIED-CAUGHT" in stdout
     assert "REENTRY-OUTER-DENIED-CAUGHT" in stdout
-    if action == "reentry-process":
+    if action in {"reentry-process", "reentry-copyfile2"}:
         assert not forbidden.exists()
     events = load_audit_events(execution.audit_log_path)
     assert any(
