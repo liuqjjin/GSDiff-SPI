@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 from pathlib import Path
 
 import pytest
@@ -161,3 +162,47 @@ def test_algorithm_seed_rejects_noncanonical_hashes(invalid_hash: str) -> None:
 def test_path_hygiene_precedes_override_validation(value: object) -> None:
     with pytest.raises(ValueError, match="path"):
         resolve_publication("dgi", base_config={"unexpected": value})
+
+
+def test_all_methods_use_the_locked_execution_family_and_entrypoint() -> None:
+    expected_families = {
+        **{method_id: "baseline" for method_id in METHODS[:7]},
+        **{method_id: "gsdiff" for method_id in METHODS[7:]},
+    }
+    for method_id, family in expected_families.items():
+        base_config = {"gaussian_count": 1000} if method_id.startswith("gsdiff_") else {}
+        method = resolve_publication(method_id, base_config=base_config)
+        expected_entrypoint = "train.py" if family == "gsdiff" else "scripts/run_baselines.py"
+        assert method.execution_family == family
+        assert method.command_template[:2] == ("${PYTHON}", expected_entrypoint)
+
+
+@pytest.mark.parametrize(
+    "method_id", ["siren", "recinr_se2", "gsdiff_tv", "gsdiff_diffusion"]
+)
+@pytest.mark.parametrize(
+    ("profile", "config_id"),
+    [("publication-v1", "default"), ("controller-cpu-smoke-v1", "smoke-default-v1")],
+)
+def test_gsdiff_profiles_bind_all_shared_constructor_semantics(method_id: str, profile: str, config_id: str) -> None:
+    base_config = {"gaussian_count": 1000} if method_id.startswith("gsdiff_") else {}
+    method = resolve_method_semantics(method_id, method_config_id=config_id, base_config=base_config, measurements_metadata=_measurements_metadata(), execution_profile=profile, registry_path=REGISTRY)
+    assert dict(method.semantic_config["motion"]) == {
+        "enable_rotation": True,
+        "polynomial_degree": 1,
+        "enable_affine": False,
+    }
+    solver = method.semantic_config["solver"]
+    assert solver["loss_norm"] == "zscore"
+    assert solver["lr_motion"] == 0.15
+    assert solver["tv_weight"] == 0.005
+    if method_id == "siren":
+        assert solver["motion_warmup_steps"] == 0
+
+
+def test_tv_smoke_motion_warmup_integer_matches_zero_fraction() -> None:
+    method = resolve_method_semantics("gsdiff_tv", method_config_id="smoke-default-v1", base_config={"gaussian_count": 1000}, measurements_metadata=_measurements_metadata(), execution_profile="controller-cpu-smoke-v1", registry_path=REGISTRY)
+    solver = method.semantic_config["solver"]
+    assert solver["motion_warmup_fraction"] == 0.0
+    assert solver["motion_warmup_outer"] == 0
+    assert solver["motion_warmup_outer"] == math.ceil(solver["motion_warmup_fraction"] * solver["outer_iterations"])

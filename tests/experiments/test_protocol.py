@@ -578,6 +578,23 @@ def test_method_registry_nested_contract_mutations_fail_after_rehash(mutate, mes
         protocol.validate_protocol(invalid)
 
 
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda document: document["methods"][0]["profiles"]["publication-v1"].__setitem__("method_config_id", "changed"),
+        lambda document: document["methods"][0]["profiles"]["controller-cpu-smoke-v1"].__setitem__("method_config_id", "changed"),
+        lambda document: document["methods"][0]["profiles"]["ablation-selection-v1"].__setitem__("method_config_id", "changed"),
+        lambda document: next(entry for entry in document["methods"] if entry["id"] == "gsdiff_diffusion")["profiles"]["publication-v1"].update({"publication_eligible": True, "selection_eligible": True, "promotion_eligible": True, "execution_ready": True, "execution_blockers": []}),
+    ],
+)
+def test_method_registry_rejects_rehashed_profile_policy_mutations(mutate):
+    invalid = copy.deepcopy(_load("methods-v1.yaml"))
+    mutate(invalid)
+    _refresh_hashes(invalid)
+    with pytest.raises(ValueError, match="profile policy"):
+        protocol.validate_protocol(invalid)
+
+
 def test_ablation_axes_shortlist_lanes_and_workflow_counts_are_locked():
     ablations = _load("ablations-v1.yaml")
 
