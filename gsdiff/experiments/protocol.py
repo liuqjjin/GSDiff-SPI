@@ -28,6 +28,19 @@ _METHODS = (
     "gsdiff_tv",
     "gsdiff_diffusion",
 )
+_METHOD_PROFILE_SEMANTIC_SHA256 = {
+    "dgi": ("43ca8aa144afd1dc592a2dab12d90e2536b3dbd478024f70605fd88774588834", "3c0929cc135db0fdee8042bd84f018d2854d8a60d866951e31a459f8d0b81868", "96e8e763676f162bf902f18242f530d8e256b347ef89b8cbc016599a8332109f"),
+    "static_cs": ("a32acad6eef82e11954d091908deb97e72398030b1423a74eff178489fd9fdb7", "5a462259025ec7a0411d670c99bc03af1c1c355a52707ca902c8b55c889be7b9", "96e8e763676f162bf902f18242f530d8e256b347ef89b8cbc016599a8332109f"),
+    "perframe_cs": ("e1891788145d28ab1b20cda5b5490c4f1c7773d97e53b7bdd4b4fb79d515d64a", "5a462259025ec7a0411d670c99bc03af1c1c355a52707ca902c8b55c889be7b9", "96e8e763676f162bf902f18242f530d8e256b347ef89b8cbc016599a8332109f"),
+    "tv3d": ("92e600f8984f660f782bc95e907d06043e7f4717ad1a5c535409e226e0b88496", "44766d015599b48c0b14dac06bad9c6371a178931e5c544e5e1ee5613c3a5ae3", "96e8e763676f162bf902f18242f530d8e256b347ef89b8cbc016599a8332109f"),
+    "monin": ("96d41e9ee44120c30572c9d6202dd7aa5464a2fc4bc275da0dd324c34848e11e", "99f0ef76bdf5cdd0781c1f752db00881fb5d799e3be1382b1430b92849a1e855", "96e8e763676f162bf902f18242f530d8e256b347ef89b8cbc016599a8332109f"),
+    "gidc3dtv": ("d56f9f22fb904c91eb24ad11614ab330778b57596bf01d95d01eb70c3afa24aa", "5780f7de67e97716c400243d923b0f42195839a73aeaa09a5ff3f2dc9a890082", "96e8e763676f162bf902f18242f530d8e256b347ef89b8cbc016599a8332109f"),
+    "recinr": ("adb866544a3bf45bc65f6556458ddb3077905a9cbe87d09cd47f82550d7e0218", "7b684716b1a6b9ea1a1f65f2c2d84f3ff3654535f9e4c552af972f55e274dfd8", "96e8e763676f162bf902f18242f530d8e256b347ef89b8cbc016599a8332109f"),
+    "siren": ("f5b53f0b3570da2d9df1fa1a5442d07f72aad492e3b58d3abe960ef1e9563b00", "2a97adaa85ea593221c00722570207a42388c760370a95a8c1c2dcdf0d15a3f0", "96e8e763676f162bf902f18242f530d8e256b347ef89b8cbc016599a8332109f"),
+    "recinr_se2": ("063c538236ae7a8f78b5c42208e4b3ea67f70bd4130c1049ecce126aa30fbba0", "c3c1720460526559e12601e3087c792140edeca702a4f95cba2813a13488375d", "96e8e763676f162bf902f18242f530d8e256b347ef89b8cbc016599a8332109f"),
+    "gsdiff_tv": ("cc7b8b968367b5671a3cb906abee7d88b975ef83b1857120b5f71883c9c0436e", "7fda3af00f941b865d4b0ecc004309d50eef838ed48ef7d765bba03fb5a02278", "b35e21f70c6b3a2a32235709a2f5a9bf16cbe3fe0917ed178565c89982a8c905"),
+    "gsdiff_diffusion": ("5c35e4d0817d71a47c1ef806ad6154be1354585cdd48a5d05703ea2bd4635eb5", "0974b538b682a1bdda02f87bb34d697494e9a4135cb43d7e1213a9d87a22d1bf", "fe76b8f92ba4ba6fc735648d6c528c43d1dbf2c17b91b46dd5fe8d0d1a376477"),
+}
 _TARGETS = {
     "tank": "assets/tank.png",
     "digit5": "char:5",
@@ -692,6 +705,8 @@ def _validate_methods_registry(protocol: Mapping[str, object]) -> None:
     keys = {
         "schema_version",
         "document_kind",
+        "campaign_execution_profile_aliases",
+        "pilot_method_config_aliases",
         "methods",
         "primary_method",
         "secondary_diffusion_method",
@@ -713,13 +728,82 @@ def _validate_methods_registry(protocol: Mapping[str, object]) -> None:
         "gsdiff_tv": "tv",
         "gsdiff_diffusion": "diffusion",
     }
+    if document["campaign_execution_profile_aliases"] != {
+        "primary-full-v1": "publication-v1",
+        "supplement-full-v1": "publication-v1",
+        "ood-full-v1": "publication-v1",
+        "failure-budget-v1": "publication-v1",
+        "pilot-smoke-v1": "controller-cpu-smoke-v1",
+        "ablation-selection-v1": "ablation-selection-v1",
+    }:
+        raise ValueError("campaign execution profile aliases are not locked")
+    if document["pilot_method_config_aliases"] != {
+        "pilot-smoke-v1": {"default": "smoke-default-v1"}
+    }:
+        raise ValueError("pilot method config aliases are not locked")
     entries = _require_list("methods", document["methods"])
     ids = []
     for entry in entries:
-        method = _require_exact_keys("method entry", entry, {"id", "lane"})
+        method = _require_exact_keys(
+            "method entry", entry,
+            {"id", "lane", "execution_family", "command_template",
+             "required_child_outputs", "checkpoints", "profiles"},
+        )
         ids.append(_require_string("method.id", method["id"]))
         if method["lane"] != expected_lanes.get(method["id"]):
             raise ValueError(f"method {method['id']!r} has an invalid diffusion/TV lane")
+        family = "gsdiff" if method["id"].startswith("gsdiff_") else "baseline"
+        if method["execution_family"] != family:
+            raise ValueError("method execution family is not locked")
+        entrypoint = "train.py" if family == "gsdiff" else "scripts/run_baselines.py"
+        expected_command = [
+            "${PYTHON}", entrypoint, "--method", method["id"], "--dataset",
+            "${MEASUREMENTS_PATH}", "--dataset-identity-sha256",
+            "${DATASET_IDENTITY_SHA256}", "--method-config",
+            "${METHOD_CONFIG_PATH}", "--algorithm-seed", "${ALGORITHM_SEED}",
+            "--device", "${DEVICE}", "--output-dir", "${OUTPUT_DIR}",
+        ]
+        if method["id"] == "gsdiff_diffusion":
+            expected_command += ["--checkpoint", "gsdiff-diffusion-prior-v1=${CHECKPOINT:gsdiff-diffusion-prior-v1}"]
+        if method["command_template"] != expected_command:
+            raise ValueError("method command template is not locked")
+        if method["required_child_outputs"] != ["reconstruction.npz", "method-info.json"]:
+            raise ValueError("method required child outputs are not locked")
+        expected_checkpoints: list[object] = []
+        if method["id"] == "gsdiff_diffusion":
+            expected_checkpoints = [{
+                "logical_id": "gsdiff-diffusion-prior-v1",
+                "sha256": "667948800911acb9f9a7271e20af5692b0f007007d0fc32a15ac169eba32c5dd",
+                "provenance_status": "blocked-missing-training-provenance",
+            }]
+        if method["checkpoints"] != expected_checkpoints:
+            raise ValueError("method checkpoint declaration is not locked")
+        profiles = _require_exact_keys(
+            "method profiles", method["profiles"],
+            {"publication-v1", "controller-cpu-smoke-v1", "ablation-selection-v1"},
+        )
+        for profile_index, (profile_name, profile) in enumerate(profiles.items()):
+            _require_exact_keys(
+                f"method profile {profile_name}", profile,
+                {"method_config_id", "publication_eligible", "selection_eligible",
+                 "promotion_eligible", "convergence_status", "execution_ready",
+                 "execution_blockers", "semantic_config"},
+            )
+            if not isinstance(profile["semantic_config"], Mapping):
+                raise ValueError("method semantic config must be a mapping")
+            expected_semantic_sha = _METHOD_PROFILE_SEMANTIC_SHA256[method["id"]][profile_index]
+            if sha256_bytes(canonical_json_bytes(profile["semantic_config"])) != expected_semantic_sha:
+                raise ValueError("method semantic config does not match locked values")
+        publication = profiles["publication-v1"]
+        if not isinstance(publication, Mapping):
+            raise ValueError("publication profile must be a mapping")
+        if method["id"] == "dgi":
+            if publication["convergence_status"] != "not-applicable":
+                raise ValueError("DGI publication profile is analytic")
+        elif publication["convergence_status"] != "convergence-required":
+            raise ValueError("optimizing publication profile requires convergence")
+        if not isinstance(publication["semantic_config"].get("compute_cap"), Mapping):
+            raise ValueError("publication semantic config must bind compute cap")
     if len(ids) != len(set(ids)):
         raise ValueError("duplicate method ID in methods registry")
     if ids != list(_METHODS):

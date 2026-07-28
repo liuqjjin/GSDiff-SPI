@@ -549,6 +549,35 @@ def test_method_registry_locks_canonical_lanes_and_confirmation_pair():
     )["lane"] == "diffusion"
 
 
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (
+            lambda document: document["methods"][0]["command_template"].__setitem__(3, "dgi-copy"),
+            "command template",
+        ),
+        (
+            lambda document: document["methods"][0]["required_child_outputs"].append("extra.json"),
+            "child outputs",
+        ),
+        (
+            lambda document: next(entry for entry in document["methods"] if entry["id"] == "gsdiff_diffusion")["checkpoints"][0].__setitem__("sha256", "0" * 64),
+            "checkpoint",
+        ),
+        (
+            lambda document: next(entry for entry in document["methods"] if entry["id"] == "gsdiff_tv")["profiles"]["publication-v1"]["semantic_config"]["solver"].__setitem__("outer_iterations", 79),
+            "semantic config",
+        ),
+    ],
+)
+def test_method_registry_nested_contract_mutations_fail_after_rehash(mutate, message):
+    invalid = copy.deepcopy(_load("methods-v1.yaml"))
+    mutate(invalid)
+    _refresh_hashes(invalid)
+    with pytest.raises(ValueError, match=message):
+        protocol.validate_protocol(invalid)
+
+
 def test_ablation_axes_shortlist_lanes_and_workflow_counts_are_locked():
     ablations = _load("ablations-v1.yaml")
 
