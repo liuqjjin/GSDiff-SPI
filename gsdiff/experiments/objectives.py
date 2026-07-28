@@ -48,19 +48,25 @@ def heldout_normalized_l2(
         raise ValueError("frame_indices must be a rank-one integer array")
     if not (patterns_array.shape[0] == measurements_array.shape[0] == indices.shape[0]):
         raise ValueError("patterns, measurements, and frame_indices lengths must match")
+    if measurements_array.shape[0] == 0:
+        raise ValueError("held-out arrays must contain at least one row")
     if patterns_array.shape[1:] != reconstruction_array.shape[1:]:
         raise ValueError("patterns dimensions must match reconstruction")
     if np.any(indices < 0) or np.any(indices >= reconstruction_array.shape[0]):
         raise ValueError("frame_indices values must be in reconstruction range")
-    selected = reconstruction_array[indices].astype(np.float64, copy=False)
-    physical_patterns = patterns_array.astype(np.float64, copy=False)
-    predicted = np.einsum("khw,khw->k", physical_patterns, selected)
-    target = measurements_array.astype(np.float64, copy=False)
-    numerator = float(np.linalg.norm(predicted - target))
-    denominator = max(float(np.linalg.norm(target)), 1e-12)
-    value = numerator / denominator
-    if not np.isfinite(value):
-        raise ValueError("objective must be finite")
+    try:
+        with np.errstate(over="raise", invalid="raise", divide="raise"):
+            selected = reconstruction_array[indices].astype(np.float64, copy=False)
+            physical_patterns = patterns_array.astype(np.float64, copy=False)
+            predicted = np.einsum("khw,khw->k", physical_patterns, selected)
+            target = measurements_array.astype(np.float64, copy=False)
+            numerator = float(np.linalg.norm(predicted - target))
+            denominator = max(float(np.linalg.norm(target)), 1e-12)
+            value = numerator / denominator
+    except FloatingPointError as error:
+        raise ValueError("objective fields must be finite") from error
+    if not all(np.isfinite(item) for item in (numerator, denominator, value)):
+        raise ValueError("objective fields must be finite")
     return BlindObjective(_FORMULA_ID, numerator, denominator, value)
 
 
@@ -77,7 +83,8 @@ def select_by_heldout_normalized_l2(
         raise TypeError("run_candidate must be callable")
     if not candidates:
         raise ValueError("candidates must not be empty")
-    selected_candidate: object | None = None
+    sentinel = object()
+    selected_candidate: object = sentinel
     selected_reconstruction: np.ndarray | None = None
     selected_value: float | None = None
     history: list[Mapping[str, object]] = []
@@ -95,5 +102,5 @@ def select_by_heldout_normalized_l2(
             selected_candidate = candidate
             selected_reconstruction = reconstruction
             selected_value = objective.value
-    assert selected_candidate is not None and selected_reconstruction is not None
+    assert selected_candidate is not sentinel and selected_reconstruction is not None
     return selected_candidate, selected_reconstruction, tuple(history)

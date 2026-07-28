@@ -3,7 +3,14 @@
   "title": "Blind method child information v2",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema", "method_id", "method_config_id", "execution_family", "execution_profile", "dataset_identity_sha256", "measurements_file_sha256", "method_config_sha256", "semantic_config", "algorithm_seed", "parameter_count", "native_iteration", "warmup", "selected_hyperparameters", "selection", "convergence", "checkpoints", "motion_estimate", "reconstruction", "child_timing"],
+  "required": [
+    "schema", "method_id", "method_config_id", "execution_family",
+    "execution_profile", "dataset_identity_sha256",
+    "measurements_file_sha256", "method_config_sha256", "semantic_config",
+    "algorithm_seed", "parameter_count", "native_iteration", "warmup",
+    "selected_hyperparameters", "selection", "convergence", "checkpoints",
+    "motion_estimate", "reconstruction", "child_timing"
+  ],
   "properties": {
     "schema": {"const": "method-info-v2"},
     "method_id": {"type": "string", "minLength": 1},
@@ -13,21 +20,626 @@
     "dataset_identity_sha256": {"$ref": "#/$defs/sha256"},
     "measurements_file_sha256": {"$ref": "#/$defs/sha256"},
     "method_config_sha256": {"$ref": "#/$defs/sha256"},
-    "semantic_config": {"type": "object"},
-    "algorithm_seed": {"type": "object", "additionalProperties": false, "required": ["domain", "derivation_sha256", "seed_u32"], "properties": {"domain": {"const": "algorithm-seed-v1"}, "derivation_sha256": {"$ref": "#/$defs/sha256"}, "seed_u32": {"type": "integer", "minimum": 0, "maximum": 4294967295}}},
+    "semantic_config": {"$ref": "#/$defs/semanticConfig"},
+    "algorithm_seed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["domain", "derivation_sha256", "seed_u32"],
+      "properties": {
+        "domain": {"const": "algorithm-seed-v1"},
+        "derivation_sha256": {"$ref": "#/$defs/sha256"},
+        "seed_u32": {"type": "integer", "minimum": 0, "maximum": 4294967295}
+      }
+    },
     "parameter_count": {"type": "integer", "minimum": 0},
-    "native_iteration": {"type": "object", "additionalProperties": false, "required": ["unit", "budget"], "properties": {"unit": {"type": "string", "minLength": 1}, "budget": {"type": "integer", "minimum": 0}}},
-    "warmup": {"type": "object", "additionalProperties": false, "required": ["splitting", "motion"], "properties": {"splitting": {"type": "integer", "minimum": 0}, "motion": {"type": "integer", "minimum": 0}}},
-    "selected_hyperparameters": {"type": ["object", "array", "string", "number", "boolean", "null"]},
-    "selection": {"type": ["object", "array", "string", "number", "boolean", "null"]},
-    "convergence": {"type": "object", "additionalProperties": false, "required": ["status", "sampling_policy", "observed_count", "serialized_count", "history"], "properties": {"status": {"type": "string", "minLength": 1}, "sampling_policy": {"type": "string", "minLength": 1}, "observed_count": {"type": "integer", "minimum": 0}, "serialized_count": {"type": "integer", "minimum": 0, "maximum": 21}, "history": {"type": "array", "maxItems": 21, "items": {"type": "object"}}}},
-    "checkpoints": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["logical_id", "sha256"], "properties": {"logical_id": {"type": "string", "minLength": 1}, "sha256": {"$ref": "#/$defs/sha256"}}}},
-    "motion_estimate": {"type": "object", "additionalProperties": false, "required": ["present", "native_model"], "properties": {"present": {"type": "boolean"}, "native_model": {"type": "string", "minLength": 1}}},
-    "reconstruction": {"type": "object", "additionalProperties": false, "required": ["sha256", "array_descriptors"], "properties": {"sha256": {"$ref": "#/$defs/sha256"}, "array_descriptors": {"type": "object", "minProperties": 3, "additionalProperties": {"$ref": "#/$defs/array_descriptor"}}}},
-    "child_timing": {"type": "object", "additionalProperties": false, "required": ["started_at", "finished_at", "elapsed_seconds"], "properties": {"started_at": {"type": "string", "pattern": "Z$"}, "finished_at": {"type": "string", "pattern": "Z$"}, "elapsed_seconds": {"type": "number", "minimum": 0}}}
+    "native_iteration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["unit", "budget"],
+      "properties": {
+        "unit": {"type": "string", "minLength": 1},
+        "budget": {"type": "integer", "minimum": 0}
+      }
+    },
+    "warmup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["splitting", "motion"],
+      "properties": {
+        "splitting": {"type": "integer", "minimum": 0},
+        "motion": {"type": "integer", "minimum": 0}
+      }
+    },
+    "selected_hyperparameters": {
+      "oneOf": [
+        {"type": "null"},
+        {"$ref": "#/$defs/lambdaSelection"},
+        {"$ref": "#/$defs/tvSelection"},
+        {"$ref": "#/$defs/gidcSelection"}
+      ]
+    },
+    "selection": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "formula_id", "candidate_grid", "selected_candidate", "rows"
+          ],
+          "properties": {
+            "formula_id": {"const": "heldout-normalized-l2-v1"},
+            "candidate_grid": {
+              "type": "array",
+              "minItems": 1,
+              "items": {"$ref": "#/$defs/candidate"}
+            },
+            "selected_candidate": {"$ref": "#/$defs/candidate"},
+            "rows": {
+              "type": "array",
+              "minItems": 1,
+              "items": {"$ref": "#/$defs/selectionRow"}
+            }
+          }
+        }
+      ]
+    },
+    "convergence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status", "sampling_policy", "observed_count", "serialized_count",
+        "history"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "not-applicable", "convergence-required",
+            "smoke-only/not-convergence-assessed"
+          ]
+        },
+        "sampling_policy": {
+          "enum": [
+            "all-observations",
+            "floor(i*(observed_count-1)/20), i=0..20"
+          ]
+        },
+        "observed_count": {"type": "integer", "minimum": 0},
+        "serialized_count": {
+          "type": "integer", "minimum": 0, "maximum": 21
+        },
+        "history": {
+          "type": "array",
+          "maxItems": 21,
+          "items": {"$ref": "#/$defs/historyRow"}
+        }
+      }
+    },
+    "checkpoints": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["logical_id", "sha256"],
+        "properties": {
+          "logical_id": {"type": "string", "minLength": 1},
+          "sha256": {"$ref": "#/$defs/sha256"}
+        }
+      }
+    },
+    "motion_estimate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["present", "native_model"],
+      "properties": {
+        "present": {"type": "boolean"},
+        "native_model": {"type": "string", "minLength": 1}
+      }
+    },
+    "reconstruction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha256", "array_descriptors"],
+      "properties": {
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "array_descriptors": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["reconstruction", "frame_indices", "time_grid"],
+          "properties": {
+            "reconstruction": {"$ref": "#/$defs/arrayDescriptor"},
+            "frame_indices": {"$ref": "#/$defs/arrayDescriptor"},
+            "time_grid": {"$ref": "#/$defs/arrayDescriptor"},
+            "dgi": {"$ref": "#/$defs/arrayDescriptor"},
+            "estimated_motion_trajectory": {
+              "$ref": "#/$defs/arrayDescriptor"
+            }
+          }
+        }
+      }
+    },
+    "child_timing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["started_at", "finished_at", "elapsed_seconds"],
+      "properties": {
+        "started_at": {"$ref": "#/$defs/rfc3339Utc"},
+        "finished_at": {"$ref": "#/$defs/rfc3339Utc"},
+        "elapsed_seconds": {"type": "number", "minimum": 0}
+      }
+    }
   },
   "$defs": {
     "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-    "array_descriptor": {"type": "object", "additionalProperties": false, "required": ["dtype", "shape", "sha256"], "properties": {"dtype": {"type": "string", "minLength": 1}, "shape": {"type": "array", "items": {"type": "integer", "minimum": 0}}, "sha256": {"$ref": "#/$defs/sha256"}}}
+    "rfc3339Utc": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,6})?Z$"
+    },
+    "arrayDescriptor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dtype", "shape", "sha256"],
+      "properties": {
+        "dtype": {"type": "string", "minLength": 1},
+        "shape": {
+          "type": "array",
+          "items": {"type": "integer", "minimum": 0}
+        },
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "computeCap": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["wall_time_seconds", "peak_vram_bytes", "on_exceed"],
+      "properties": {
+        "wall_time_seconds": {"type": "integer", "minimum": 1},
+        "peak_vram_bytes": {"type": "integer", "minimum": 1},
+        "on_exceed": {"type": "string", "minLength": 1}
+      }
+    },
+    "semanticConfig": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["algorithm", "native_unit", "native_budget"],
+          "properties": {
+            "algorithm": {"type": "string", "minLength": 1},
+            "native_unit": {"type": "string", "minLength": 1},
+            "native_budget": {"type": "integer", "minimum": 0},
+            "compute_cap": {"$ref": "#/$defs/computeCap"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["solver"],
+          "properties": {
+            "solver": {"$ref": "#/$defs/classicalSolver"},
+            "compute_cap": {"$ref": "#/$defs/computeCap"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["representation", "solver"],
+          "properties": {
+            "representation": {"$ref": "#/$defs/recinrRepresentation"},
+            "solver": {"$ref": "#/$defs/recinrSolver"},
+            "compute_cap": {"$ref": "#/$defs/computeCap"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["scene", "motion", "solver"],
+          "properties": {
+            "scene": {"$ref": "#/$defs/scene"},
+            "motion": {"$ref": "#/$defs/motion"},
+            "solver": {"$ref": "#/$defs/learnedSolver"},
+            "diffusion": {"$ref": "#/$defs/diffusion"},
+            "compute_cap": {"$ref": "#/$defs/computeCap"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "representation", "solver", "prior", "motion_warmup_fraction",
+            "temporal_tv_weight", "gaussian_count"
+          ],
+          "properties": {
+            "representation": {"type": "string", "minLength": 1},
+            "solver": {"type": "string", "minLength": 1},
+            "prior": {"type": "string", "minLength": 1},
+            "motion_warmup_fraction": {"type": "number", "minimum": 0},
+            "temporal_tv_weight": {"type": "number", "minimum": 0},
+            "gaussian_count": {
+              "type": ["integer", "null"], "minimum": 1
+            }
+          }
+        }
+      ]
+    },
+    "classicalSolver": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "rho", "n_admm", "chambolle_iter", "lambda_grid",
+            "refit_all_measurements", "nonnegative",
+            "target_std_conditioning", "chambolle_tv"
+          ],
+          "properties": {
+            "rho": {"type": "number"},
+            "n_admm": {"type": "integer", "minimum": 1},
+            "chambolle_iter": {"type": "integer", "minimum": 1},
+            "lambda_grid": {
+              "type": "array", "minItems": 1,
+              "items": {"type": "number", "minimum": 0}
+            },
+            "refit_all_measurements": {"type": "boolean"},
+            "nonnegative": {"type": "boolean"},
+            "target_std_conditioning": {"type": "boolean"},
+            "chambolle_tv": {"type": "string", "minLength": 1}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "iterations", "opnorm_iterations", "lambda_xy", "lambda_t",
+            "refit_all_measurements"
+          ],
+          "properties": {
+            "iterations": {"type": "integer", "minimum": 1},
+            "opnorm_iterations": {"type": "integer", "minimum": 1},
+            "lambda_xy": {
+              "type": "array", "minItems": 1, "items": {"type": "number"}
+            },
+            "lambda_t": {
+              "type": "array", "minItems": 1, "items": {"type": "number"}
+            },
+            "refit_all_measurements": {"type": "boolean"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "rho", "n_admm", "chambolle_iter", "lambda_grid",
+            "interpolation", "motion_blocks", "ncc_search_radius",
+            "polynomial_degree", "preview_blur_sigma"
+          ],
+          "properties": {
+            "rho": {"type": "number"},
+            "n_admm": {"type": "integer", "minimum": 1},
+            "chambolle_iter": {"type": "integer", "minimum": 1},
+            "lambda_grid": {
+              "type": "array", "minItems": 1, "items": {"type": "number"}
+            },
+            "interpolation": {"type": "string", "minLength": 1},
+            "motion_blocks": {"type": "integer", "minimum": 1},
+            "ncc_search_radius": {"type": "integer", "minimum": 0},
+            "polynomial_degree": {"type": "integer", "minimum": 0},
+            "preview_blur_sigma": {"type": "number", "minimum": 0}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "optimizer", "n_steps", "lr", "betas", "adam_epsilon",
+            "eval_every", "lr_decay", "unet_channels", "xi_xy", "xi_t"
+          ],
+          "properties": {
+            "optimizer": {"type": "string", "minLength": 1},
+            "n_steps": {"type": "integer", "minimum": 1},
+            "lr": {"type": "number", "minimum": 0},
+            "betas": {
+              "type": "array", "minItems": 2, "maxItems": 2,
+              "items": {"type": "number"}
+            },
+            "adam_epsilon": {"type": "number", "minimum": 0},
+            "eval_every": {"type": "integer", "minimum": 1},
+            "lr_decay": {"type": "string", "minLength": 1},
+            "unet_channels": {
+              "type": "array", "minItems": 1,
+              "items": {"type": "integer", "minimum": 1}
+            },
+            "xi_xy": {
+              "type": "array", "minItems": 1, "items": {"type": "number"}
+            },
+            "xi_t": {
+              "type": "array", "minItems": 1, "items": {"type": "number"}
+            }
+          }
+        }
+      ]
+    },
+    "recinrRepresentation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "basis", "basis_order", "flow_scale", "harmonics", "hidden_dim",
+        "output_activation", "position_encoding_space",
+        "position_encoding_time", "render_layers"
+      ],
+      "properties": {
+        "basis": {"type": "string"},
+        "basis_order": {"type": "integer", "minimum": 0},
+        "flow_scale": {"type": "number"},
+        "harmonics": {"type": "integer", "minimum": 0},
+        "hidden_dim": {"type": "integer", "minimum": 1},
+        "output_activation": {"type": "string"},
+        "position_encoding_space": {"type": "integer", "minimum": 0},
+        "position_encoding_time": {"type": "integer", "minimum": 0},
+        "render_layers": {"type": "integer", "minimum": 1}
+      }
+    },
+    "recinrSolver": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "anchor_tau", "anneal_fraction", "flow_steps", "joint_steps",
+        "lam_flow_t", "lam_flow_xy", "lam_l1", "lam_ttv",
+        "lam_tv_canon", "lr_end", "lr_start", "node_rule",
+        "snapshot_every", "tv_xy", "warm_steps"
+      ],
+      "properties": {
+        "anchor_tau": {"type": "number"},
+        "anneal_fraction": {"type": "number"},
+        "flow_steps": {"type": "integer", "minimum": 0},
+        "joint_steps": {"type": "integer", "minimum": 0},
+        "lam_flow_t": {"type": "number"},
+        "lam_flow_xy": {"type": "number"},
+        "lam_l1": {"type": "number"},
+        "lam_ttv": {"type": "number"},
+        "lam_tv_canon": {"type": "number"},
+        "lr_end": {"type": "number"},
+        "lr_start": {"type": "number"},
+        "node_rule": {"type": "string"},
+        "snapshot_every": {"type": "integer", "minimum": 1},
+        "tv_xy": {"type": "number"},
+        "warm_steps": {"type": "integer", "minimum": 0}
+      }
+    },
+    "scene": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "scene_type", "hidden", "hidden_layers", "w0",
+            "initialization", "dgi_prefit"
+          ],
+          "properties": {
+            "scene_type": {"const": "siren"},
+            "hidden": {"type": "integer", "minimum": 1},
+            "hidden_layers": {"type": "integer", "minimum": 1},
+            "w0": {"type": "number"},
+            "initialization": {"type": "string"},
+            "dgi_prefit": {"type": "boolean"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "scene_type", "channels", "render_layers", "grid_size",
+            "initialization", "dgi_prefit"
+          ],
+          "properties": {
+            "scene_type": {"const": "recinr"},
+            "channels": {"type": "integer", "minimum": 1},
+            "render_layers": {"type": "integer", "minimum": 1},
+            "grid_size": {"type": "integer", "minimum": 1},
+            "initialization": {"type": "string"},
+            "dgi_prefit": {"type": "boolean"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "scene_type", "gaussian_count", "initialization",
+            "init_scale", "min_scale"
+          ],
+          "properties": {
+            "scene_type": {"const": "gaussian"},
+            "gaussian_count": {"type": "integer", "minimum": 1},
+            "initialization": {"type": "string"},
+            "init_scale": {"type": "number"},
+            "min_scale": {"type": "number"}
+          }
+        }
+      ]
+    },
+    "motion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enable_rotation", "polynomial_degree", "enable_affine"],
+      "properties": {
+        "enable_rotation": {"type": "boolean"},
+        "polynomial_degree": {"type": "integer", "minimum": 0},
+        "enable_affine": {"type": "boolean"}
+      }
+    },
+    "learnedSolver": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "solver_type", "sgd_steps", "lr_scene", "motion_warmup_steps",
+            "use_3dtv", "temporal_tv_weight", "loss_norm", "lr_motion",
+            "tv_weight"
+          ],
+          "properties": {
+            "solver_type": {"const": "sgd"},
+            "sgd_steps": {"type": "integer", "minimum": 1},
+            "lr_scene": {"type": "number"},
+            "motion_warmup_steps": {"type": "integer", "minimum": 0},
+            "use_3dtv": {"type": "boolean"},
+            "temporal_tv_weight": {"type": "number"},
+            "loss_norm": {"type": "string"},
+            "lr_motion": {"type": "number"},
+            "tv_weight": {"type": "number"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "solver_type", "outer_iterations", "inner_iterations",
+            "splitting_warmup_outer", "rho", "rho_growth", "prior_type",
+            "tv_weight", "soft_tv_weight", "temporal_tv_weight", "lr_scene",
+            "lr_motion", "motion_warmup_fraction", "motion_warmup_outer",
+            "loss_norm"
+          ],
+          "properties": {
+            "solver_type": {"const": "admm"},
+            "outer_iterations": {"type": "integer", "minimum": 1},
+            "inner_iterations": {"type": "integer", "minimum": 1},
+            "splitting_warmup_outer": {"type": "integer", "minimum": 0},
+            "rho": {"type": "number"},
+            "rho_growth": {"type": "number"},
+            "prior_type": {"type": "string"},
+            "tv_variant": {"type": "string"},
+            "prior_proximal_iterations": {"type": "integer", "minimum": 1},
+            "proximal_weight": {"type": "number"},
+            "tv_weight": {"type": "number"},
+            "soft_tv_weight": {"type": "number"},
+            "temporal_tv_weight": {"type": "number"},
+            "lr_scene": {"type": "number"},
+            "lr_motion": {"type": "number"},
+            "motion_warmup_fraction": {"type": "number", "minimum": 0},
+            "motion_warmup_outer": {"type": "integer", "minimum": 0},
+            "loss_norm": {"type": "string"}
+          }
+        }
+      ]
+    },
+    "diffusion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "denoise_steps", "clamp_range", "sigma_start", "sigma_end",
+        "renoise", "ddim_spacing"
+      ],
+      "properties": {
+        "denoise_steps": {"type": "integer", "minimum": 1},
+        "clamp_range": {
+          "type": "array", "minItems": 2, "maxItems": 2,
+          "items": {"type": "number"}
+        },
+        "sigma_start": {"type": "number"},
+        "sigma_end": {"type": "number"},
+        "renoise": {"type": "boolean"},
+        "ddim_spacing": {"type": "string"}
+      }
+    },
+    "lambdaSelection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["lambda"],
+      "properties": {"lambda": {"type": "number"}}
+    },
+    "tvSelection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["lambda_xy", "lambda_t"],
+      "properties": {
+        "lambda_xy": {"type": "number"},
+        "lambda_t": {"type": "number"}
+      }
+    },
+    "gidcSelection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["xi_xy", "xi_t"],
+      "properties": {
+        "xi_xy": {"type": "number"},
+        "xi_t": {"type": "number"}
+      }
+    },
+    "candidate": {
+      "oneOf": [
+        {"type": "number"},
+        {"$ref": "#/$defs/tvSelection"},
+        {"$ref": "#/$defs/gidcSelection"}
+      ]
+    },
+    "selectionRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "candidate", "formula_id", "numerator", "denominator", "value"
+      ],
+      "properties": {
+        "candidate": {"$ref": "#/$defs/candidate"},
+        "formula_id": {"const": "heldout-normalized-l2-v1"},
+        "numerator": {"type": "number", "minimum": 0},
+        "denominator": {"type": "number", "exclusiveMinimum": 0},
+        "value": {"type": "number", "minimum": 0}
+      }
+    },
+    "historyRow": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "iteration"],
+          "properties": {
+            "kind": {"const": "iteration"},
+            "iteration": {"type": "integer", "minimum": 0},
+            "objective": {"type": "number"},
+            "loss": {"type": "number"},
+            "data_fidelity": {"type": "number"},
+            "primal_residual": {"type": "number"},
+            "dual_residual": {"type": "number"},
+            "learning_rate": {"type": "number"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "step"],
+          "properties": {
+            "kind": {"const": "step"},
+            "step": {"type": "integer", "minimum": 0},
+            "objective": {"type": "number"},
+            "loss": {"type": "number"},
+            "data_fidelity": {"type": "number"},
+            "learning_rate": {"type": "number"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "outer_iteration"],
+          "properties": {
+            "kind": {"const": "outer-iteration"},
+            "outer_iteration": {"type": "integer", "minimum": 0},
+            "objective": {"type": "number"},
+            "loss": {"type": "number"},
+            "primal_residual": {"type": "number"},
+            "dual_residual": {"type": "number"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "pass"],
+          "properties": {
+            "kind": {"const": "pass"},
+            "pass": {"type": "integer", "minimum": 0},
+            "objective": {"type": "number"}
+          }
+        }
+      ]
+    }
   }
 }
