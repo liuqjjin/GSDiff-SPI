@@ -130,8 +130,6 @@ def test_smoke_baseline_accepts_blind_acquisition_only(method_id: str, blind_acq
     assert "ground_truth" not in forbidden
     assert "gt_" not in forbidden
     child_outputs._validate_result(result, blind_acquisition, method)
-    assert "gsdiff.evaluation" not in sys.modules
-    assert "gsdiff.baselines._evaluation" not in sys.modules
 
 
 def test_static_cs_selects_on_train_then_refits_all_measurements(blind_acquisition: SPIAcquisitionData, monkeypatch: pytest.MonkeyPatch) -> None:

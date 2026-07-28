@@ -3,14 +3,34 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import sys
 from dataclasses import replace
+from types import MappingProxyType
 
+import numpy as np
 import pytest
+import yaml
 
+from gsdiff.data._artifact_dataset import (
+    blind_acquisition_spec,
+    save_acquisition_data,
+)
+from gsdiff.data._artifact_identity import array_descriptor
+from gsdiff.data._artifact_io import artifact_sha256
+from gsdiff.data._artifact_models import SPIAcquisitionData
+from gsdiff.experiments.child_outputs import (
+    validate_method_child_outputs_v2,
+)
+from gsdiff.experiments.execution import MaterializedMethodRequest
 from gsdiff.experiments.identity import canonical_json_bytes
+from gsdiff.experiments.methods import (
+    AlgorithmSeed,
+    derive_algorithm_seed,
+    resolve_method_semantics,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -2273,3 +2293,967 @@ def test_task3_round1_unique_reuse_ignores_unrelated_staging_churn(
         1 if mutation == "add" else 0
     )
     assert verify_calls >= 3
+
+
+# Task 6 binds the production entry points to one frozen materialized request.
+# These helpers deliberately build a real acquisition and real canonical method
+# while replacing only the already-tested materialized-config loader.
+def _strict_method_acquisition() -> SPIAcquisitionData:
+    rng = np.random.default_rng(20260728)
+    T, H, W, rows = 4, 8, 8, 2
+    patterns = rng.random((T * rows, H, W), dtype=np.float32)
+    frame_indices = np.repeat(np.arange(T, dtype=np.int64), rows)
+    source = rng.random((T, H, W), dtype=np.float32)
+    measurements = np.einsum(
+        "khw,khw->k",
+        patterns,
+        source[frame_indices],
+    ).astype(np.float32)
+    holdout_patterns = rng.random((T, H, W), dtype=np.float32)
+    holdout_frame_indices = np.arange(T, dtype=np.int64)
+    holdout_measurements = np.einsum(
+        "khw,khw->k",
+        holdout_patterns,
+        source[holdout_frame_indices],
+    ).astype(np.float32)
+    arrays = {
+        "patterns": patterns,
+        "measurements": measurements,
+        "frame_indices": frame_indices,
+        "time_grid": np.linspace(0.0, 1.0, T, dtype=np.float64),
+        "holdout_patterns": holdout_patterns,
+        "holdout_measurements": holdout_measurements,
+        "holdout_frame_indices": holdout_frame_indices,
+    }
+    return SPIAcquisitionData(
+        dataset_identity_sha256="a" * 64,
+        **arrays,
+        H=H,
+        W=W,
+        T=T,
+        K=patterns.shape[0],
+        holdout_K=holdout_patterns.shape[0],
+        acquisition={
+            "pattern_family": "bernoulli",
+            "pattern_values": [0, 1],
+            "pattern_order": "sequential",
+            "time_assignment": "uniform",
+            "holdout_pattern_family": "uniform-random",
+            "noise_convention": "detector-absolute",
+            "noise_sigma_absolute": 0.0,
+        },
+        array_descriptors={
+            name: array_descriptor(value)
+            for name, value in arrays.items()
+        },
+    )
+
+
+def _strict_method_case(
+    tmp_path: Path,
+    method_id: str,
+    *,
+    requested_device: str = "cpu",
+    child_device: str = "cpu",
+    save_measurements: bool = False,
+) -> tuple[
+    MaterializedMethodRequest,
+    SPIAcquisitionData,
+    Path,
+    list[str],
+]:
+    acquisition = _strict_method_acquisition()
+    stage = tmp_path / f"stage-{method_id}"
+    measurements_path = stage / "input" / "measurements.npz"
+    method_config_path = stage / "config" / "method-config.json"
+    child_output_dir = stage / "child-output"
+    measurements_path.parent.mkdir(parents=True)
+    method_config_path.parent.mkdir(parents=True)
+    child_output_dir.mkdir(parents=True)
+    method_config_path.write_text("{}", encoding="utf-8")
+    if save_measurements:
+        save_acquisition_data(acquisition, measurements_path)
+    else:
+        measurements_path.write_bytes(b"unit-test-measurements")
+    base_config = (
+        {"gaussian_count": 1000}
+        if method_id in {"gsdiff_tv", "gsdiff_diffusion"}
+        else {}
+    )
+    method = resolve_method_semantics(
+        method_id,
+        method_config_id="smoke-default-v1",
+        base_config=base_config,
+        measurements_metadata={
+            "H": acquisition.H,
+            "W": acquisition.W,
+            "T": acquisition.T,
+            "K": acquisition.K,
+            "holdout_K": acquisition.holdout_K,
+        },
+        execution_profile="controller-cpu-smoke-v1",
+    )
+    algorithm_seed = derive_algorithm_seed(
+        cell_seed=17,
+        dataset_identity_sha256=acquisition.dataset_identity_sha256,
+        method_id=method.method_id,
+        method_config_sha256=method.method_config_sha256,
+    )
+    checkpoint_paths: dict[str, Path] = {}
+    for requirement in method.checkpoint_requirements:
+        checkpoint_path = (
+            stage / "checkpoints" / f"{requirement.logical_id}.checkpoint"
+        )
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint_path.write_bytes(b"test-checkpoint")
+        checkpoint_paths[requirement.logical_id] = checkpoint_path
+    request = MaterializedMethodRequest(
+        method=method,
+        algorithm_seed=algorithm_seed,
+        dataset_identity_sha256=acquisition.dataset_identity_sha256,
+        measurements_file_sha256=artifact_sha256(measurements_path),
+        expected_acquisition_spec=blind_acquisition_spec(acquisition),
+        measurements_path=measurements_path.resolve(),
+        child_output_dir=child_output_dir.resolve(),
+        checkpoint_paths=MappingProxyType(checkpoint_paths),
+        requested_runtime_device=requested_device,
+        child_runtime_device=child_device,
+    )
+    argv = [
+        "--method",
+        method.method_id,
+        "--dataset",
+        str(request.measurements_path),
+        "--dataset-identity-sha256",
+        request.dataset_identity_sha256,
+        "--method-config",
+        str(method_config_path.resolve()),
+        "--algorithm-seed",
+        str(request.algorithm_seed.seed_u32),
+        "--device",
+        request.child_runtime_device,
+        "--output-dir",
+        str(request.child_output_dir),
+    ]
+    for logical_id, checkpoint_path in request.checkpoint_paths.items():
+        argv.extend(
+            ["--checkpoint", f"{logical_id}={checkpoint_path}"]
+        )
+    return request, acquisition, method_config_path.resolve(), argv
+
+
+def _strict_entry_module(family: str):
+    if family == "baseline":
+        import scripts.run_baselines as module
+    elif family == "gsdiff":
+        import train as module
+    else:
+        raise AssertionError(f"unknown test family: {family}")
+    return module
+
+
+@pytest.mark.parametrize("family", ["baseline", "gsdiff"])
+def test_method_entry_usage_documents_strict_default_and_marked_legacy(
+    tmp_path,
+    monkeypatch,
+    family,
+):
+    module = _strict_entry_module(family)
+    usage = module.__doc__ or ""
+    for option in (
+        "--method",
+        "--dataset",
+        "--dataset-identity-sha256",
+        "--method-config",
+        "--algorithm-seed",
+        "--device",
+        "--output-dir",
+    ):
+        assert option in usage
+    assert "--legacy-compatibility" in usage
+    for line in usage.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("python "):
+            continue
+        if any(
+            option in stripped
+            for option in ("--config", "--solver", "--baselines")
+        ):
+            assert "--legacy-compatibility" in stripped
+
+    commands = [
+        shlex.split(line.strip())
+        for line in usage.splitlines()
+        if line.strip().startswith("python ")
+    ]
+    assert len(commands) == 2
+    strict_documented = commands[0][2:]
+    legacy_documented = commands[1][2:]
+
+    method_id = "dgi" if family == "baseline" else "gsdiff_tv"
+    request, _acquisition, config_path, canonical_argv = (
+        _strict_method_case(tmp_path, method_id)
+    )
+    canonical_values = {
+        canonical_argv[index]: canonical_argv[index + 1]
+        for index in range(0, len(canonical_argv), 2)
+    }
+    placeholder_values = {
+        "<absolute-measurements>": canonical_values["--dataset"],
+        "<sha256>": canonical_values["--dataset-identity-sha256"],
+        "<absolute-config>": canonical_values["--method-config"],
+        "<u32>": canonical_values["--algorithm-seed"],
+        "<absolute-output>": canonical_values["--output-dir"],
+    }
+    strict_argv = [
+        placeholder_values.get(value, value)
+        for value in strict_documented
+    ]
+    parsed = module._strict_parser().parse_args(strict_argv)
+    code_dir = config_path.parent.parent / "code"
+    code_dir.mkdir()
+    monkeypatch.chdir(code_dir)
+    locked_config = module._crosslock_method_config_before_load(
+        parsed.method_config
+    )
+    if family == "baseline":
+        module._crosslock_request(parsed, request, locked_config)
+    else:
+        module._crosslock_request(
+            parsed,
+            request,
+            locked_config,
+            module._checkpoint_mapping(parsed.checkpoint),
+        )
+
+    assert "--legacy-compatibility" in legacy_documented
+    assert "--truth-path" in legacy_documented
+    assert "--measurements-path" in legacy_documented
+    assert "--dataset-identity-sha256" in legacy_documented
+    if family == "baseline":
+        assert "--name" in legacy_documented
+    legacy_values = {
+        "<truth>": str(tmp_path / "truth.npz"),
+        "<measurements>": str(tmp_path / "measurements.npz"),
+        "<sha256>": "a" * 64,
+    }
+    legacy_argv = [
+        legacy_values.get(value, value)
+        for value in legacy_documented
+    ]
+    observed = []
+    monkeypatch.setattr(
+        module,
+        "legacy_main",
+        lambda argv: observed.append(list(argv)) or 0,
+    )
+    assert module.main(legacy_argv) == 0
+    assert observed
+
+
+def _patch_strict_request_loader(
+    monkeypatch,
+    *,
+    expected_path: Path,
+    request: MaterializedMethodRequest,
+) -> list[Path]:
+    import gsdiff.experiments.execution as execution
+
+    code_dir = request.measurements_path.parent.parent / "code"
+    code_dir.mkdir(exist_ok=True)
+    monkeypatch.chdir(code_dir)
+    loaded: list[Path] = []
+
+    def load(path):
+        loaded.append(path)
+        assert path == expected_path
+        return request
+
+    monkeypatch.setattr(
+        execution,
+        "load_materialized_method_request",
+        load,
+    )
+    return loaded
+
+
+@pytest.mark.parametrize("family", ["baseline", "gsdiff"])
+def test_strict_method_rejects_external_config_before_loader_or_read(
+    tmp_path,
+    monkeypatch,
+    family,
+):
+    import gsdiff.experiments.execution as execution
+
+    method_id = "dgi" if family == "baseline" else "gsdiff_tv"
+    request, _acquisition, config_path, argv = _strict_method_case(
+        tmp_path, method_id
+    )
+    code_dir = config_path.parent.parent / "code"
+    code_dir.mkdir()
+    monkeypatch.chdir(code_dir)
+    external_config = (
+        tmp_path
+        / "external-stage"
+        / "config"
+        / "method-config.json"
+    )
+    external_config.parent.mkdir(parents=True)
+    external_config.write_bytes(b'{"external_sentinel":true}')
+    changed = list(argv)
+    changed[changed.index("--method-config") + 1] = str(
+        external_config.resolve()
+    )
+    loader_calls = []
+    read_calls = []
+    real_loader = execution.load_materialized_method_request
+    real_read = execution._read_stable_regular_bytes
+
+    def tracked_read(path, *, noun):
+        read_calls.append(path)
+        return real_read(path, noun=noun)
+
+    def tracked_loader(path):
+        loader_calls.append(path)
+        return real_loader(path)
+
+    monkeypatch.setattr(execution, "_read_stable_regular_bytes", tracked_read)
+    monkeypatch.setattr(
+        execution,
+        "load_materialized_method_request",
+        tracked_loader,
+    )
+
+    with pytest.raises(ValueError, match="method config.*crosslock"):
+        _strict_entry_module(family).strict_main(changed)
+    assert loader_calls == []
+    assert read_calls == []
+    assert external_config.read_bytes() == b'{"external_sentinel":true}'
+
+
+@pytest.mark.parametrize("family", ["baseline", "gsdiff"])
+def test_strict_method_dispatch_is_default_and_legacy_requires_marker(
+    monkeypatch,
+    family,
+):
+    module = _strict_entry_module(family)
+    calls = []
+
+    def strict(argv):
+        calls.append(("strict", list(argv)))
+        return 71
+
+    def legacy(argv):
+        calls.append(("legacy", list(argv)))
+        return 72
+
+    monkeypatch.setattr(module, "strict_main", strict, raising=False)
+    monkeypatch.setattr(module, "legacy_main", legacy, raising=False)
+
+    assert module.main(["--method", "dgi"]) == 71
+    assert module.main(
+        [
+            "--legacy-compatibility",
+            "--config",
+            "legacy.yaml",
+            "--truth-path",
+            "truth.npz",
+        ]
+    ) == 72
+    assert calls == [
+        ("strict", ["--method", "dgi"]),
+        (
+            "legacy",
+            ["--config", "legacy.yaml", "--truth-path", "truth.npz"],
+        ),
+    ]
+
+
+@pytest.mark.parametrize("family", ["baseline", "gsdiff"])
+@pytest.mark.parametrize(
+    "legacy_argv",
+    [
+        ["--config", "legacy.yaml", "--task6-invalid-sentinel"],
+        ["--truth-path", "truth.npz", "--task6-invalid-sentinel"],
+        ["--override", "solver.steps=1", "--task6-invalid-sentinel"],
+        ["--name", "legacy-name", "--task6-invalid-sentinel"],
+        ["--baselines", "dgi", "--task6-invalid-sentinel"],
+        ["--solver", "sgd", "--task6-invalid-sentinel"],
+    ],
+)
+def test_strict_method_default_rejects_legacy_flags_with_migration_message(
+    capsys,
+    family,
+    legacy_argv,
+):
+    module = _strict_entry_module(family)
+    with pytest.raises(SystemExit):
+        module.main(legacy_argv)
+    captured = capsys.readouterr()
+    assert "--legacy-compatibility" in captured.err
+
+
+@pytest.mark.parametrize("family", ["baseline", "gsdiff"])
+@pytest.mark.parametrize(
+    "duplicate_flag",
+    [
+        "--method",
+        "--dataset",
+        "--dataset-identity-sha256",
+        "--method-config",
+        "--algorithm-seed",
+        "--device",
+        "--output-dir",
+    ],
+)
+def test_strict_method_rejects_duplicate_singleton_options(
+    tmp_path,
+    family,
+    duplicate_flag,
+):
+    method_id = "dgi" if family == "baseline" else "gsdiff_tv"
+    _request, _acquisition, _config, argv = _strict_method_case(
+        tmp_path, method_id
+    )
+    index = argv.index(duplicate_flag)
+    duplicate_value = argv[index + 1]
+    module = _strict_entry_module(family)
+
+    with pytest.raises(SystemExit, match="duplicate"):
+        module.strict_main(
+            [*argv, duplicate_flag, duplicate_value]
+        )
+
+
+@pytest.mark.parametrize(
+    ("family", "method_id"),
+    [
+        ("baseline", "gsdiff_tv"),
+        ("gsdiff", "dgi"),
+    ],
+)
+def test_strict_method_family_gate_precedes_adapter_and_writer(
+    tmp_path,
+    monkeypatch,
+    family,
+    method_id,
+):
+    import gsdiff.data as data
+    import gsdiff.experiments.adapters as adapters
+    import gsdiff.experiments.child_outputs as child_outputs
+
+    request, _acquisition, config_path, argv = _strict_method_case(
+        tmp_path, method_id
+    )
+    _patch_strict_request_loader(
+        monkeypatch,
+        expected_path=config_path,
+        request=request,
+    )
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("family mismatch reached execution")
+
+    monkeypatch.setattr(data, "load_acquisition_data", forbidden)
+    monkeypatch.setattr(adapters, "run_canonical_method", forbidden)
+    monkeypatch.setattr(
+        child_outputs,
+        "write_method_child_outputs_v2",
+        forbidden,
+    )
+
+    with pytest.raises(ValueError, match="family"):
+        _strict_entry_module(family).strict_main(argv)
+
+
+@pytest.mark.parametrize(
+    ("family", "method_id", "replacement"),
+    [
+        ("baseline", "dgi", ("--method", "unknown-method")),
+        ("baseline", "dgi", ("--method", "gsdiff_diff")),
+        ("gsdiff", "gsdiff_diffusion", ("--method", "gsdiff_diff")),
+    ],
+)
+def test_strict_method_rejects_unknown_ids_and_aliases(
+    tmp_path,
+    monkeypatch,
+    family,
+    method_id,
+    replacement,
+):
+    request, _acquisition, config_path, argv = _strict_method_case(
+        tmp_path, method_id
+    )
+    _patch_strict_request_loader(
+        monkeypatch,
+        expected_path=config_path,
+        request=request,
+    )
+    option, value = replacement
+    changed = list(argv)
+    changed[changed.index(option) + 1] = value
+
+    with pytest.raises(ValueError, match="method"):
+        _strict_entry_module(family).strict_main(changed)
+
+
+@pytest.mark.parametrize("family", ["baseline", "gsdiff"])
+@pytest.mark.parametrize(
+    "field",
+    [
+        "method",
+        "dataset",
+        "dataset_identity",
+        "method_config",
+        "output",
+        "algorithm_seed",
+        "device",
+    ],
+)
+def test_strict_method_crosslocks_every_cli_value_before_execution(
+    tmp_path,
+    monkeypatch,
+    family,
+    field,
+):
+    import gsdiff.experiments.adapters as adapters
+    import gsdiff.experiments.child_outputs as child_outputs
+
+    method_id = "dgi" if family == "baseline" else "gsdiff_tv"
+    request, _acquisition, config_path, argv = _strict_method_case(
+        tmp_path, method_id
+    )
+    changed = list(argv)
+    replacements = {
+        "method": ("--method", "static_cs" if family == "baseline" else "siren"),
+        "dataset": ("--dataset", str(tmp_path / "other-measurements.npz")),
+        "dataset_identity": (
+            "--dataset-identity-sha256",
+            "f" * 64,
+        ),
+        "method_config": (
+            "--method-config",
+            str(tmp_path / "other-method-config.json"),
+        ),
+        "output": ("--output-dir", str(tmp_path / "other-output")),
+        "algorithm_seed": (
+            "--algorithm-seed",
+            str((request.algorithm_seed.seed_u32 + 1) % (2**32)),
+        ),
+        "device": ("--device", "cuda:0"),
+    }
+    option, value = replacements[field]
+    changed[changed.index(option) + 1] = value
+
+    # A config-path mutation is rejected from trusted cwd/stage structure
+    # before the request loader can read or hash the supplied file. Other
+    # parent-known mutations are cross-locked against the loaded request.
+    loaded = _patch_strict_request_loader(
+        monkeypatch,
+        expected_path=config_path,
+        request=request,
+    )
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("tampered request reached execution")
+
+    monkeypatch.setattr(adapters, "run_canonical_method", forbidden)
+    monkeypatch.setattr(
+        child_outputs,
+        "write_method_child_outputs_v2",
+        forbidden,
+    )
+
+    with pytest.raises(ValueError, match="mismatch|crosslock"):
+        _strict_entry_module(family).strict_main(changed)
+    assert loaded == ([] if field == "method_config" else [config_path])
+
+
+def test_strict_method_baseline_rejects_any_checkpoint(tmp_path):
+    _request, _acquisition, _config, argv = _strict_method_case(
+        tmp_path, "dgi"
+    )
+    with pytest.raises(SystemExit):
+        _strict_entry_module("baseline").strict_main(
+            [*argv, "--checkpoint", f"extra={tmp_path / 'extra.pt'}"]
+        )
+
+
+@pytest.mark.parametrize(
+    "checkpoint_args",
+    [
+        ["--checkpoint", "extra=extra.pt"],
+        [
+            "--checkpoint",
+            "extra=extra.pt",
+            "--checkpoint",
+            "extra=extra.pt",
+        ],
+    ],
+)
+def test_strict_method_non_diffusion_gsdiff_rejects_checkpoints(
+    tmp_path,
+    monkeypatch,
+    checkpoint_args,
+):
+    request, _acquisition, config_path, argv = _strict_method_case(
+        tmp_path, "gsdiff_tv"
+    )
+    _patch_strict_request_loader(
+        monkeypatch,
+        expected_path=config_path,
+        request=request,
+    )
+    with pytest.raises(ValueError, match="checkpoint"):
+        _strict_entry_module("gsdiff").strict_main(
+            [*argv, *checkpoint_args]
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing",
+        "duplicate",
+        "extra",
+        "wrong_logical_id",
+        "wrong_path",
+    ],
+)
+def test_strict_method_diffusion_requires_exact_checkpoint_mapping(
+    tmp_path,
+    monkeypatch,
+    mutation,
+):
+    request, _acquisition, config_path, argv = _strict_method_case(
+        tmp_path, "gsdiff_diffusion"
+    )
+    _patch_strict_request_loader(
+        monkeypatch,
+        expected_path=config_path,
+        request=request,
+    )
+    checkpoint_index = argv.index("--checkpoint")
+    assignment = argv[checkpoint_index + 1]
+    changed = list(argv)
+    if mutation == "missing":
+        del changed[checkpoint_index : checkpoint_index + 2]
+    elif mutation == "duplicate":
+        changed.extend(["--checkpoint", assignment])
+    elif mutation == "extra":
+        changed.extend(["--checkpoint", f"extra={tmp_path / 'extra.pt'}"])
+    elif mutation == "wrong_logical_id":
+        changed[checkpoint_index + 1] = (
+            f"wrong={next(iter(request.checkpoint_paths.values()))}"
+        )
+    elif mutation == "wrong_path":
+        changed[checkpoint_index + 1] = (
+            f"gsdiff-diffusion-prior-v1={tmp_path / 'wrong.pt'}"
+        )
+    else:
+        raise AssertionError(mutation)
+
+    with pytest.raises(ValueError, match="checkpoint"):
+        _strict_entry_module("gsdiff").strict_main(changed)
+
+
+def test_strict_method_exact_diffusion_mapping_and_child_device_are_forwarded(
+    tmp_path,
+    monkeypatch,
+):
+    import gsdiff.data as data
+    import gsdiff.experiments.adapters as adapters
+    import gsdiff.experiments.child_outputs as child_outputs
+
+    request, acquisition, config_path, argv = _strict_method_case(
+        tmp_path,
+        "gsdiff_diffusion",
+        requested_device="cuda:3",
+        child_device="cuda:0",
+    )
+    _patch_strict_request_loader(
+        monkeypatch,
+        expected_path=config_path,
+        request=request,
+    )
+    calls = []
+    sentinel_result = object()
+
+    def load_acquisition(path, **kwargs):
+        calls.append(("load", path, kwargs))
+        return acquisition
+
+    def run(method, loaded, **kwargs):
+        calls.append(("run", method, loaded, kwargs))
+        return sentinel_result
+
+    def write(output_dir, **kwargs):
+        calls.append(("write", output_dir, kwargs))
+        return {
+            "reconstruction.npz": "1" * 64,
+            "method-info.json": "2" * 64,
+        }
+
+    monkeypatch.setattr(data, "load_acquisition_data", load_acquisition)
+    monkeypatch.setattr(adapters, "run_canonical_method", run)
+    monkeypatch.setattr(
+        child_outputs,
+        "write_method_child_outputs_v2",
+        write,
+    )
+
+    assert _strict_entry_module("gsdiff").strict_main(argv) == 0
+    run_call = next(call for call in calls if call[0] == "run")
+    assert run_call[3]["device"] == "cuda:0"
+    assert run_call[3]["device"] != request.requested_runtime_device
+    assert run_call[3]["checkpoint_paths"] == request.checkpoint_paths
+    write_call = next(call for call in calls if call[0] == "write")
+    assert write_call[1] == request.child_output_dir
+    assert write_call[2]["result"] is sentinel_result
+
+
+def test_strict_method_real_dgi_success_writes_exact_two_v2_files(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    request, acquisition, config_path, argv = _strict_method_case(
+        tmp_path, "dgi", save_measurements=True
+    )
+    _patch_strict_request_loader(
+        monkeypatch,
+        expected_path=config_path,
+        request=request,
+    )
+
+    assert _strict_entry_module("baseline").strict_main(argv) == 0
+    assert {path.name for path in request.child_output_dir.iterdir()} == {
+        "reconstruction.npz",
+        "method-info.json",
+    }
+    validate_method_child_outputs_v2(
+        request.child_output_dir,
+        expected_method=request.method,
+        expected_acquisition=acquisition,
+        expected_dataset_identity_sha256=request.dataset_identity_sha256,
+        expected_measurements_file_sha256=(
+            request.measurements_file_sha256
+        ),
+        expected_algorithm_seed=request.algorithm_seed,
+    )
+    output = capsys.readouterr().out.lower()
+    assert "reconstruction.npz" in output
+    assert "method-info.json" in output
+    for forbidden in ("psnr", "ssim", "nrmse", "truth", "figure"):
+        assert forbidden not in output
+
+
+@pytest.mark.parametrize("family", ["baseline", "gsdiff"])
+def test_strict_method_explicit_legacy_never_calls_v2_writer(
+    monkeypatch,
+    capsys,
+    family,
+):
+    import gsdiff.experiments.child_outputs as child_outputs
+
+    module = _strict_entry_module(family)
+    observed = []
+
+    def legacy(argv):
+        observed.append(list(argv))
+        return 19
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("legacy compatibility reached v2 writer")
+
+    monkeypatch.setattr(module, "legacy_main", legacy, raising=False)
+    monkeypatch.setattr(
+        child_outputs,
+        "write_method_child_outputs_v2",
+        forbidden,
+    )
+
+    assert module.main(
+        [
+            "--legacy-compatibility",
+            "--config",
+            "legacy.yaml",
+            "--truth-path",
+            "truth.npz",
+        ]
+    ) == 19
+    captured = capsys.readouterr()
+    assert "nonpromotable" in (captured.out + captured.err).lower()
+    assert observed == [
+        ["--config", "legacy.yaml", "--truth-path", "truth.npz"]
+    ]
+
+
+@pytest.mark.parametrize("family", ["baseline", "gsdiff"])
+def test_explicit_legacy_without_truth_fails_closed_before_artifacts(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    family,
+):
+    import gsdiff.experiments.child_outputs as child_outputs
+
+    module = _strict_entry_module(family)
+    output_dir = tmp_path / "legacy-output"
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("truthless legacy reached execution or writer")
+
+    monkeypatch.setattr(module, "legacy_main", forbidden, raising=False)
+    monkeypatch.setattr(
+        child_outputs,
+        "write_method_child_outputs_v2",
+        forbidden,
+    )
+    monkeypatch.setattr(
+        module,
+        "write_method_child_outputs",
+        forbidden,
+    )
+
+    with pytest.raises(SystemExit):
+        module.main(
+            [
+                "--legacy-compatibility",
+                "--config",
+                "legacy.yaml",
+                "--measurements-path",
+                str(tmp_path / "measurements.npz"),
+                "--output-dir",
+                str(output_dir),
+            ]
+        )
+    captured = capsys.readouterr()
+    message = (captured.out + captured.err).lower()
+    assert "truth" in message
+    assert "strict" in message
+    assert not output_dir.exists()
+
+
+@pytest.mark.parametrize("family", ["baseline", "gsdiff"])
+@pytest.mark.parametrize(
+    ("truth_args", "expected_message"),
+    [
+        (["--truth-path="], "truthless"),
+        (["--truth-path"], "truthless"),
+        (["--truth-path", ""], "truthless"),
+        (["--truth-path=   "], "truthless"),
+        (["--truth-path", "   "], "truthless"),
+        (
+            ["--truth-path=truth.npz", "--truth-path="],
+            "duplicate",
+        ),
+        (
+            ["--truth-path", "truth.npz", "--truth-path="],
+            "duplicate",
+        ),
+        (
+            [
+                "--truth-path=truth.npz",
+                "--truth-path",
+                "other-truth.npz",
+            ],
+            "duplicate",
+        ),
+    ],
+)
+def test_explicit_legacy_rejects_empty_or_duplicate_truth_option(
+    monkeypatch,
+    capsys,
+    family,
+    truth_args,
+    expected_message,
+):
+    module = _strict_entry_module(family)
+    calls = []
+
+    def legacy(argv):
+        calls.append(list(argv))
+        return 91
+
+    monkeypatch.setattr(module, "legacy_main", legacy, raising=False)
+    with pytest.raises(SystemExit) as caught:
+        module.main(
+            [
+                "--legacy-compatibility",
+                "--config",
+                "legacy.yaml",
+                *truth_args,
+            ]
+        )
+    message = (
+        capsys.readouterr().err + str(caught.value)
+    ).lower()
+    assert expected_message in message
+    assert calls == []
+
+
+@pytest.mark.parametrize("family", ["baseline", "gsdiff"])
+@pytest.mark.parametrize(
+    "abbreviated_override",
+    [
+        ["--truth="],
+        ["--truth-pa="],
+        ["--truth-p", ""],
+    ],
+)
+def test_legacy_parser_rejects_abbreviated_truth_override_before_io(
+    tmp_path,
+    monkeypatch,
+    family,
+    abbreviated_override,
+):
+    module = _strict_entry_module(family)
+    output_dir = tmp_path / "output"
+    argv = [
+        "--legacy-compatibility",
+        "--config",
+        str(tmp_path / "must-not-read.yaml"),
+        "--truth-path=truth.npz",
+        *abbreviated_override,
+        "--output-dir",
+        str(output_dir),
+    ]
+    if family == "baseline":
+        argv.extend(["--name", "legacy-test"])
+
+    def forbidden_open(*args, **kwargs):
+        raise AssertionError("abbreviated truth override reached config I/O")
+
+    monkeypatch.setattr("builtins.open", forbidden_open)
+    with pytest.raises(SystemExit):
+        module.main(argv)
+    assert not output_dir.exists()
+
+
+def test_strict_method_pilot_readiness_remains_false_with_exact_blockers():
+    pilot = yaml.safe_load(
+        (REPO_ROOT / "configs" / "protocols" / "pilot-v1.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    diffusion = resolve_method_semantics(
+        "gsdiff_diffusion",
+        method_config_id="default",
+        base_config={"gaussian_count": 1000},
+        measurements_metadata={
+            "H": 32,
+            "W": 32,
+            "T": 4,
+            "K": 128,
+            "holdout_K": 16,
+        },
+        execution_profile="publication-v1",
+    )
+
+    assert pilot["execution_ready"] is False
+    assert pilot["method_budgets"] is None
+    assert diffusion.execution_blockers == (
+        "missing-reproducible-checkpoint-locator",
+        "missing-checkpoint-training-provenance",
+    )

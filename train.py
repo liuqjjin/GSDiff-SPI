@@ -1,12 +1,18 @@
 
-"""GSDiff-SPI  Training.
+"""Run one frozen GSDiff method child.
 
 Usage:
-    python train.py                          # ADMM (default)
-    python train.py --solver sgd             # SGD baseline
-    python train.py --config configs/default.yaml
+    python train.py --method gsdiff_tv --dataset <absolute-measurements> \
+        --dataset-identity-sha256 <sha256> --method-config <absolute-config> \
+        --algorithm-seed <u32> --device cpu --output-dir <absolute-output>
+
+Legacy truth-visible evaluation is explicit and nonpromotable:
+    python train.py --legacy-compatibility --truth-path <truth> \
+        --config configs/default.yaml --measurements-path <measurements> \
+        --dataset-identity-sha256 <sha256>
 """
-import argparse, json, os, time
+import argparse, contextlib, io, json, os, sys, time
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 import numpy as np, torch, yaml
@@ -27,6 +33,262 @@ from gsdiff.data import (
     write_method_child_outputs,
 )
 
+GSDIFF_METHOD_IDS = (
+    "siren",
+    "recinr_se2",
+    "gsdiff_tv",
+    "gsdiff_diffusion",
+)
+STRICT_SINGLETON_OPTIONS = (
+    "--method",
+    "--dataset",
+    "--dataset-identity-sha256",
+    "--method-config",
+    "--algorithm-seed",
+    "--device",
+    "--output-dir",
+)
+LEGACY_ONLY_OPTIONS = (
+    "--config",
+    "--measurements-path",
+    "--truth-path",
+    "--name",
+    "--baselines",
+    "--solver",
+    "--override",
+)
+
+
+def _utc_now():
+    return (
+        datetime.now(timezone.utc)
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def _option_present(argv, option):
+    return any(
+        value == option or value.startswith(option + "=")
+        for value in argv
+    )
+
+
+def _legacy_truth_supplied(argv):
+    for index, value in enumerate(argv):
+        if value.startswith("--truth-path="):
+            return bool(value.partition("=")[2].strip())
+        if value == "--truth-path":
+            return (
+                index + 1 < len(argv)
+                and bool(argv[index + 1].strip())
+                and not argv[index + 1].startswith("--")
+            )
+    return False
+
+
+def _require_parsed_legacy_truth(value):
+    if not isinstance(value, str) or not value.strip():
+        print(
+            "truthless legacy method output is disabled; "
+            "use the strict method interface",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
+
+def _reject_duplicate_legacy_truth(argv):
+    count = sum(
+        value == "--truth-path"
+        or value.startswith("--truth-path=")
+        for value in argv
+    )
+    if count > 1:
+        raise SystemExit("duplicate legacy option: --truth-path")
+
+
+def _reject_duplicate_singletons(argv):
+    for option in STRICT_SINGLETON_OPTIONS:
+        count = sum(
+            value == option or value.startswith(option + "=")
+            for value in argv
+        )
+        if count > 1:
+            raise SystemExit(f"duplicate strict option: {option}")
+
+
+def _strict_seed(value):
+    try:
+        seed = int(value, 10)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "algorithm seed must be an unsigned 32-bit integer"
+        ) from error
+    if not 0 <= seed <= 2**32 - 1:
+        raise argparse.ArgumentTypeError(
+            "algorithm seed must be an unsigned 32-bit integer"
+        )
+    return seed
+
+
+def _strict_parser():
+    parser = argparse.ArgumentParser(
+        description="Run one frozen GSDiff method child.",
+        allow_abbrev=False,
+    )
+    parser.add_argument("--method", required=True)
+    parser.add_argument("--dataset", required=True)
+    parser.add_argument("--dataset-identity-sha256", required=True)
+    parser.add_argument("--method-config", required=True)
+    parser.add_argument(
+        "--algorithm-seed", required=True, type=_strict_seed
+    )
+    parser.add_argument("--device", required=True)
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--checkpoint", action="append", default=[])
+    return parser
+
+
+def _path_key(value):
+    return os.path.normcase(os.path.abspath(os.fspath(value)))
+
+
+def _crosslock_path(name, supplied, expected):
+    supplied_path = Path(supplied)
+    if not supplied_path.is_absolute():
+        raise ValueError(f"{name} crosslock mismatch")
+    if _path_key(supplied_path) != _path_key(expected):
+        raise ValueError(f"{name} crosslock mismatch")
+
+
+def _crosslock_method_config_before_load(supplied):
+    """Bind config loading to the materializer-owned stage beside cwd."""
+    cwd = Path.cwd()
+    if cwd.name != "code":
+        raise ValueError("method config path crosslock mismatch")
+    expected = cwd.parent / "config" / "method-config.json"
+    _crosslock_path("method config path", supplied, expected)
+    return Path(supplied)
+
+
+def _checkpoint_mapping(assignments):
+    result = {}
+    for assignment in assignments:
+        logical_id, separator, path_text = assignment.partition("=")
+        if (
+            not separator
+            or not logical_id
+            or not path_text
+            or logical_id in result
+        ):
+            raise ValueError("checkpoint mapping is malformed or duplicate")
+        checkpoint_path = Path(path_text)
+        if not checkpoint_path.is_absolute():
+            raise ValueError("checkpoint path crosslock mismatch")
+        result[logical_id] = checkpoint_path
+    return result
+
+
+def _crosslock_request(
+    args,
+    request,
+    method_config_path,
+    checkpoint_mapping,
+):
+    if args.method != request.method.method_id:
+        raise ValueError("method crosslock mismatch")
+    _crosslock_path(
+        "dataset path", args.dataset, request.measurements_path
+    )
+    if args.dataset_identity_sha256 != request.dataset_identity_sha256:
+        raise ValueError("dataset identity crosslock mismatch")
+    expected_config_path = (
+        request.measurements_path.parent.parent
+        / "config"
+        / "method-config.json"
+    )
+    _crosslock_path(
+        "method config path", method_config_path, expected_config_path
+    )
+    _crosslock_path(
+        "output path", args.output_dir, request.child_output_dir
+    )
+    if args.algorithm_seed != request.algorithm_seed.seed_u32:
+        raise ValueError("algorithm seed crosslock mismatch")
+    if args.device != request.child_runtime_device:
+        raise ValueError("child device crosslock mismatch")
+    if set(checkpoint_mapping) != set(request.checkpoint_paths):
+        raise ValueError("checkpoint logical-ID crosslock mismatch")
+    for logical_id, expected_path in request.checkpoint_paths.items():
+        _crosslock_path(
+            f"checkpoint {logical_id!r} path",
+            checkpoint_mapping[logical_id],
+            expected_path,
+        )
+
+
+def strict_main(argv=None):
+    """Run one canonical GSDiff method from a frozen materialized request."""
+    strict_argv = list(sys.argv[1:] if argv is None else argv)
+    _reject_duplicate_singletons(strict_argv)
+    args = _strict_parser().parse_args(strict_argv)
+    method_config_path = _crosslock_method_config_before_load(
+        args.method_config
+    )
+
+    import gsdiff.data as data
+    import gsdiff.experiments.adapters as adapters
+    import gsdiff.experiments.child_outputs as child_outputs
+    import gsdiff.experiments.execution as execution
+
+    request = execution.load_materialized_method_request(
+        method_config_path
+    )
+    checkpoint_mapping = _checkpoint_mapping(args.checkpoint)
+    _crosslock_request(
+        args,
+        request,
+        method_config_path,
+        checkpoint_mapping,
+    )
+    if (
+        request.method.execution_family != "gsdiff"
+        or request.method.method_id not in GSDIFF_METHOD_IDS
+    ):
+        raise ValueError("GSDiff method family mismatch")
+
+    child_started_at_utc = _utc_now()
+    acquisition = data.load_acquisition_data(
+        request.measurements_path,
+        expected_dataset_identity_sha256=(
+            request.dataset_identity_sha256
+        ),
+        expected_acquisition_spec=request.expected_acquisition_spec,
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        result = adapters.run_canonical_method(
+            request.method,
+            acquisition,
+            algorithm_seed=request.algorithm_seed,
+            checkpoint_paths=request.checkpoint_paths,
+            device=request.child_runtime_device,
+        )
+    child_finished_at_utc = _utc_now()
+    child_outputs.write_method_child_outputs_v2(
+        request.child_output_dir,
+        method=request.method,
+        acquisition=acquisition,
+        measurements_file_sha256=request.measurements_file_sha256,
+        algorithm_seed=request.algorithm_seed,
+        result=result,
+        child_started_at_utc=child_started_at_utc,
+        child_finished_at_utc=child_finished_at_utc,
+    )
+    print(f"completed method child: {request.method.method_id}")
+    print(request.child_output_dir / "reconstruction.npz")
+    print(request.child_output_dir / "method-info.json")
+    return 0
+
 
 def _compatibility_pyplot():
     """Load plotting only for the legacy evaluation/figure workflow."""
@@ -39,7 +301,7 @@ def _compatibility_pyplot():
 
 
 def parse_args(argv=None):
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(allow_abbrev=False)
     p.add_argument("--config", default="configs/default.yaml")
     p.add_argument("--solver", default=None)
     p.add_argument("--measurements-path", default=None)
@@ -229,6 +491,7 @@ def _estimated_motion_trajectory(motion_parameters, time_grid):
 def _run_legacy_compatibility(argv=None):
     """Run the legacy evaluation/figure CLI retained for compatibility."""
     args = parse_args(argv)
+    _require_parsed_legacy_truth(args.truth_path)
     with open(args.config, encoding='utf-8') as f:
         raw = yaml.safe_load(f)
     cfg = _to_ns(raw)
@@ -662,9 +925,46 @@ def _run_legacy_compatibility(argv=None):
     return mean_p
 
 
-def main(argv=None):
-    """Compatibility CLI entry point; strict child execution uses the adapter."""
+def legacy_main(argv=None):
+    """Run the explicitly requested legacy compatibility workflow."""
     return _run_legacy_compatibility(argv)
+
+
+def main(argv=None):
+    """Dispatch strict by default.
+
+    ``_run_legacy_compatibility`` remains reachable only through the explicit
+    ``legacy_main`` boundary below.
+    """
+    dispatch_argv = list(sys.argv[1:] if argv is None else argv)
+    marker_count = dispatch_argv.count("--legacy-compatibility")
+    if marker_count > 1:
+        raise SystemExit("duplicate strict option: --legacy-compatibility")
+    if marker_count == 1:
+        dispatch_argv.remove("--legacy-compatibility")
+        _reject_duplicate_legacy_truth(dispatch_argv)
+        if not _legacy_truth_supplied(dispatch_argv):
+            print(
+                "truthless legacy method output is disabled; "
+                "use the strict method interface",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+        print(
+            "LEGACY COMPATIBILITY: outputs are nonpromotable.",
+            file=sys.stderr,
+        )
+        return legacy_main(dispatch_argv)
+    if any(
+        _option_present(dispatch_argv, option)
+        for option in LEGACY_ONLY_OPTIONS
+    ):
+        print(
+            "legacy flags require explicit --legacy-compatibility",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    return strict_main(dispatch_argv)
 
 
 if __name__ == "__main__":

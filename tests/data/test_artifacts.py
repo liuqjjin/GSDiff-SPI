@@ -335,6 +335,55 @@ def t300_pair():
     return _tiny_pair(T=300)
 
 
+@pytest.fixture
+def _preserve_evaluation_import_state():
+    prefixes = (
+        "gsdiff.evaluation",
+        "gsdiff.baselines._evaluation",
+    )
+    before = {
+        name: module
+        for name, module in sys.modules.items()
+        if any(
+            name == prefix or name.startswith(prefix + ".")
+            for prefix in prefixes
+        )
+    }
+    parent_attributes = (
+        ("gsdiff", "evaluation"),
+        ("gsdiff.baselines", "_evaluation"),
+    )
+    attributes_before = {}
+    for parent_name, attribute_name in parent_attributes:
+        parent = sys.modules.get(parent_name)
+        namespace = vars(parent) if parent is not None else {}
+        attributes_before[(parent_name, attribute_name)] = (
+            attribute_name in namespace,
+            namespace.get(attribute_name),
+        )
+    try:
+        yield
+    finally:
+        for name in tuple(sys.modules):
+            if any(
+                name == prefix or name.startswith(prefix + ".")
+                for prefix in prefixes
+            ):
+                sys.modules.pop(name, None)
+        sys.modules.update(before)
+        for parent_name, attribute_name in parent_attributes:
+            parent = sys.modules.get(parent_name)
+            if parent is None:
+                continue
+            had_attribute, attribute = attributes_before[
+                (parent_name, attribute_name)
+            ]
+            if had_attribute:
+                setattr(parent, attribute_name, attribute)
+            else:
+                vars(parent).pop(attribute_name, None)
+
+
 def _write_entry_config(path, acquisition, output_dir):
     config = {
         "seed": 7,
@@ -372,54 +421,6 @@ def _write_entry_config(path, acquisition, output_dir):
         "output_dir": str(output_dir),
     }
     path.write_text(yaml.safe_dump(config, sort_keys=True), encoding="utf-8")
-
-
-def _assert_blind_output_is_measurement_only(output_dir, expected_identity):
-    assert set(entry.name for entry in output_dir.iterdir()) == {
-        "reconstruction.npz",
-        "iteration-history.jsonl",
-        "method-info.json",
-    }
-    reconstruction = load_reconstruction_output(
-        output_dir / "reconstruction.npz"
-    )
-    assert reconstruction.dataset_identity_sha256 == expected_identity
-    assert reconstruction.execution_policy == MethodExecutionPolicy(
-        execution_class="blind_method_child",
-        truth_access="unavailable",
-        promotion_eligible=True,
-    )
-    serialized_metadata = json.dumps(
-        {
-            "reconstruction": _read_metadata(
-                output_dir / "reconstruction.npz"
-            ),
-            "method_info": json.loads(
-                (output_dir / "method-info.json").read_text(encoding="utf-8")
-            ),
-            "history": [
-                json.loads(line)
-                for line in (
-                    output_dir / "iteration-history.jsonl"
-                ).read_text(encoding="utf-8").splitlines()
-            ],
-        },
-        sort_keys=True,
-    ).lower()
-    for forbidden in (
-        "canonical",
-        "ground_truth",
-        "gt_",
-        "gt-",
-        "psnr",
-        "ssim",
-        "nrmse",
-        "metric",
-        "evaluator",
-        "display",
-        "normalized",
-    ):
-        assert forbidden not in serialized_metadata
 
 
 def test_round_trip_restores_every_field_and_returns_direct_file_hash(tmp_path):
@@ -2245,7 +2246,7 @@ def test_raw_child_outputs_have_only_native_reconstruction_members(tmp_path):
         assert forbidden not in serialized
 
 
-def test_both_real_entrypoints_load_measurements_without_generation(
+def test_truthless_legacy_entrypoints_fail_before_generation_or_outputs(
     tmp_path, monkeypatch
 ):
     import train
@@ -2267,53 +2268,53 @@ def test_both_real_entrypoints_load_measurements_without_generation(
     assert blind_config["acquisition_spec"] == _mutable_json(
         blind_acquisition_spec(acquisition)
     )
-    train.main(
-        [
-            "--config",
-            str(train_config),
-            "--measurements-path",
-            str(measurements_path),
-            "--dataset-identity-sha256",
-            acquisition.dataset_identity_sha256,
-            "--output-dir",
-            str(train_output),
-            "--device",
-            "cpu",
-        ]
-    )
-    _assert_blind_output_is_measurement_only(
-        train_output, acquisition.dataset_identity_sha256
-    )
+    with pytest.raises(SystemExit):
+        train.main(
+            [
+                "--legacy-compatibility",
+                "--config",
+                str(train_config),
+                "--measurements-path",
+                str(measurements_path),
+                "--dataset-identity-sha256",
+                acquisition.dataset_identity_sha256,
+                "--output-dir",
+                str(train_output),
+                "--device",
+                "cpu",
+            ]
+        )
+    assert not train_output.exists()
 
     monkeypatch.setattr(
         run_baselines, "generate_spi_data", forbidden_generation
     )
     baseline_output = tmp_path / "baseline-output"
-    run_baselines.main(
-        [
-            "--config",
-            str(train_config),
-            "--name",
-            "blind-test",
-            "--baselines",
-            "dgi",
-            "--device",
-            "cpu",
-            "--measurements-path",
-            str(measurements_path),
-            "--dataset-identity-sha256",
-            acquisition.dataset_identity_sha256,
-            "--output-dir",
-            str(baseline_output),
-        ]
-    )
-    _assert_blind_output_is_measurement_only(
-        baseline_output, acquisition.dataset_identity_sha256
-    )
+    with pytest.raises(SystemExit):
+        run_baselines.main(
+            [
+                "--legacy-compatibility",
+                "--config",
+                str(train_config),
+                "--name",
+                "blind-test",
+                "--baselines",
+                "dgi",
+                "--device",
+                "cpu",
+                "--measurements-path",
+                str(measurements_path),
+                "--dataset-identity-sha256",
+                acquisition.dataset_identity_sha256,
+                "--output-dir",
+                str(baseline_output),
+            ]
+        )
+    assert not baseline_output.exists()
 
 
 def test_explicit_truth_compatibility_paths_are_unblinded_and_not_promotable(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, _preserve_evaluation_import_state
 ):
     import train
     import scripts.run_baselines as run_baselines
@@ -2333,6 +2334,7 @@ def test_explicit_truth_compatibility_paths_are_unblinded_and_not_promotable(
     monkeypatch.setattr(train, "generate_spi_data", forbidden_generation)
     train.main(
         [
+            "--legacy-compatibility",
             "--config",
             str(config_path),
             "--measurements-path",
@@ -2366,6 +2368,7 @@ def test_explicit_truth_compatibility_paths_are_unblinded_and_not_promotable(
     )
     run_baselines.main(
         [
+            "--legacy-compatibility",
             "--config",
             str(config_path),
             "--name",
@@ -2396,6 +2399,55 @@ def test_explicit_truth_compatibility_paths_are_unblinded_and_not_promotable(
         "promotion_eligible": False,
     }
     assert not (baseline_output / "method-info.json").exists()
+
+    legacy_policy = method_execution_policy(truth_path=truth_path)
+    with pytest.raises(ArtifactValidationError, match="not eligible"):
+        require_promotion_eligible(legacy_policy)
+
+    from gsdiff.experiments.child_outputs import (
+        validate_method_child_outputs_v2,
+    )
+    from gsdiff.experiments.methods import (
+        derive_algorithm_seed,
+        resolve_method_semantics,
+    )
+
+    expected_method = resolve_method_semantics(
+        "dgi",
+        method_config_id="smoke-default-v1",
+        base_config={},
+        measurements_metadata={
+            "H": acquisition.H,
+            "W": acquisition.W,
+            "T": acquisition.T,
+            "K": acquisition.K,
+            "holdout_K": acquisition.holdout_K,
+        },
+        execution_profile="controller-cpu-smoke-v1",
+    )
+    expected_seed = derive_algorithm_seed(
+        cell_seed=7,
+        dataset_identity_sha256=acquisition.dataset_identity_sha256,
+        method_id=expected_method.method_id,
+        method_config_sha256=expected_method.method_config_sha256,
+    )
+    for legacy_output in (train_output, baseline_output):
+        with pytest.raises(
+            ArtifactValidationError,
+            match="exactly two files|inventory must be flat",
+        ):
+            validate_method_child_outputs_v2(
+                legacy_output,
+                expected_method=expected_method,
+                expected_acquisition=acquisition,
+                expected_dataset_identity_sha256=(
+                    acquisition.dataset_identity_sha256
+                ),
+                expected_measurements_file_sha256=artifact_sha256(
+                    measurements_path
+                ),
+                expected_algorithm_seed=expected_seed,
+            )
 
 
 def test_method_child_entry_modules_have_no_top_level_evaluator_capabilities():
@@ -2442,7 +2494,14 @@ def test_fresh_blind_entry_processes_keep_evaluator_import_graph_closed(
                 "audit_path = Path(sys.argv[2])",
                 "entry_args = sys.argv[3:]",
                 "sys.argv = [str(entry_path), *entry_args]",
-                "namespace = runpy.run_path(str(entry_path), run_name='__main__')",
+                "namespace = {}",
+                "entry_exit_code = None",
+                "try:",
+                "    namespace = runpy.run_path(",
+                "        str(entry_path), run_name='__main__'",
+                "    )",
+                "except SystemExit as error:",
+                "    entry_exit_code = error.code",
                 "forbidden = {",
                 "    'evaluate_video',",
                 "    'evaluate_video_global_affine',",
@@ -2473,6 +2532,7 @@ def test_fresh_blind_entry_processes_keep_evaluator_import_graph_closed(
                 "    if names:",
                 "        process_bound[module_name] = names",
                 "audit = {",
+                "    'entry_exit_code': entry_exit_code,",
                 "    'entry_bound': entry_bound,",
                 "    'package_bound': package_bound,",
                 "    'process_bound': process_bound,",
@@ -2516,6 +2576,7 @@ def test_fresh_blind_entry_processes_keep_evaluator_import_graph_closed(
                 f"train-{scene_type}",
                 REPO_ROOT / "train.py",
                 [
+                    "--legacy-compatibility",
                     "--config",
                     str(config_path),
                     "--measurements-path",
@@ -2539,6 +2600,7 @@ def test_fresh_blind_entry_processes_keep_evaluator_import_graph_closed(
             "baseline-dgi",
             REPO_ROOT / "scripts" / "run_baselines.py",
             [
+                "--legacy-compatibility",
                 "--config",
                 str(baseline_config),
                 "--name",
@@ -2585,17 +2647,18 @@ def test_fresh_blind_entry_processes_keep_evaluator_import_graph_closed(
             completed.stderr,
         )
         assert audit == {
+            "entry_exit_code": 2,
             "entry_bound": [],
             "metrics_module_loaded": False,
             "package_bound": {},
             "process_bound": {},
         }
-        _assert_blind_output_is_measurement_only(
-            output_dir, acquisition.dataset_identity_sha256
-        )
+        assert not output_dir.exists()
 
 
-def test_real_method_child_subprocess_has_no_truth_capability(tmp_path):
+def test_real_legacy_without_evaluator_input_fails_before_artifacts(
+    tmp_path,
+):
     acquisition, _ = _tiny_pair()
     child_cwd = tmp_path / "method-child"
     child_cwd.mkdir()
@@ -2607,6 +2670,7 @@ def test_real_method_child_subprocess_has_no_truth_capability(tmp_path):
     command = [
         str(AUTHORITATIVE_PYTHON),
         str(REPO_ROOT / "scripts" / "run_baselines.py"),
+        "--legacy-compatibility",
         "--config",
         str(config_path),
         "--name",
@@ -2642,14 +2706,10 @@ def test_real_method_child_subprocess_has_no_truth_capability(tmp_path):
         timeout=60,
     )
 
-    assert completed.returncode == 0, completed.stderr
-    reconstructed = load_reconstruction_output(output_dir / "reconstruction.npz")
-    assert reconstructed.method_name == "dgi"
-    assert reconstructed.reconstruction.shape == (
-        acquisition.T,
-        acquisition.H,
-        acquisition.W,
-    )
+    assert completed.returncode == 2
+    assert "truthless legacy" in completed.stderr.lower()
+    assert "strict method interface" in completed.stderr.lower()
+    assert not output_dir.exists()
     truth_seeker = subprocess.run(
         [
             str(AUTHORITATIVE_PYTHON),
@@ -7367,3 +7427,269 @@ def test_task3_round1_target_inputs_reject_same_bytes_replacement_at_second_read
             W=8,
         )
     assert calls == 2
+
+
+_METHOD_REGISTRY_DOC = (
+    REPO_ROOT / "docs" / "experiments" / "method-registry-v1.md"
+)
+_METHOD_REGISTRY_MARKER_START = "<!-- method-registry-machine-v1:start -->"
+_METHOD_REGISTRY_MARKER_END = "<!-- method-registry-machine-v1:end -->"
+_PILOT_READINESS_BLOCKERS = [
+    "all-eleven-method-clean-clone-subprocess-evidence-missing",
+    "diffusion-reproducible-checkpoint-locator-missing",
+    "diffusion-checkpoint-training-provenance-missing",
+    "required-cuda-preflight-evidence-missing",
+    "required-disk-preflight-evidence-missing",
+]
+
+
+def _load_method_registry_document():
+    text = _METHOD_REGISTRY_DOC.read_text(encoding="utf-8")
+    assert text.count(_METHOD_REGISTRY_MARKER_START) == 1
+    assert text.count(_METHOD_REGISTRY_MARKER_END) == 1
+    payload = text.split(_METHOD_REGISTRY_MARKER_START, 1)[1]
+    payload = payload.split(_METHOD_REGISTRY_MARKER_END, 1)[0].strip()
+    assert payload.startswith("```json\n")
+    assert payload.endswith("\n```")
+    snapshot = json.loads(payload[len("```json\n") : -len("\n```")])
+    return text, snapshot
+
+
+def _canonical_json_sha256(value):
+    payload = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def test_method_registry_document_binds_all_canonical_publication_and_smoke_profiles():
+    _, snapshot = _load_method_registry_document()
+    registry_path = REPO_ROOT / "configs" / "protocols" / "methods-v1.yaml"
+    registry = yaml.safe_load(registry_path.read_text(encoding="utf-8"))
+    canonical_ids = [method["id"] for method in registry["methods"]]
+    expected_profile_hashes = {
+        method["id"]: {
+            profile_id: _canonical_json_sha256(method["profiles"][profile_id])
+            for profile_id in (
+                "publication-v1",
+                "controller-cpu-smoke-v1",
+            )
+        }
+        for method in registry["methods"]
+    }
+    expected_profiles = {
+        method["id"]: {
+            profile_id: method["profiles"][profile_id]
+            for profile_id in (
+                "publication-v1",
+                "controller-cpu-smoke-v1",
+            )
+        }
+        for method in registry["methods"]
+    }
+
+    assert canonical_ids == [
+        "dgi",
+        "static_cs",
+        "perframe_cs",
+        "tv3d",
+        "monin",
+        "gidc3dtv",
+        "recinr",
+        "siren",
+        "recinr_se2",
+        "gsdiff_tv",
+        "gsdiff_diffusion",
+    ]
+    assert snapshot["registry"] == {
+        "source": "configs/protocols/methods-v1.yaml",
+        "source_sha256": hashlib.sha256(registry_path.read_bytes()).hexdigest(),
+        "canonical_ids": canonical_ids,
+        "profile_hash_algorithm": (
+            "sha256(canonical-json(raw-profile-object))"
+        ),
+        "profile_sha256": expected_profile_hashes,
+        "profiles": expected_profiles,
+    }
+
+
+def test_method_registry_document_binds_rec_inr_provenance_and_license_status():
+    text, snapshot = _load_method_registry_document()
+    provenance = snapshot["recinr_provenance"]
+    expected_local_hashes = {
+        "gsdiff/baselines/recinr_model.py": (
+            "7cfa1c7f20809634bc71fc14b143f815"
+            "12358198af946f0039a38ad119c94eb7"
+        ),
+        "gsdiff/baselines/recinr.py": (
+            "6bcb79509e1dcfe07e857aa5a5f92cb"
+            "1cf32211c8017e4b0b692c80a64a6875a"
+        ),
+        "gsdiff/baselines/inr.py": (
+            "600c26aec1545c0f7aab36d0cad5f95d"
+            "4f4005ad0d3b9042e6c09f9ccdeabdf4"
+        ),
+    }
+    actual_local_hashes = {
+        path: hashlib.sha256((REPO_ROOT / path).read_bytes()).hexdigest()
+        for path in expected_local_hashes
+    }
+
+    assert provenance == {
+        "url": "https://github.com/liuqjjin/ReCINR",
+        "pinned_commit": (
+            "9149d1d228db2e4eb3ae852a004f1d9e95ee0229"
+        ),
+        "pinned_tree": "61df3a42e83f3145892ca8bba0aadfc88dc38c08",
+        "remote_sha256": {
+            "README.md": (
+                "ce118bfc1514ae9a15d688ab5c4333a"
+                "73600b756370bd666593e140dffefdfa2"
+            ),
+            "pyproject.toml": (
+                "30c8d4e440f9e6ba18b345e035cef7b9"
+                "74ed858d3109364ab8eae99b235a8521"
+            ),
+            "src/recinr/model.py": (
+                "9c0d85bbc7e634038c9e060e4458f1df"
+                "5d9d72f21069d5a924915b570a08660a"
+            ),
+            "src/recinr/train.py": (
+                "a9a066b454e6be1cbbf67cfe30b23117"
+                "67560edd5e6d5c96ca842c0b838c399c"
+            ),
+        },
+        "local_sha256": expected_local_hashes,
+        "source_mapping": {
+            "gsdiff/baselines/recinr_model.py": {
+                "relation": (
+                    "earlier-upstream-snapshot-after-removing-641-byte-"
+                    "local-header-and-retaining-opening-triple-quote"
+                ),
+                "ancestor_commit": (
+                    "847cca7cafded24ffc36522e92bc504090e48ab0"
+                ),
+                "ancestor_path": "src/recinr/model.py",
+                "ancestor_sha256": (
+                    "bf80fc0b2573839ef500c45511e6692c"
+                    "5a669aef5fd4619974ddbb220b396047"
+                ),
+                "ancestor_bytes": 18537,
+                "pinned_commit_byte_identical": False,
+            },
+            "gsdiff/baselines/recinr.py": {
+                "relation": "local-adapter-no-one-to-one-remote-blob",
+            },
+            "gsdiff/baselines/inr.py": {
+                "relation": "earlier-local-control-not-vendored",
+            },
+        },
+        "github_license_info": None,
+        "github_is_archived": False,
+        "pinned_tree_entry_count": 285,
+        "pinned_tree_truncated": False,
+        "license_files_present": [],
+        "license_file_names_checked": [
+            "LICENSE",
+            "LICENSE.md",
+            "LICENSE.txt",
+            "COPYING",
+            "NOTICE",
+        ],
+        "repository_license_declarations": (
+            "README-and-pyproject-declarations-only"
+        ),
+        "confirmed_redistribution_grant": False,
+        "archive_status": "blocked-license-copyright-review",
+    }
+    assert actual_local_hashes == expected_local_hashes
+    local_model = (
+        REPO_ROOT / "gsdiff" / "baselines" / "recinr_model.py"
+    ).read_bytes()
+    ancestor_snapshot = local_model[:3] + local_model[644:]
+    assert len(ancestor_snapshot) == 18537
+    assert hashlib.sha256(ancestor_snapshot).hexdigest() == (
+        provenance["source_mapping"]["gsdiff/baselines/recinr_model.py"][
+            "ancestor_sha256"
+        ]
+    )
+    assert "declarations only" in text
+    assert "not a confirmed redistribution grant" in text
+    assert "blocked-license-copyright-review" in text
+
+
+def test_method_registry_document_binds_blind_contract_and_current_blockers():
+    text, snapshot = _load_method_registry_document()
+    registry = yaml.safe_load(
+        (
+            REPO_ROOT / "configs" / "protocols" / "methods-v1.yaml"
+        ).read_text(encoding="utf-8")
+    )
+    pilot = yaml.safe_load(
+        (
+            REPO_ROOT / "configs" / "protocols" / "pilot-v1.yaml"
+        ).read_text(encoding="utf-8")
+    )
+    diffusion = next(
+        method
+        for method in registry["methods"]
+        if method["id"] == "gsdiff_diffusion"
+    )
+
+    assert snapshot["blind_contract"] == {
+        "selection_formula_id": "heldout-normalized-l2-v1",
+        "selection_formula": (
+            "||pred-y||_2/max(||y||_2,1e-12); "
+            "pred[k]=sum(P[k]*reconstruction[frame_indices[k]])"
+        ),
+        "selection_dtype": "float64",
+        "selection_units": (
+            "raw physical detector measurement units before ratio"
+        ),
+        "algorithm_seed_domain": "algorithm-seed-v1",
+        "child_output_files": [
+            "reconstruction.npz",
+            "method-info.json",
+        ],
+        "final_output_files": [
+            "reconstruction.npz",
+            "metrics.json",
+            "method-info.json",
+            "stdout.log",
+            "stderr.log",
+        ],
+        "boundary": "procedural-boundary-for-trusted-research-code",
+        "os_sandbox": False,
+        "native_extensions_covered": False,
+        "direct_syscalls_covered": False,
+    }
+    assert snapshot["diffusion_checkpoint"] == {
+        "logical_id": diffusion["checkpoints"][0]["logical_id"],
+        "sha256": diffusion["checkpoints"][0]["sha256"],
+        "provenance_status": (
+            diffusion["checkpoints"][0]["provenance_status"]
+        ),
+        "publication_execution_ready": (
+            diffusion["profiles"]["publication-v1"]["execution_ready"]
+        ),
+        "publication_blockers": (
+            diffusion["profiles"]["publication-v1"][
+                "execution_blockers"
+            ]
+        ),
+    }
+    assert snapshot["pilot_readiness"] == {
+        "campaign": "configs/protocols/pilot-v1.yaml",
+        "execution_ready": False,
+        "blockers": _PILOT_READINESS_BLOCKERS,
+    }
+    assert pilot["execution_ready"] is False
+    assert "not an OS sandbox" in text
+    assert "native extensions" in text
+    assert "direct system calls" in text
+    assert "--legacy-compatibility" in text
+    assert "never publication evidence" in text
