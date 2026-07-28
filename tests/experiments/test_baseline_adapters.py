@@ -3,16 +3,19 @@ from __future__ import annotations
 from dataclasses import replace
 import json
 import inspect
+import os
 import random
 from pathlib import Path
 import shutil
 import subprocess
 import sys
+import textwrap
 
 import numpy as np
 import pytest
 import torch
 
+from gsdiff.data._artifact_dataset import save_acquisition_data
 from gsdiff.data._artifact_identity import array_descriptor
 from gsdiff.data._artifact_models import SPIAcquisitionData
 from gsdiff.data.simulation import SPIData
@@ -211,16 +214,124 @@ def test_strict_core_signatures_expose_no_capability_escape_hatches() -> None:
         assert not any("truth" in parameter.name.lower() or "gt" in parameter.name.lower() or parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values())
 
 
-def test_strict_import_closure_survives_without_evaluator_or_truth_sources(tmp_path: Path) -> None:
+def test_strict_runtime_import_closure_executes_all_baselines_without_evaluator_or_truth_sources(
+    tmp_path: Path,
+    blind_acquisition: SPIAcquisitionData,
+) -> None:
     source_root = Path(__file__).resolve().parents[2]
     snapshot = tmp_path / "snapshot"
     shutil.copytree(source_root / "gsdiff", snapshot / "gsdiff", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    registry_path = snapshot / "configs" / "protocols" / "methods-v1.yaml"
+    registry_path.parent.mkdir(parents=True)
+    shutil.copy2(
+        source_root / "configs" / "protocols" / "methods-v1.yaml",
+        registry_path,
+    )
     (snapshot / "gsdiff" / "baselines" / "_evaluation.py").unlink()
     (snapshot / "gsdiff" / "data" / "_artifact_truth.py").unlink()
     shutil.rmtree(snapshot / "gsdiff" / "evaluation")
-    probe = "import sys; import gsdiff.experiments.adapters; import gsdiff.baselines.cs, gsdiff.baselines.gidc, gsdiff.baselines.monin, gsdiff.baselines.tv3d; assert 'gsdiff.baselines._evaluation' not in sys.modules"
-    completed = subprocess.run([sys.executable, "-c", probe], cwd=snapshot, capture_output=True, text=True, check=False)
-    assert completed.returncode == 0, completed.stderr
+    acquisition_path = tmp_path / "blind-acquisition.npz"
+    serializable_acquisition = replace(
+        blind_acquisition,
+        acquisition={
+            **dict(blind_acquisition.acquisition),
+            "pattern_family": "random",
+            "holdout_pattern_family": "uniform-random",
+            "noise_convention": "detector-absolute",
+        },
+    )
+    save_acquisition_data(serializable_acquisition, acquisition_path)
+    probe = textwrap.dedent(
+        """\
+        import sys
+        from pathlib import Path
+
+        import gsdiff
+        from gsdiff.data._artifact_dataset import load_acquisition_data
+        from gsdiff.experiments.adapters import (
+            BASELINE_METHOD_IDS,
+            run_baseline_method,
+        )
+        from gsdiff.experiments.methods import (
+            derive_algorithm_seed,
+            resolve_method_semantics,
+        )
+
+        EXPECTED_METHOD_IDS = (
+            "dgi",
+            "static_cs",
+            "perframe_cs",
+            "tv3d",
+            "monin",
+            "gidc3dtv",
+            "recinr",
+        )
+        FORBIDDEN_PREFIXES = (
+            "gsdiff.evaluation",
+            "gsdiff.baselines._evaluation",
+            "gsdiff.data._artifact_truth",
+        )
+
+        assert Path(gsdiff.__file__).resolve().parent.parent == Path.cwd().resolve()
+        assert tuple(BASELINE_METHOD_IDS) == EXPECTED_METHOD_IDS
+        acquisition = load_acquisition_data(
+            Path(sys.argv[1]),
+            expected_dataset_identity_sha256="a" * 64,
+        )
+        for method_id in EXPECTED_METHOD_IDS:
+            method = resolve_method_semantics(
+                method_id,
+                method_config_id="smoke-default-v1",
+                base_config={},
+                measurements_metadata={
+                    "H": acquisition.H,
+                    "W": acquisition.W,
+                    "T": acquisition.T,
+                    "K": acquisition.K,
+                    "holdout_K": acquisition.holdout_K,
+                },
+                execution_profile="controller-cpu-smoke-v1",
+            )
+            algorithm_seed = derive_algorithm_seed(
+                cell_seed=11,
+                dataset_identity_sha256=acquisition.dataset_identity_sha256,
+                method_id=method.method_id,
+                method_config_sha256=method.method_config_sha256,
+            )
+            result = run_baseline_method(
+                method,
+                acquisition,
+                algorithm_seed=algorithm_seed,
+                device="cpu",
+            )
+            assert result.method_id == method_id
+            loaded_forbidden = sorted(
+                name
+                for name in sys.modules
+                if any(
+                    name == prefix or name.startswith(prefix + ".")
+                    for prefix in FORBIDDEN_PREFIXES
+                )
+            )
+            assert not loaded_forbidden, (
+                f"{method_id} loaded forbidden modules: {loaded_forbidden}"
+            )
+        """
+    )
+    child_env = os.environ.copy()
+    child_env["PYTHONPATH"] = str(snapshot)
+    child_env["PYTHONNOUSERSITE"] = "1"
+    completed = subprocess.run(
+        [sys.executable, "-c", probe, str(acquisition_path)],
+        cwd=snapshot,
+        env=child_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, (
+        f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
+    )
 
 
 @pytest.mark.parametrize("method_id", ("dgi", "gidc3dtv", "recinr"))
