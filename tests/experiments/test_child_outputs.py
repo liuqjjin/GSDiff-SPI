@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import replace
 import json
 import os
@@ -32,6 +33,7 @@ from gsdiff.experiments.methods import (
     ResolvedMethod,
     derive_algorithm_seed,
     resolve_method_semantics,
+    thaw_json,
 )
 
 
@@ -180,6 +182,141 @@ def static_result(
             "checkpoint_hashes": [],
         },
         history=history,
+    )
+
+
+def snapshot_method_result(
+    method_id: str,
+    *,
+    profile: str = "controller-cpu-smoke-v1",
+    solver_changes: dict[str, object] | None = None,
+) -> tuple[ResolvedMethod, MethodChildResult]:
+    method = resolved_method(method_id, profile=profile)
+    semantic = thaw_json(method.semantic_config)
+    solver = semantic["solver"]
+    if solver_changes is not None:
+        solver.update(solver_changes)
+    method = replace(method, semantic_config=semantic)
+
+    if method_id == "gidc3dtv":
+        steps = list(
+            range(
+                int(solver["eval_every"]),
+                int(solver["n_steps"]) + 1,
+                int(solver["eval_every"]),
+            )
+        )
+        if not steps or steps[-1] != int(solver["n_steps"]):
+            steps.append(int(solver["n_steps"]))
+        candidate_grid = [
+            {"xi_xy": xi_xy, "xi_t": xi_t, "snapshot_step": step}
+            for xi_xy in solver["xi_xy"]
+            for xi_t in solver["xi_t"]
+            for step in steps
+        ]
+        selected_hyperparameters: object = {
+            "xi_xy": candidate_grid[0]["xi_xy"],
+            "xi_t": candidate_grid[0]["xi_t"],
+        }
+        native_unit = "adam-step"
+        native_budget = int(solver["n_steps"])
+    elif method_id == "recinr":
+        warm_steps = int(solver["warm_steps"])
+        flow_steps = int(solver["flow_steps"])
+        joint_steps = int(solver["joint_steps"])
+        total_steps = flow_steps + joint_steps
+        candidate_grid = [
+            {"snapshot_step": warm_steps + loop_step + 1}
+            for loop_step in range(total_steps)
+            if loop_step >= flow_steps
+            and (
+                loop_step % int(solver["snapshot_every"]) == 0
+                or loop_step == total_steps - 1
+            )
+        ]
+        selected_hyperparameters = None
+        native_unit = "optimization-step"
+        native_budget = warm_steps + total_steps
+    else:
+        raise ValueError(f"unsupported snapshot method: {method_id}")
+
+    rows = [
+        {
+            "candidate": copy.deepcopy(candidate),
+            "formula_id": "heldout-normalized-l2-v1",
+            "numerator": float(index + 1),
+            "denominator": 1.0,
+            "value": float(index + 1),
+        }
+        for index, candidate in enumerate(candidate_grid)
+    ]
+    selected_candidate = copy.deepcopy(candidate_grid[0])
+    source_step = int(selected_candidate["snapshot_step"])
+    history = tuple(
+        {
+            "kind": "step",
+            "step": step,
+            "loss": float(step),
+            **(
+                {"reconstruction_source": True}
+                if step == source_step
+                else {}
+            ),
+        }
+        for step in range(1, native_budget + 1)
+    )
+    return method, MethodChildResult(
+        method_id=method_id,
+        reconstruction=np.ones((4, 32, 32), dtype=np.float32),
+        estimated_motion_trajectory=None,
+        dgi=None,
+        info={
+            "parameter_count": 1,
+            "native_iteration_unit": native_unit,
+            "native_iteration_budget": native_budget,
+            "convergence_status": method.convergence_status,
+            "selected_hyperparameters": selected_hyperparameters,
+            "selection": {
+                "formula_id": "heldout-normalized-l2-v1",
+                "candidate_grid": candidate_grid,
+                "selected_candidate": selected_candidate,
+                "rows": rows,
+            },
+            "checkpoint_hashes": [],
+        },
+        history=history,
+    )
+
+
+def monin_result(parameter_count: int) -> MethodChildResult:
+    candidate = 0.0001
+    return MethodChildResult(
+        method_id="monin",
+        reconstruction=np.ones((4, 32, 32), dtype=np.float32),
+        estimated_motion_trajectory=np.zeros((4, 3), dtype=np.float32),
+        dgi=None,
+        info={
+            "parameter_count": parameter_count,
+            "native_iteration_unit": "admm-iteration",
+            "native_iteration_budget": 1,
+            "convergence_status": "smoke-only/not-convergence-assessed",
+            "selected_hyperparameters": {"lambda": candidate},
+            "selection": {
+                "formula_id": "heldout-normalized-l2-v1",
+                "candidate_grid": [candidate],
+                "selected_candidate": candidate,
+                "rows": [{
+                    "candidate": candidate,
+                    "formula_id": "heldout-normalized-l2-v1",
+                    "numerator": 1.0,
+                    "denominator": 1.0,
+                    "value": 1.0,
+                }],
+            },
+            "checkpoint_hashes": [],
+            "native_motion_model": "translation-polynomial",
+        },
+        history=({"kind": "iteration", "iteration": 1, "loss": 1.0},),
     )
 
 
@@ -432,6 +569,301 @@ def test_convergence_required_selection_positive_control(
         result=static_result(history=history),
     )
     assert validate_valid(tmp_path, method, data, seed) == hashes
+
+
+@pytest.mark.parametrize("method_id", ("gidc3dtv", "recinr"))
+def test_snapshot_selection_positive_controls_round_trip(
+    tmp_path: Path,
+    method_id: str,
+) -> None:
+    method, result = snapshot_method_result(method_id)
+    data = acquisition()
+    seed = algorithm_seed(method, data)
+    hashes = dict(
+        write_method_child_outputs_v2(
+            tmp_path,
+            method=method,
+            acquisition=data,
+            measurements_file_sha256=MEASUREMENTS_SHA256,
+            algorithm_seed=seed,
+            result=result,
+            child_started_at_utc="2026-07-28T00:00:00Z",
+            child_finished_at_utc="2026-07-28T00:00:01Z",
+        )
+    )
+    assert validate_valid(tmp_path, method, data, seed) == hashes
+    info = load_info(tmp_path / "method-info.json")
+    assert info["selection"] == result.info["selection"]
+    assert sum(
+        row.get("reconstruction_source") is True
+        for row in info["convergence"]["history"]
+    ) == 1
+
+
+def test_old_six_row_gidc_snapshot_selection_is_rejected() -> None:
+    method, valid = snapshot_method_result(
+        "gidc3dtv", profile="publication-v1"
+    )
+    data = acquisition()
+    child_outputs._validate_result(valid, data, method)
+    info = copy.deepcopy(dict(valid.info))
+    old_grid = [
+        {"xi_xy": xi_xy, "xi_t": xi_t}
+        for xi_xy in (0.003, 0.03, 0.3)
+        for xi_t in (0.01, 0.1)
+    ]
+    info["selection"] = {
+        "formula_id": "heldout-normalized-l2-v1",
+        "candidate_grid": old_grid,
+        "selected_candidate": copy.deepcopy(old_grid[0]),
+        "rows": [
+            {
+                "candidate": copy.deepcopy(candidate),
+                "formula_id": "heldout-normalized-l2-v1",
+                "numerator": float(index + 1),
+                "denominator": 1.0,
+                "value": float(index + 1),
+            }
+            for index, candidate in enumerate(old_grid)
+        ],
+    }
+    legacy = replace(valid, info=info)
+    with pytest.raises(ValueError, match="candidate|snapshot|grid"):
+        child_outputs._validate_result(legacy, data, method)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "missing-row",
+        "extra-row",
+        "duplicate-row",
+        "reordered-rows",
+        "wrong-step",
+        "non-first-minimum",
+        "projection-mismatch",
+        "snapshot-leaked-into-hyperparameters",
+    ),
+)
+def test_gidc_snapshot_selection_mutations_are_rejected(
+    mutation: str,
+) -> None:
+    method, valid = snapshot_method_result(
+        "gidc3dtv",
+        solver_changes={
+            "n_steps": 2,
+            "eval_every": 1,
+            "xi_xy": [0.003, 0.03],
+            "xi_t": [0.01],
+        },
+    )
+    data = acquisition()
+    child_outputs._validate_result(valid, data, method)
+    info = copy.deepcopy(dict(valid.info))
+    selection = info["selection"]
+    rows = selection["rows"]
+    grid = selection["candidate_grid"]
+    if mutation == "missing-row":
+        rows.pop()
+    elif mutation == "extra-row":
+        rows.append(copy.deepcopy(rows[-1]))
+    elif mutation == "duplicate-row":
+        rows[1] = copy.deepcopy(rows[0])
+    elif mutation == "reordered-rows":
+        rows[0], rows[1] = rows[1], rows[0]
+    elif mutation == "wrong-step":
+        grid[1]["snapshot_step"] = 99
+        rows[1]["candidate"]["snapshot_step"] = 99
+    elif mutation == "non-first-minimum":
+        selection["selected_candidate"] = copy.deepcopy(grid[1])
+    elif mutation == "projection-mismatch":
+        info["selected_hyperparameters"] = {
+            "xi_xy": 0.03,
+            "xi_t": 0.01,
+        }
+    else:
+        info["selected_hyperparameters"]["snapshot_step"] = 1
+    mutated = replace(valid, info=info)
+    with pytest.raises(
+        ValueError,
+        match="selection|candidate|grid|row|hyperparameter|snapshot",
+    ):
+        child_outputs._validate_result(mutated, data, method)
+
+
+@pytest.mark.parametrize(
+    "mutation", ("non-null-hyperparameters", "null-selection")
+)
+def test_recinr_snapshot_selection_shape_mutations_are_rejected(
+    mutation: str,
+) -> None:
+    method, valid = snapshot_method_result("recinr")
+    data = acquisition()
+    child_outputs._validate_result(valid, data, method)
+    info = copy.deepcopy(dict(valid.info))
+    if mutation == "non-null-hyperparameters":
+        info["selected_hyperparameters"] = {"snapshot_step": 3}
+    else:
+        info["selection"] = None
+    mutated = replace(valid, info=info)
+    with pytest.raises(
+        ValueError,
+        match="selection|hyperparameter|snapshot",
+    ):
+        child_outputs._validate_result(mutated, data, method)
+
+
+@pytest.mark.parametrize("method_id", ("gidc3dtv", "recinr"))
+@pytest.mark.parametrize(
+    "mutation",
+    ("missing", "duplicate", "false", "wrong-step", "non-step"),
+)
+def test_reconstruction_source_marker_mutations_are_rejected(
+    method_id: str,
+    mutation: str,
+) -> None:
+    changes = (
+        {"n_steps": 2, "eval_every": 1}
+        if method_id == "gidc3dtv"
+        else None
+    )
+    method, valid = snapshot_method_result(
+        method_id, solver_changes=changes
+    )
+    data = acquisition()
+    child_outputs._validate_result(valid, data, method)
+    history = [copy.deepcopy(dict(row)) for row in valid.history]
+    source_index = next(
+        index
+        for index, row in enumerate(history)
+        if row.get("reconstruction_source") is True
+    )
+    other_index = 0 if source_index != 0 else 1
+    if mutation == "missing":
+        history[source_index].pop("reconstruction_source")
+    elif mutation == "duplicate":
+        history[other_index]["reconstruction_source"] = True
+    elif mutation == "false":
+        history[source_index]["reconstruction_source"] = False
+    elif mutation == "wrong-step":
+        history[source_index].pop("reconstruction_source")
+        history[other_index]["reconstruction_source"] = True
+    else:
+        step = history[source_index].pop("step")
+        history[source_index]["kind"] = "iteration"
+        history[source_index]["iteration"] = step
+    mutated = replace(valid, history=tuple(history))
+    with pytest.raises(
+        ValueError,
+        match="reconstruction|source|snapshot|history|step",
+    ):
+        child_outputs._validate_result(mutated, data, method)
+
+
+def test_only_snapshot_methods_accept_reconstruction_source_marker() -> None:
+    method, valid_snapshot = snapshot_method_result("gidc3dtv")
+    data = acquisition()
+    child_outputs._validate_result(valid_snapshot, data, method)
+    dgi_method = resolved_method("dgi")
+    valid_dgi = dgi_result(
+        history=({"kind": "step", "step": 1, "loss": 1.0},)
+    )
+    child_outputs._validate_result(valid_dgi, data, dgi_method)
+    marked_dgi = replace(
+        valid_dgi,
+        history=({
+            "kind": "step",
+            "step": 1,
+            "loss": 1.0,
+            "reconstruction_source": True,
+        },),
+    )
+    with pytest.raises(ValueError, match="reconstruction|source|snapshot"):
+        child_outputs._validate_result(marked_dgi, data, dgi_method)
+
+
+def test_bounded_history_always_retains_reconstruction_source(
+    tmp_path: Path,
+) -> None:
+    method, result = snapshot_method_result(
+        "gidc3dtv",
+        solver_changes={"n_steps": 42, "eval_every": 4},
+    )
+    data = acquisition()
+    seed = algorithm_seed(method, data)
+    write_method_child_outputs_v2(
+        tmp_path,
+        method=method,
+        acquisition=data,
+        measurements_file_sha256=MEASUREMENTS_SHA256,
+        algorithm_seed=seed,
+        result=result,
+        child_started_at_utc="2026-07-28T00:00:00Z",
+        child_finished_at_utc="2026-07-28T00:00:01Z",
+    )
+    original = load_info(tmp_path / "method-info.json")
+    convergence = original["convergence"]
+    assert convergence["sampling_policy"] == (
+        "floor-grid-21-with-reconstruction-source-v1"
+    )
+    assert convergence["serialized_count"] == 21
+    expected_steps = [
+        1, 4, 5, 7, 9, 11, 13, 15, 17, 19, 21,
+        23, 25, 27, 29, 31, 33, 35, 37, 39, 42,
+    ]
+    assert [
+        row["step"] for row in convergence["history"]
+    ] == expected_steps
+    source_rows = [
+        row
+        for row in convergence["history"]
+        if row.get("reconstruction_source") is True
+    ]
+    assert [row["step"] for row in source_rows] == [4]
+    validate_valid(tmp_path, method, data, seed)
+
+    rewrite_info(
+        tmp_path / "method-info.json",
+        lambda info: next(
+            row
+            for row in info["convergence"]["history"]
+            if row.get("reconstruction_source") is True
+        ).pop("reconstruction_source"),
+    )
+    with pytest.raises(ValueError, match="reconstruction|source|snapshot"):
+        validate_valid(tmp_path, method, data, seed)
+
+    atomic_write_bytes(
+        tmp_path / "method-info.json", canonical_json_bytes(original)
+    )
+
+    def move_source(info: dict[str, object]) -> None:
+        history = info["convergence"]["history"]
+        source = next(
+            row
+            for row in history
+            if row.get("reconstruction_source") is True
+        )
+        source.pop("reconstruction_source")
+        history[2]["reconstruction_source"] = True
+
+    rewrite_info(tmp_path / "method-info.json", move_source)
+    with pytest.raises(ValueError, match="reconstruction|source|snapshot|step"):
+        validate_valid(tmp_path, method, data, seed)
+
+
+def test_validator_rejects_legacy_monin_intercept_count() -> None:
+    method = resolved_method(
+        "monin", profile="controller-cpu-smoke-v1"
+    )
+    data = acquisition()
+    corrected = monin_result(32 * 32 + 2)
+    child_outputs._validate_result(corrected, data, method)
+    legacy_info = copy.deepcopy(dict(corrected.info))
+    legacy_info["parameter_count"] = 32 * 32 + 4
+    legacy = replace(corrected, info=legacy_info)
+    with pytest.raises(ValueError, match="parameter_count"):
+        child_outputs._validate_result(legacy, data, method)
 
 
 def test_closed_semantic_schema_accepts_every_resolved_method_profile(

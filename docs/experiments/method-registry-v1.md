@@ -56,6 +56,24 @@ internal iterate, but it must return to physical forward-model scale before
 selection or artifact writing. PSNR, SSIM, ground truth, trajectory error,
 z-scored residuals, and evaluator data are not child selection signals.
 
+GIDC records the complete nested snapshot search. Each candidate is
+`{xi_xy, xi_t, snapshot_step}`, where `snapshot_step` is the 1-based completed
+Adam update. Publication order is the registry's xi-xy order, then xi-t order,
+then `25, 50, ..., 2500`, exactly 600 rows. ReCINR candidates are
+`{snapshot_step}` at the 1-based global optimization step including warm-up;
+publication uses `[701 + 50*j for j in range(24)] + [1900]`, exactly 25 rows.
+Selection keeps the exact first minimum in those orders. GIDC reports only the
+two-xi projection as selected hyperparameters, and ReCINR reports null
+hyperparameters. Each selected run has one `reconstruction_source: true`
+history step matching the selected snapshot, and its 21-row bounded history
+retains that step.
+
+Classical `parameter_count` is fitted scalar degrees of freedom: DGI `0`,
+static CS `H*W`, per-frame CS and TV3D `T*H*W`, and Monin
+`H*W + 2*polynomial_degree`. Monin's translation polynomial is anchored at the
+reference block, so it has no fitted intercept; degree one and two therefore
+contribute two and four motion coefficients, respectively.
+
 Algorithm randomness has a separate `algorithm-seed-v1` domain:
 
 ```text
@@ -153,7 +171,7 @@ read-only through GitHub's API; no excluded local ReCINR workspace was used.
 | Current tracked path | SHA-256 | Defensible mapping |
 | --- | --- | --- |
 | `gsdiff/baselines/recinr_model.py` | `7cfa1c7f20809634bc71fc14b143f81512358198af946f0039a38ad119c94eb7` | local header plus an earlier upstream model snapshot |
-| `gsdiff/baselines/recinr.py` | `6bcb79509e1dcfe07e857aa5a5f92cb1cf32211c8017e4b0b692c80a64a6875a` | local semantic adapter; no one-to-one remote blob |
+| `gsdiff/baselines/recinr.py` | `a8f3db6b7b34d501c077ff8592c11a473b884db9dcc7b3e9fc16fba144ac868e` | local semantic adapter; no one-to-one remote blob |
 | `gsdiff/baselines/inr.py` | `600c26aec1545c0f7aab36d0cad5f95d4f4005ad0d3b9042e6c09f9ccdeabdf4` | earlier local control; not labelled as vendored ReCINR |
 
 For the first mapping, removing local bytes 3--643 (a 641-byte header while
@@ -315,7 +333,7 @@ numbers.
     },
     "local_sha256": {
       "gsdiff/baselines/recinr_model.py": "7cfa1c7f20809634bc71fc14b143f81512358198af946f0039a38ad119c94eb7",
-      "gsdiff/baselines/recinr.py": "6bcb79509e1dcfe07e857aa5a5f92cb1cf32211c8017e4b0b692c80a64a6875a",
+      "gsdiff/baselines/recinr.py": "a8f3db6b7b34d501c077ff8592c11a473b884db9dcc7b3e9fc16fba144ac868e",
       "gsdiff/baselines/inr.py": "600c26aec1545c0f7aab36d0cad5f95d4f4005ad0d3b9042e6c09f9ccdeabdf4"
     },
     "source_mapping": {

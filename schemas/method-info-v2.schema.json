@@ -101,7 +101,8 @@
         "sampling_policy": {
           "enum": [
             "all-observations",
-            "floor(i*(observed_count-1)/20), i=0..20"
+            "floor(i*(observed_count-1)/20), i=0..20",
+            "floor-grid-21-with-reconstruction-source-v1"
           ]
         },
         "observed_count": {"type": "integer", "minimum": 0},
@@ -392,7 +393,7 @@
         "anchor_tau": {"type": "number"},
         "anneal_fraction": {"type": "number"},
         "flow_steps": {"type": "integer", "minimum": 0},
-        "joint_steps": {"type": "integer", "minimum": 0},
+        "joint_steps": {"type": "integer", "minimum": 1},
         "lam_flow_t": {"type": "number"},
         "lam_flow_xy": {"type": "number"},
         "lam_l1": {"type": "number"},
@@ -572,11 +573,31 @@
         "xi_t": {"type": "number"}
       }
     },
+    "gidcSnapshotCandidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["xi_xy", "xi_t", "snapshot_step"],
+      "properties": {
+        "xi_xy": {"type": "number"},
+        "xi_t": {"type": "number"},
+        "snapshot_step": {"type": "integer", "minimum": 1}
+      }
+    },
+    "recinrSnapshotCandidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["snapshot_step"],
+      "properties": {
+        "snapshot_step": {"type": "integer", "minimum": 1}
+      }
+    },
     "candidate": {
       "oneOf": [
         {"type": "number"},
         {"$ref": "#/$defs/tvSelection"},
-        {"$ref": "#/$defs/gidcSelection"}
+        {"$ref": "#/$defs/gidcSelection"},
+        {"$ref": "#/$defs/gidcSnapshotCandidate"},
+        {"$ref": "#/$defs/recinrSnapshotCandidate"}
       ]
     },
     "selectionRow": {
@@ -620,7 +641,8 @@
             "objective": {"type": "number"},
             "loss": {"type": "number"},
             "data_fidelity": {"type": "number"},
-            "learning_rate": {"type": "number"}
+            "learning_rate": {"type": "number"},
+            "reconstruction_source": {"const": true}
           }
         },
         {

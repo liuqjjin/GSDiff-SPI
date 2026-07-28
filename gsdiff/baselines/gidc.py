@@ -20,6 +20,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from gsdiff.experiments.objectives import (
+    gidc_snapshot_candidate_grid,
+    heldout_normalized_l2,
+)
+
 from .common import (
     build_operator,
     calibrate_reconstruction_physical,
@@ -217,59 +222,81 @@ def run_gidc3dtv(acquisition, semantic_config, algorithm_seed, device: str):
     fixed_noise = torch.randn(T, 1, H, W, device=device)
     input_tensor = torch.cat([fixed_noise, dgi], dim=1)
     target = _zscore(measurements)
-    candidates = [{"xi_xy": xy, "xi_t": temporal} for xy in solver["xi_xy"] for temporal in solver["xi_t"]]
+    candidates = gidc_snapshot_candidate_grid(solver)
     rows, best_video, best_candidate, best_value, parameter_count = [], None, None, None, 0
     best_history: tuple[dict[str, object], ...] = ()
-    for candidate in candidates:
-        torch.manual_seed(int(algorithm_seed.seed_u32))
-        network = GIDCUNet2D(in_channels=2, channels=solver["unet_channels"]).to(device).train()
-        optimizer = torch.optim.Adam(network.parameters(), lr=float(solver["lr"]),
-                                     betas=tuple(solver["betas"]), eps=float(solver["adam_epsilon"]))
-        parameter_count = unique_optimizer_parameter_count(optimizer)
-        snapshot, snapshot_objective = None, None
-        candidate_history: list[dict[str, object]] = []
-        for step in range(int(solver["n_steps"])):
-            for group in optimizer.param_groups:
-                group["lr"] = _lr_at(step, float(solver["lr"]))
-            optimizer.zero_grad()
-            video = network(input_tensor)[:, 0]
-            data_loss = F.mse_loss(_zscore(_measure_dynamic(A, video, indices, T)), target)
-            loss = data_loss + float(candidate["xi_xy"]) * _tv2d(_zscore(video)) + float(candidate["xi_t"]) * (video[1:] - video[:-1]).abs().mean()
-            loss.backward(); optimizer.step()
-            candidate_history.append({
-                "kind": "step",
-                "step": step + 1,
-                "loss": float(loss.detach()),
-                "data_fidelity": float(data_loss.detach()),
-                "learning_rate": float(optimizer.param_groups[0]["lr"]),
-            })
-            if (
-                (step + 1) % int(solver["eval_every"]) == 0
-                or step == int(solver["n_steps"]) - 1
-            ):
-                with torch.no_grad():
-                    conditioned = network(input_tensor)[:, 0].cpu().numpy()
-                value = calibrate_reconstruction_physical(
-                    conditioned,
-                    acquisition.patterns,
-                    acquisition.measurements,
-                    acquisition.frame_indices,
+    for xi_xy in solver["xi_xy"]:
+        for xi_t in solver["xi_t"]:
+            run_candidates = {
+                int(candidate["snapshot_step"]): candidate
+                for candidate in candidates
+                if candidate["xi_xy"] == xi_xy
+                and candidate["xi_t"] == xi_t
+            }
+            torch.manual_seed(int(algorithm_seed.seed_u32))
+            network = GIDCUNet2D(in_channels=2, channels=solver["unet_channels"]).to(device).train()
+            optimizer = torch.optim.Adam(network.parameters(), lr=float(solver["lr"]),
+                                         betas=tuple(solver["betas"]), eps=float(solver["adam_epsilon"]))
+            parameter_count = unique_optimizer_parameter_count(optimizer)
+            candidate_history: list[dict[str, object]] = []
+            selected_step_in_run: int | None = None
+            for step in range(int(solver["n_steps"])):
+                for group in optimizer.param_groups:
+                    group["lr"] = _lr_at(step, float(solver["lr"]))
+                optimizer.zero_grad()
+                video = network(input_tensor)[:, 0]
+                data_loss = F.mse_loss(_zscore(_measure_dynamic(A, video, indices, T)), target)
+                loss = data_loss + float(xi_xy) * _tv2d(_zscore(video)) + float(xi_t) * (video[1:] - video[:-1]).abs().mean()
+                loss.backward(); optimizer.step()
+                native_step = step + 1
+                candidate_history.append({
+                    "kind": "step",
+                    "step": native_step,
+                    "loss": float(loss.detach()),
+                    "data_fidelity": float(data_loss.detach()),
+                    "learning_rate": float(optimizer.param_groups[0]["lr"]),
+                })
+                candidate = run_candidates.get(native_step)
+                if candidate is not None:
+                    with torch.no_grad():
+                        conditioned = network(input_tensor)[:, 0].cpu().numpy()
+                    reconstruction = calibrate_reconstruction_physical(
+                        conditioned,
+                        acquisition.patterns,
+                        acquisition.measurements,
+                        acquisition.frame_indices,
+                    )
+                    objective = heldout_normalized_l2(reconstruction, *holdout)
+                    rows.append({
+                        "candidate": candidate,
+                        "formula_id": objective.formula_id,
+                        "numerator": objective.numerator,
+                        "denominator": objective.denominator,
+                        "value": objective.value,
+                    })
+                    if best_value is None or objective.value < best_value:
+                        best_video = reconstruction
+                        best_candidate = candidate
+                        best_value = objective.value
+                        selected_step_in_run = native_step
+            if selected_step_in_run is not None:
+                best_history = tuple(
+                    {
+                        **row,
+                        **(
+                            {"reconstruction_source": True}
+                            if row["step"] == selected_step_in_run
+                            else {}
+                        ),
+                    }
+                    for row in candidate_history
                 )
-                objective = holdout_residual(value, *holdout)
-                if snapshot_objective is None or objective < snapshot_objective:
-                    snapshot, snapshot_objective = value, objective
-        assert snapshot is not None and snapshot_objective is not None
-        # Record the exact locked objective fields, not a normalized training loss.
-        from gsdiff.experiments.objectives import heldout_normalized_l2
-        objective = heldout_normalized_l2(snapshot, *holdout)
-        rows.append({"candidate": candidate, "formula_id": objective.formula_id,
-                     "numerator": objective.numerator, "denominator": objective.denominator,
-                     "value": objective.value})
-        if best_value is None or objective.value < best_value:
-            best_video, best_candidate, best_value = snapshot, candidate, objective.value
-            best_history = tuple(candidate_history)
     assert best_video is not None and best_candidate is not None
-    return best_video, {"selected_hyperparameters": best_candidate,
+    selected_hyperparameters = {
+        "xi_xy": best_candidate["xi_xy"],
+        "xi_t": best_candidate["xi_t"],
+    }
+    return best_video, {"selected_hyperparameters": selected_hyperparameters,
                         "selection": {"formula_id": "heldout-normalized-l2-v1", "candidate_grid": candidates,
                                       "selected_candidate": best_candidate, "rows": rows},
                         "parameter_count": parameter_count,

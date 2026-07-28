@@ -295,7 +295,7 @@ def _run_monin_adapter(method, acquisition, algorithm_seed, device):
     degree = int(method.semantic_config["solver"]["polynomial_degree"])
     info = _base_info(
         method,
-        parameter_count=acquisition.H * acquisition.W + 2 * (degree + 1),
+        parameter_count=acquisition.H * acquisition.W + 2 * degree,
         unit="admm-iteration",
         budget=int(method.semantic_config["solver"]["n_admm"]),
         selected_hyperparameters=details["selected_hyperparameters"],
@@ -337,8 +337,8 @@ def _run_recinr_adapter(method, acquisition, algorithm_seed, device):
         budget=int(
             solver["warm_steps"] + solver["flow_steps"] + solver["joint_steps"]
         ),
-        selected_hyperparameters=None,
-        selection=None,
+        selected_hyperparameters=details["selected_hyperparameters"],
+        selection=details["selection"],
     )
     return _result(
         method, reconstruction, info=info, history=details.get("history", ())

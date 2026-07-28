@@ -20,7 +20,8 @@ from gsdiff.data._artifact_identity import array_descriptor
 from gsdiff.data._artifact_models import SPIAcquisitionData
 from gsdiff.data.simulation import SPIData
 from gsdiff.experiments.methods import AlgorithmSeed, derive_algorithm_seed, resolve_method_semantics, thaw_json
-from gsdiff.experiments.objectives import heldout_normalized_l2
+import gsdiff.experiments.objectives as objectives
+from gsdiff.experiments.objectives import BlindObjective, heldout_normalized_l2
 
 from gsdiff.experiments.adapters import BASELINE_METHOD_IDS, run_baseline_method
 import gsdiff.experiments.child_outputs as child_outputs
@@ -509,6 +510,235 @@ def test_gidc_one_step_snapshot_is_the_post_update_state(blind_acquisition: SPIA
     )
     assert np.array_equal(result.reconstruction, expected)
     assert not np.array_equal(result.reconstruction, stale)
+    expected_candidate = {
+        "xi_xy": 0.003,
+        "xi_t": 0.01,
+        "snapshot_step": 1,
+    }
+    assert result.info["selected_hyperparameters"] == {
+        "xi_xy": 0.003,
+        "xi_t": 0.01,
+    }
+    assert result.info["selection"]["candidate_grid"] == [expected_candidate]
+    assert result.info["selection"]["selected_candidate"] == expected_candidate
+    assert result.info["selection"]["rows"][0]["candidate"] == expected_candidate
+    assert result.history == ({
+        **result.history[0],
+        "reconstruction_source": True,
+    },)
+
+
+def test_gidc_nested_snapshot_tie_keeps_first_flat_candidate(
+    blind_acquisition: SPIAcquisitionData,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import gsdiff.baselines.gidc as gidc
+
+    method = resolve_smoke("gidc3dtv", blind_acquisition)
+    semantic = thaw_json(method.semantic_config)
+    semantic["solver"].update(
+        n_steps=2,
+        eval_every=1,
+        xi_xy=[0.003, 0.03],
+        xi_t=[0.01],
+    )
+    method = replace(method, semantic_config=semantic)
+    calibration_count = 0
+
+    def tagged_calibration(*args, **kwargs):
+        nonlocal calibration_count
+        calibration_count += 1
+        return np.full(
+            (blind_acquisition.T, blind_acquisition.H, blind_acquisition.W),
+            calibration_count,
+            dtype=np.float32,
+        )
+
+    def tied_objective(*args, **kwargs):
+        return BlindObjective(
+            "heldout-normalized-l2-v1",
+            numerator=1.0,
+            denominator=2.0,
+            value=0.5,
+        )
+
+    monkeypatch.setattr(gidc, "calibrate_reconstruction_physical", tagged_calibration)
+    monkeypatch.setattr(gidc, "holdout_residual", lambda *args: 0.5)
+    monkeypatch.setattr(objectives, "heldout_normalized_l2", tied_objective)
+    monkeypatch.setattr(
+        gidc, "heldout_normalized_l2", tied_objective, raising=False
+    )
+    result = run_baseline_method(
+        method,
+        blind_acquisition,
+        algorithm_seed=derive_for(method, blind_acquisition),
+        device="cpu",
+    )
+    expected_grid = [
+        {"xi_xy": 0.003, "xi_t": 0.01, "snapshot_step": 1},
+        {"xi_xy": 0.003, "xi_t": 0.01, "snapshot_step": 2},
+        {"xi_xy": 0.03, "xi_t": 0.01, "snapshot_step": 1},
+        {"xi_xy": 0.03, "xi_t": 0.01, "snapshot_step": 2},
+    ]
+    assert result.info["selection"]["candidate_grid"] == expected_grid
+    assert [
+        row["candidate"] for row in result.info["selection"]["rows"]
+    ] == expected_grid
+    assert result.info["selection"]["selected_candidate"] == expected_grid[0]
+    assert result.info["selected_hyperparameters"] == {
+        "xi_xy": 0.003,
+        "xi_t": 0.01,
+    }
+    assert np.array_equal(result.reconstruction, np.ones_like(result.reconstruction))
+    assert [row.get("reconstruction_source") for row in result.history] == [
+        True,
+        None,
+    ]
+
+
+def test_recinr_smoke_serializes_selected_snapshot(
+    blind_acquisition: SPIAcquisitionData,
+) -> None:
+    method = resolve_smoke("recinr", blind_acquisition)
+    result = run_baseline_method(
+        method,
+        blind_acquisition,
+        algorithm_seed=derive_for(method, blind_acquisition),
+        device="cpu",
+    )
+    expected_candidate = {"snapshot_step": 3}
+    assert result.info["selected_hyperparameters"] is None
+    assert result.info["selection"]["candidate_grid"] == [expected_candidate]
+    assert result.info["selection"]["selected_candidate"] == expected_candidate
+    assert [
+        row["candidate"] for row in result.info["selection"]["rows"]
+    ] == [expected_candidate]
+    assert [row.get("reconstruction_source") for row in result.history] == [
+        None,
+        None,
+        True,
+    ]
+
+
+def test_recinr_snapshot_tie_keeps_earliest_native_step(
+    blind_acquisition: SPIAcquisitionData,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import gsdiff.baselines.recinr as recinr
+
+    method = resolve_smoke("recinr", blind_acquisition)
+    semantic = thaw_json(method.semantic_config)
+    semantic["solver"].update(
+        warm_steps=1,
+        flow_steps=1,
+        joint_steps=2,
+        snapshot_every=1,
+    )
+    method = replace(method, semantic_config=semantic)
+    calibration_count = 0
+
+    def tagged_calibration(*args, **kwargs):
+        nonlocal calibration_count
+        calibration_count += 1
+        return np.full(
+            (blind_acquisition.T, blind_acquisition.H, blind_acquisition.W),
+            calibration_count,
+            dtype=np.float32,
+        )
+
+    def tied_objective(*args, **kwargs):
+        return BlindObjective(
+            "heldout-normalized-l2-v1",
+            numerator=1.0,
+            denominator=2.0,
+            value=0.5,
+        )
+
+    monkeypatch.setattr(recinr, "calibrate_reconstruction_physical", tagged_calibration)
+    monkeypatch.setattr(recinr, "holdout_residual", lambda *args: 0.5)
+    monkeypatch.setattr(objectives, "heldout_normalized_l2", tied_objective)
+    monkeypatch.setattr(
+        recinr, "heldout_normalized_l2", tied_objective, raising=False
+    )
+    result = run_baseline_method(
+        method,
+        blind_acquisition,
+        algorithm_seed=derive_for(method, blind_acquisition),
+        device="cpu",
+    )
+    expected_grid = [{"snapshot_step": 3}, {"snapshot_step": 4}]
+    assert result.info["selected_hyperparameters"] is None
+    assert result.info["selection"]["candidate_grid"] == expected_grid
+    assert [
+        row["candidate"] for row in result.info["selection"]["rows"]
+    ] == expected_grid
+    assert result.info["selection"]["selected_candidate"] == expected_grid[0]
+    assert np.array_equal(result.reconstruction, np.ones_like(result.reconstruction))
+    assert [row.get("reconstruction_source") for row in result.history] == [
+        None,
+        None,
+        True,
+        None,
+    ]
+
+
+def test_monin_reports_anchored_polynomial_parameter_count(
+    blind_acquisition: SPIAcquisitionData,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import gsdiff.baselines.monin as monin
+
+    coefficient_shapes: list[tuple[int, ...]] = []
+    real_lstsq = monin.np.linalg.lstsq
+
+    def recording_lstsq(*args, **kwargs):
+        result = real_lstsq(*args, **kwargs)
+        coefficient_shapes.append(result[0].shape)
+        return result
+
+    monkeypatch.setattr(monin.np.linalg, "lstsq", recording_lstsq)
+    method = resolve_smoke("monin", blind_acquisition)
+    result = run_baseline_method(
+        method,
+        blind_acquisition,
+        algorithm_seed=derive_for(method, blind_acquisition),
+        device="cpu",
+    )
+    assert coefficient_shapes == [(1, 2)]
+    assert result.info["parameter_count"] == (
+        blind_acquisition.H * blind_acquisition.W + 2
+    )
+
+
+def test_monin_degree_two_count_is_four_motion_coefficients(
+    blind_acquisition: SPIAcquisitionData,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import gsdiff.baselines.monin as monin
+
+    coefficient_shapes: list[tuple[int, ...]] = []
+    real_lstsq = monin.np.linalg.lstsq
+
+    def recording_lstsq(*args, **kwargs):
+        result = real_lstsq(*args, **kwargs)
+        coefficient_shapes.append(result[0].shape)
+        return result
+
+    monkeypatch.setattr(monin.np.linalg, "lstsq", recording_lstsq)
+    method = resolve_smoke("monin", blind_acquisition)
+    semantic = thaw_json(method.semantic_config)
+    semantic["solver"]["polynomial_degree"] = 2
+    method = replace(method, semantic_config=semantic)
+    result = run_baseline_method(
+        method,
+        blind_acquisition,
+        algorithm_seed=derive_for(method, blind_acquisition),
+        device="cpu",
+    )
+    assert coefficient_shapes == [(2, 2)]
+    assert result.info["parameter_count"] == (
+        blind_acquisition.H * blind_acquisition.W + 4
+    )
 
 
 def test_gidc_parameter_count_is_unique_optimizer_owned_count(blind_acquisition: SPIAcquisitionData) -> None:

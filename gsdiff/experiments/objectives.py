@@ -19,6 +19,73 @@ class BlindObjective:
     value: float
 
 
+def _exact_int(
+    solver: Mapping[str, object],
+    key: str,
+    *,
+    minimum: int,
+) -> int:
+    value = solver.get(key)
+    if type(value) is not int or value < minimum:
+        raise ValueError(f"{key} must be an integer at least {minimum}")
+    return value
+
+
+def _ordered_grid_values(
+    solver: Mapping[str, object],
+    key: str,
+) -> Sequence[object]:
+    values = solver.get(key)
+    if (
+        not isinstance(values, Sequence)
+        or isinstance(values, (str, bytes))
+        or not values
+    ):
+        raise ValueError(f"{key} must be a nonempty ordered sequence")
+    return values
+
+
+def gidc_snapshot_candidate_grid(
+    solver: Mapping[str, object],
+) -> list[dict[str, object]]:
+    """Return the locked xi/snapshot grid in publication order."""
+    if not isinstance(solver, Mapping):
+        raise TypeError("solver must be a mapping")
+    n_steps = _exact_int(solver, "n_steps", minimum=1)
+    eval_every = _exact_int(solver, "eval_every", minimum=1)
+    steps = list(range(eval_every, n_steps + 1, eval_every))
+    if not steps or steps[-1] != n_steps:
+        steps.append(n_steps)
+    return [
+        {"xi_xy": xi_xy, "xi_t": xi_t, "snapshot_step": step}
+        for xi_xy in _ordered_grid_values(solver, "xi_xy")
+        for xi_t in _ordered_grid_values(solver, "xi_t")
+        for step in steps
+    ]
+
+
+def recinr_snapshot_candidate_grid(
+    solver: Mapping[str, object],
+) -> list[dict[str, object]]:
+    """Return eligible 1-based global ReCINR snapshot steps."""
+    if not isinstance(solver, Mapping):
+        raise TypeError("solver must be a mapping")
+    warm_steps = _exact_int(solver, "warm_steps", minimum=0)
+    flow_steps = _exact_int(solver, "flow_steps", minimum=0)
+    joint_steps = _exact_int(solver, "joint_steps", minimum=1)
+    snapshot_every = _exact_int(solver, "snapshot_every", minimum=1)
+    total_steps = flow_steps + joint_steps
+    return [
+        {"snapshot_step": warm_steps + loop_step + 1}
+        for loop_step in range(total_steps)
+        if loop_step >= flow_steps
+        and (
+            loop_step % snapshot_every == 0
+            or loop_step == total_steps - 1
+        )
+    ]
+
+
 def _finite_real_array(value: object, name: str, *, ndim: int) -> np.ndarray:
     array = np.asarray(value)
     if array.ndim != ndim:

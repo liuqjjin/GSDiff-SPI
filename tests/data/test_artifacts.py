@@ -7526,8 +7526,8 @@ def test_method_registry_document_binds_rec_inr_provenance_and_license_status():
             "12358198af946f0039a38ad119c94eb7"
         ),
         "gsdiff/baselines/recinr.py": (
-            "6bcb79509e1dcfe07e857aa5a5f92cb"
-            "1cf32211c8017e4b0b692c80a64a6875a"
+            "a8f3db6b7b34d501c077ff8592c11a47"
+            "3b884db9dcc7b3e9fc16fba144ac868e"
         ),
         "gsdiff/baselines/inr.py": (
             "600c26aec1545c0f7aab36d0cad5f95d"

@@ -3,6 +3,8 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+import gsdiff.experiments.objectives as objectives
+from gsdiff.experiments.methods import resolve_method_semantics
 from gsdiff.experiments.objectives import (
     heldout_normalized_l2,
     select_by_heldout_normalized_l2,
@@ -16,6 +18,85 @@ def valid_arrays() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         np.ones(2, dtype=np.float32),
         np.array([0, 1], dtype=np.int64),
     )
+
+
+def _resolved_solver(method_id: str, profile: str):
+    method_config_id = (
+        "default"
+        if profile == "publication-v1"
+        else "smoke-default-v1"
+    )
+    method = resolve_method_semantics(
+        method_id,
+        method_config_id=method_config_id,
+        base_config={},
+        measurements_metadata={},
+        execution_profile=profile,
+    )
+    return method.semantic_config["solver"]
+
+
+def test_gidc_publication_snapshot_grid_is_600_rows_in_locked_order() -> None:
+    publication = objectives.gidc_snapshot_candidate_grid(
+        _resolved_solver("gidc3dtv", "publication-v1")
+    )
+    expected_steps = list(range(25, 2501, 25))
+    expected = [
+        {"xi_xy": xi_xy, "xi_t": xi_t, "snapshot_step": step}
+        for xi_xy in (0.003, 0.03, 0.3)
+        for xi_t in (0.01, 0.1)
+        for step in expected_steps
+    ]
+    assert publication == expected
+    assert len(publication) == 600
+    assert [publication[index] for index in (0, 99, 100, 199, 200, 299)] == [
+        {"xi_xy": 0.003, "xi_t": 0.01, "snapshot_step": 25},
+        {"xi_xy": 0.003, "xi_t": 0.01, "snapshot_step": 2500},
+        {"xi_xy": 0.003, "xi_t": 0.1, "snapshot_step": 25},
+        {"xi_xy": 0.003, "xi_t": 0.1, "snapshot_step": 2500},
+        {"xi_xy": 0.03, "xi_t": 0.01, "snapshot_step": 25},
+        {"xi_xy": 0.03, "xi_t": 0.01, "snapshot_step": 2500},
+    ]
+    assert [publication[index] for index in (300, 399, 400, 499, 500, 599)] == [
+        {"xi_xy": 0.03, "xi_t": 0.1, "snapshot_step": 25},
+        {"xi_xy": 0.03, "xi_t": 0.1, "snapshot_step": 2500},
+        {"xi_xy": 0.3, "xi_t": 0.01, "snapshot_step": 25},
+        {"xi_xy": 0.3, "xi_t": 0.01, "snapshot_step": 2500},
+        {"xi_xy": 0.3, "xi_t": 0.1, "snapshot_step": 25},
+        {"xi_xy": 0.3, "xi_t": 0.1, "snapshot_step": 2500},
+    ]
+    for xi_xy in (0.003, 0.03, 0.3):
+        for xi_t in (0.01, 0.1):
+            assert publication.count(
+                {"xi_xy": xi_xy, "xi_t": xi_t, "snapshot_step": 2500}
+            ) == 1
+
+    smoke = objectives.gidc_snapshot_candidate_grid(
+        _resolved_solver("gidc3dtv", "controller-cpu-smoke-v1")
+    )
+    assert smoke == [{"xi_xy": 0.003, "xi_t": 0.01, "snapshot_step": 1}]
+
+
+def test_recinr_publication_snapshot_grid_is_25_native_steps() -> None:
+    publication = objectives.recinr_snapshot_candidate_grid(
+        _resolved_solver("recinr", "publication-v1")
+    )
+    expected_steps = [701 + 50 * index for index in range(24)] + [1900]
+    assert publication == [
+        {"snapshot_step": step} for step in expected_steps
+    ]
+    assert len(publication) == 25
+
+    smoke_solver = _resolved_solver(
+        "recinr", "controller-cpu-smoke-v1"
+    )
+    assert objectives.recinr_snapshot_candidate_grid(smoke_solver) == [
+        {"snapshot_step": 3}
+    ]
+    invalid_solver = dict(smoke_solver)
+    invalid_solver["joint_steps"] = 0
+    with pytest.raises(ValueError, match="joint_steps"):
+        objectives.recinr_snapshot_candidate_grid(invalid_solver)
 
 
 def test_raw_objective_matches_physical_float64_formula() -> None:

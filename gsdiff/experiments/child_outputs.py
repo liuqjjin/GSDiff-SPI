@@ -42,6 +42,10 @@ from gsdiff.data._artifact_io import (
 from gsdiff.data._artifact_models import SPIAcquisitionData
 
 from .methods import AlgorithmSeed, ResolvedMethod, thaw_json
+from .objectives import (
+    gidc_snapshot_candidate_grid,
+    recinr_snapshot_candidate_grid,
+)
 
 
 RECONSTRUCTION_V2_SCHEMA = "reconstruction-v2"
@@ -74,6 +78,13 @@ class ReconstructionV2:
     dgi: np.ndarray | None
     estimated_motion_trajectory: np.ndarray | None
     array_descriptors: Mapping[str, object]
+
+
+@dataclass(frozen=True)
+class _CandidateSpec:
+    candidate_grid: list[object]
+    selected_hyperparameter_keys: tuple[str, ...] | None
+    has_snapshot_state: bool
 
 
 def _json_object_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -312,35 +323,43 @@ def _classical_parameter_count(
             solver["polynomial_degree"],
             "semantic_config.solver.polynomial_degree",
         )
-        return acquisition.H * acquisition.W + 2 * (degree + 1)
+        return acquisition.H * acquisition.W + 2 * degree
     return None
 
 
 def _candidate_spec(
     method: ResolvedMethod,
-) -> tuple[list[object], tuple[str, ...]] | None:
+) -> _CandidateSpec | None:
     solver = method.semantic_config.get("solver")
     if not isinstance(solver, Mapping):
         return None
+    if method.method_id == "gidc3dtv":
+        return _CandidateSpec(
+            candidate_grid=gidc_snapshot_candidate_grid(solver),
+            selected_hyperparameter_keys=("xi_xy", "xi_t"),
+            has_snapshot_state=True,
+        )
+    if method.method_id == "recinr":
+        return _CandidateSpec(
+            candidate_grid=recinr_snapshot_candidate_grid(solver),
+            selected_hyperparameter_keys=None,
+            has_snapshot_state=True,
+        )
     if "lambda_grid" in solver:
-        return list(solver["lambda_grid"]), ("lambda",)
+        return _CandidateSpec(
+            candidate_grid=list(solver["lambda_grid"]),
+            selected_hyperparameter_keys=("lambda",),
+            has_snapshot_state=False,
+        )
     if "lambda_xy" in solver and "lambda_t" in solver:
-        return (
-            [
+        return _CandidateSpec(
+            candidate_grid=[
                 {"lambda_xy": xy, "lambda_t": temporal}
                 for xy in solver["lambda_xy"]
                 for temporal in solver["lambda_t"]
             ],
-            ("lambda_xy", "lambda_t"),
-        )
-    if "xi_xy" in solver and "xi_t" in solver:
-        return (
-            [
-                {"xi_xy": xy, "xi_t": temporal}
-                for xy in solver["xi_xy"]
-                for temporal in solver["xi_t"]
-            ],
-            ("xi_xy", "xi_t"),
+            selected_hyperparameter_keys=("lambda_xy", "lambda_t"),
+            has_snapshot_state=False,
         )
     return None
 
@@ -357,33 +376,7 @@ def _validate_selection(
                 "method has no locked candidate selection"
             )
         return
-    candidate_grid, hyperparameter_keys = spec
-    if not isinstance(selected_hyperparameters, Mapping):
-        raise ArtifactValidationError(
-            "selected_hyperparameters must be an object"
-        )
-    validate_exact_keys(
-        selected_hyperparameters,
-        set(hyperparameter_keys),
-        "selected_hyperparameters",
-    )
-    if len(hyperparameter_keys) == 1:
-        selected_candidate: object = selected_hyperparameters[
-            hyperparameter_keys[0]
-        ]
-    else:
-        selected_candidate = {
-            key: selected_hyperparameters[key]
-            for key in hyperparameter_keys
-        }
-    if not any(
-        canonical_json_bytes(candidate)
-        == canonical_json_bytes(selected_candidate)
-        for candidate in candidate_grid
-    ):
-        raise ArtifactValidationError(
-            "selected hyperparameter is not in the locked candidate grid"
-        )
+    candidate_grid = spec.candidate_grid
     if not isinstance(selection, Mapping):
         raise ArtifactValidationError("selection must be an object")
     validate_exact_keys(
@@ -398,12 +391,6 @@ def _validate_selection(
     ):
         raise ArtifactValidationError(
             "selection candidate_grid does not match method semantics"
-        )
-    if canonical_json_bytes(
-        selection["selected_candidate"]
-    ) != canonical_json_bytes(selected_candidate):
-        raise ArtifactValidationError(
-            "selection selected_candidate does not match hyperparameters"
         )
     rows = selection["rows"]
     if type(rows) is not list or len(rows) != len(candidate_grid):
@@ -458,15 +445,49 @@ def _validate_selection(
                 "selection row value does not equal numerator/denominator"
             )
         values.append(value)
-    selected_index = next(
-        index
-        for index, candidate in enumerate(candidate_grid)
-        if canonical_json_bytes(candidate)
-        == canonical_json_bytes(selected_candidate)
-    )
-    if selected_index != min(range(len(values)), key=values.__getitem__):
+    expected_selected = candidate_grid[
+        min(range(len(values)), key=values.__getitem__)
+    ]
+    if canonical_json_bytes(
+        selection["selected_candidate"]
+    ) != canonical_json_bytes(expected_selected):
         raise ArtifactValidationError(
-            "selection does not preserve first-minimum candidate order"
+            "selection candidate/hyperparameter does not preserve "
+            "first-minimum candidate order"
+        )
+    hyperparameter_keys = spec.selected_hyperparameter_keys
+    if hyperparameter_keys is None:
+        if selected_hyperparameters is not None:
+            raise ArtifactValidationError(
+                "selected_hyperparameters must be null for snapshot-only selection"
+            )
+        return
+    if not isinstance(selected_hyperparameters, Mapping):
+        raise ArtifactValidationError(
+            "selected_hyperparameters must be an object"
+        )
+    validate_exact_keys(
+        selected_hyperparameters,
+        set(hyperparameter_keys),
+        "selected_hyperparameters",
+    )
+    if len(hyperparameter_keys) == 1:
+        expected_hyperparameters: object = {
+            hyperparameter_keys[0]: expected_selected
+        }
+    else:
+        if not isinstance(expected_selected, Mapping):
+            raise ArtifactValidationError(
+                "selected candidate cannot be projected to hyperparameters"
+            )
+        expected_hyperparameters = {
+            key: expected_selected[key] for key in hyperparameter_keys
+        }
+    if canonical_json_bytes(
+        selected_hyperparameters
+    ) != canonical_json_bytes(expected_hyperparameters):
+        raise ArtifactValidationError(
+            "selected_hyperparameters do not match selected candidate projection"
         )
 
 
@@ -494,6 +515,8 @@ def _validate_history_row(row: Mapping[str, object], index: int) -> None:
         )
     index_field = _HISTORY_INDEX_FIELDS[kind]
     allowed = {"kind", index_field} | _HISTORY_METRIC_FIELDS
+    if kind == "step":
+        allowed.add("reconstruction_source")
     if not set(row).issubset(allowed):
         raise ArtifactValidationError(
             f"history[{index}] contains an unapproved field"
@@ -505,6 +528,67 @@ def _validate_history_row(row: Mapping[str, object], index: int) -> None:
     _require_exact_int(row[index_field], f"history[{index}].{index_field}")
     for field in set(row) & _HISTORY_METRIC_FIELDS:
         _require_finite_number(row[field], f"history[{index}].{field}")
+    if (
+        "reconstruction_source" in row
+        and row["reconstruction_source"] is not True
+    ):
+        raise ArtifactValidationError(
+            f"history[{index}].reconstruction_source must be true"
+        )
+
+
+def _validate_reconstruction_source(
+    method: ResolvedMethod,
+    selection: object,
+    history: tuple[Mapping[str, object], ...] | list[object],
+    *,
+    field: str,
+) -> None:
+    spec = _candidate_spec(method)
+    source_rows = [
+        (index, row)
+        for index, row in enumerate(history)
+        if isinstance(row, Mapping)
+        and "reconstruction_source" in row
+    ]
+    if spec is None or not spec.has_snapshot_state:
+        if source_rows:
+            raise ArtifactValidationError(
+                f"{field} contains reconstruction_source for a non-snapshot method"
+            )
+        return
+    if len(source_rows) != 1:
+        raise ArtifactValidationError(
+            f"{field} must contain exactly one reconstruction_source row"
+        )
+    if not isinstance(selection, Mapping):
+        raise ArtifactValidationError(
+            "snapshot selection is required for reconstruction_source"
+        )
+    selected_candidate = selection["selected_candidate"]
+    if not isinstance(selected_candidate, Mapping):
+        raise ArtifactValidationError(
+            "snapshot selected_candidate must be an object"
+        )
+    selected_step = _require_exact_int(
+        selected_candidate.get("snapshot_step"),
+        "selection.selected_candidate.snapshot_step",
+        minimum=1,
+    )
+    index, source_row = source_rows[0]
+    if source_row.get("kind") != "step":
+        raise ArtifactValidationError(
+            f"{field}[{index}] reconstruction_source must be a step row"
+        )
+    source_step = _require_exact_int(
+        source_row.get("step"),
+        f"{field}[{index}].step",
+        minimum=1,
+    )
+    if source_step != selected_step:
+        raise ArtifactValidationError(
+            "reconstruction_source step does not match selected snapshot"
+        )
 
 
 def _validate_result(
@@ -592,6 +676,12 @@ def _validate_result(
     for index, row in enumerate(result.history):
         validate_exact_json_native(dict(row), f"history[{index}]")
         _validate_history_row(row, index)
+    _validate_reconstruction_source(
+        method,
+        result.info["selection"],
+        result.history,
+        field="history",
+    )
 
 
 def _expected_checkpoints(method: ResolvedMethod) -> list[dict[str, str]]:
@@ -615,12 +705,36 @@ def _warmup_counts(method: ResolvedMethod) -> dict[str, int]:
 def _sample_history(history: tuple[Mapping[str, object], ...]) -> tuple[list[object], str]:
     observed = len(history)
     if observed < 21:
-        indices = range(observed)
+        indices: list[int] = list(range(observed))
         policy = "all-observations"
     else:
-        indices = (observed - 1) * np.arange(21, dtype=np.int64) // 20
-        policy = "floor(i*(observed_count-1)/20), i=0..20"
-    return [dict(history[int(index)]) for index in indices], policy
+        indices = [
+            int(index)
+            for index in (
+                (observed - 1) * np.arange(21, dtype=np.int64) // 20
+            )
+        ]
+        source_indices = [
+            index
+            for index, row in enumerate(history)
+            if "reconstruction_source" in row
+        ]
+        if source_indices:
+            source_index = source_indices[0]
+            if source_index not in indices:
+                replacement = min(
+                    range(1, 20),
+                    key=lambda index: (
+                        abs(indices[index] - source_index),
+                        index,
+                    ),
+                )
+                indices[replacement] = source_index
+                indices.sort()
+            policy = "floor-grid-21-with-reconstruction-source-v1"
+        else:
+            policy = "floor(i*(observed_count-1)/20), i=0..20"
+    return [dict(history[index]) for index in indices], policy
 
 
 def _validate_method_info_schema(info: Mapping[str, object]) -> None:
@@ -638,6 +752,8 @@ def _validate_method_info_schema(info: Mapping[str, object]) -> None:
 def _validate_convergence(
     convergence: object,
     *,
+    method: ResolvedMethod,
+    selection: object,
     expected_status: str,
 ) -> None:
     if not isinstance(convergence, Mapping):
@@ -666,11 +782,14 @@ def _validate_convergence(
         maximum=21,
     )
     expected_serialized = observed if observed < 21 else 21
-    expected_policy = (
-        "all-observations"
-        if observed < 21
-        else "floor(i*(observed_count-1)/20), i=0..20"
-    )
+    spec = _candidate_spec(method)
+    has_snapshot_state = spec is not None and spec.has_snapshot_state
+    if observed < 21:
+        expected_policy = "all-observations"
+    elif has_snapshot_state:
+        expected_policy = "floor-grid-21-with-reconstruction-source-v1"
+    else:
+        expected_policy = "floor(i*(observed_count-1)/20), i=0..20"
     if serialized != expected_serialized:
         raise ArtifactValidationError(
             "convergence serialized_count is inconsistent"
@@ -690,6 +809,12 @@ def _validate_convergence(
                 f"convergence.history[{index}] must be an object"
             )
         _validate_history_row(row, index)
+    _validate_reconstruction_source(
+        method,
+        selection,
+        history,
+        field="convergence.history",
+    )
     if expected_status == "convergence-required" and observed < 21:
         raise ArtifactValidationError(
             "convergence-required profiles need 21 observations"
@@ -745,7 +870,10 @@ def write_method_child_outputs_v2(
         "history": samples,
     }
     _validate_convergence(
-        convergence, expected_status=method.convergence_status
+        convergence,
+        method=method,
+        selection=result.info["selection"],
+        expected_status=method.convergence_status,
     )
     arrays: dict[str, np.ndarray] = {
         "reconstruction": np.ascontiguousarray(result.reconstruction),
@@ -984,6 +1112,8 @@ def validate_method_child_outputs_v2(
     )
     _validate_convergence(
         info["convergence"],
+        method=expected_method,
+        selection=info["selection"],
         expected_status=expected_method.convergence_status,
     )
     if reconstruction.dataset_identity_sha256 != expected_dataset_identity_sha256 or reconstruction.method_id != expected_method.method_id:

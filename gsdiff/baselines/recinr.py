@@ -19,6 +19,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from gsdiff.experiments.objectives import (
+    heldout_normalized_l2,
+    recinr_snapshot_candidate_grid,
+)
+
 from .recinr_model import ReCINR, ReCINRConfig
 from .common import (
     calibrate_reconstruction_physical,
@@ -256,6 +261,11 @@ def run_recinr(acquisition, semantic_config, algorithm_seed, device: str):
     solver = semantic_config.get("solver")
     if not hasattr(representation, "get") or not hasattr(solver, "get"):
         raise ValueError("ReCINR representation and solver semantics are required")
+    candidates = recinr_snapshot_candidate_grid(solver)
+    candidates_by_step = {
+        int(candidate["snapshot_step"]): candidate
+        for candidate in candidates
+    }
     holdout = (acquisition.holdout_patterns, acquisition.holdout_measurements,
                acquisition.holdout_frame_indices)
     if any(value is None for value in holdout) or acquisition.holdout_K <= 0:
@@ -319,7 +329,8 @@ def run_recinr(acquisition, semantic_config, algorithm_seed, device: str):
     schedule = None
     total_steps = int(config.flow_only_epochs + config.epochs)
     anneal_steps = max(1, int(config.pe_anneal_frac * total_steps))
-    best_reconstruction, best_score = None, None
+    rows: list[dict[str, object]] = []
+    best_reconstruction, best_candidate, best_score = None, None, None
     for step in range(total_steps):
         if step == config.flow_only_epochs:
             for parameter in canonical_parameters:
@@ -358,7 +369,8 @@ def run_recinr(acquisition, semantic_config, algorithm_seed, device: str):
             ),
             "learning_rate": float(optimizer.param_groups[0]["lr"]),
         })
-        if step >= config.flow_only_epochs and (step % int(solver["snapshot_every"]) == 0 or step == total_steps - 1):
+        candidate = candidates_by_step.get(int(history[-1]["step"]))
+        if candidate is not None:
             with torch.no_grad():
                 conditioned = network.get_key_estimates(time_grid)[0][:, 0].cpu().numpy()
             reconstruction = calibrate_reconstruction_physical(
@@ -367,19 +379,42 @@ def run_recinr(acquisition, semantic_config, algorithm_seed, device: str):
                 acquisition.measurements,
                 acquisition.frame_indices,
             )
-            score = holdout_residual(reconstruction, *holdout)
-            if best_score is None or score < best_score:
-                best_reconstruction, best_score = reconstruction, score
+            objective = heldout_normalized_l2(reconstruction, *holdout)
+            rows.append({
+                "candidate": candidate,
+                "formula_id": objective.formula_id,
+                "numerator": objective.numerator,
+                "denominator": objective.denominator,
+                "value": objective.value,
+            })
+            if best_score is None or objective.value < best_score:
+                best_reconstruction = reconstruction
+                best_candidate = candidate
+                best_score = objective.value
     with torch.no_grad():
         network.scene.set_pe_progress(1.0)
-        if best_reconstruction is None:
-            conditioned = network.get_key_estimates(time_grid)[0][:, 0].cpu().numpy()
-            best_reconstruction = calibrate_reconstruction_physical(
-                conditioned,
-                acquisition.patterns,
-                acquisition.measurements,
-                acquisition.frame_indices,
-            )
-    return best_reconstruction, {"selected_hyperparameters": None, "selection": None,
-                                 "parameter_count": parameter_count,
-                                 "history": tuple(history)}
+    if best_reconstruction is None or best_candidate is None:
+        raise RuntimeError("ReCINR produced no eligible scored snapshot")
+    selected_step = int(best_candidate["snapshot_step"])
+    selected_history = tuple(
+        {
+            **row,
+            **(
+                {"reconstruction_source": True}
+                if row["step"] == selected_step
+                else {}
+            ),
+        }
+        for row in history
+    )
+    return best_reconstruction, {
+        "selected_hyperparameters": None,
+        "selection": {
+            "formula_id": "heldout-normalized-l2-v1",
+            "candidate_grid": candidates,
+            "selected_candidate": best_candidate,
+            "rows": rows,
+        },
+        "parameter_count": parameter_count,
+        "history": selected_history,
+    }

@@ -302,6 +302,18 @@ selection signals. Method info records:
 - selected candidate;
 - the complete predeclared candidate grid.
 
+GIDC flattens snapshot state into each candidate as
+`{xi_xy, xi_t, snapshot_step}`. The 1-based step is the completed Adam update;
+publication order is registry `xi_xy`, then registry `xi_t`, then steps
+`25, 50, ..., 2500`, for exactly 600 rows. ReCINR candidates contain only
+`{snapshot_step}` and use the 1-based global optimization step including
+warm-up; publication records
+`[701 + 50*j for j in range(24)] + [1900]`, for exactly 25 rows. GIDC's
+`selected_hyperparameters` remains the two-xi projection, while ReCINR's
+remains null. Both methods mark the selected run's unique producing history
+step with `reconstruction_source: true`, and bounded history sampling retains
+that row.
+
 Solver-side conditioning is allowed only as an internal numerical device. A
 candidate and final reconstruction must be transformed back to physical
 forward-model scale before this objective or artifact writing; a normalized
@@ -529,8 +541,8 @@ v1 reader remains available only for compatibility artifacts.
 or optimized from measurements, excluding selected hyperparameters and fixed
 priors. The exact classical counts are: DGI `0`; static CS `H*W`; per-frame CS
 and TV3D `T*H*W`; and Monin
-`H*W + 2*(polynomial_degree + 1)` (one canonical image plus two translation
-polynomials, with no rotation variable). Neural/GSDiff methods report the
+`H*W + 2*polynomial_degree` (one canonical image plus two anchored translation
+polynomials, with no fitted intercept or rotation variable). Neural/GSDiff methods report the
 exact sum of unique trainable tensor elements actually passed to their
 optimizer; a frozen diffusion prior is excluded. Tests bind these formulas so
 the field cannot silently switch between “network weights” and “reconstruction

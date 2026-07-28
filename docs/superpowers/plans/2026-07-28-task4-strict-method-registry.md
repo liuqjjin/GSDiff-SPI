@@ -1123,6 +1123,15 @@ Requirements:
   seed.
 - GIDC and ReCINR use the raw held-out objective for candidate/snapshot
   selection.
+- GIDC serializes every `{xi_xy, xi_t, snapshot_step}` trial in registry-xi
+  and ascending 1-based completed-update order: 600 publication rows and one
+  smoke row. ReCINR serializes every `{snapshot_step}` trial using the 1-based
+  global step including warm-up: 25 publication rows and one smoke row.
+- Each method chooses the strict first minimum, keeps only the current best
+  reconstruction array, and marks the selected run's unique producing step
+  with `reconstruction_source: true`; bounded history must retain that row.
+- GIDC selected hyperparameters remain the two-xi projection. ReCINR selected
+  hyperparameters remain null even though its snapshot selection is non-null.
 - None of these four methods returns a fabricated trajectory.
 - `info` includes exact native unit/budget, parameter count, convergence
   status, selected hyperparameters, selection table or `None`, and checkpoint
@@ -1137,12 +1146,13 @@ fitted or optimized from measurements, excluding selected hyperparameters:
 | static CS | `H * W` |
 | per-frame CS | `T * H * W` |
 | TV3D | `T * H * W` |
-| Monin | `H * W + 2 * (polynomial_degree + 1)` |
+| Monin | `H * W + 2 * polynomial_degree` |
 | GIDC/ReCINR and GSDiff-family methods | Sum of unique trainable tensor elements actually passed to the optimizer |
 
-The Monin count represents one canonical image and the two fitted translation
-polynomials; there is no rotation degree of freedom. A frozen diffusion prior
-is excluded from GSDiff counts. Add exact formula assertions for every
+The Monin count represents one canonical image and two coefficients per
+anchored polynomial degree; the reference-block gauge fits no intercept and
+there is no rotation degree of freedom. A frozen diffusion prior is excluded
+from GSDiff counts. Add exact formula assertions for every
 classical method and direct optimizer-parameter count assertions for stochastic
 methods.
 
