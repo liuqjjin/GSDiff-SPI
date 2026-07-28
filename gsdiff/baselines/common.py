@@ -14,6 +14,7 @@ Conventions (verified against the baseline specs, 2026-07):
 """
 import numpy as np
 import torch
+from types import SimpleNamespace
 
 from ..prior.tv import TVPrior
 from ..data.dgi import dgi_reconstruct
@@ -53,7 +54,7 @@ def adjoint(A, r):
 
 # ── ADMM-TV solver (scaled form, Boyd 2011; Chambolle z-step) ──
 def admm_tv(A, y, H, W, lam, rho=0.5, n_admm=150, chambolle_iter=100,
-            b_scale=None, nonneg=True):
+            b_scale=None, nonneg=True, progress_callback=None):
     """Solve  min_{x>=0} 0.5||A x - y_n||^2 + lam * TV(x)  by ADMM-TV.
 
     A       : [K, HW] forward operator (raw, unnormalized)
@@ -93,11 +94,27 @@ def admm_tv(A, y, H, W, lam, rho=0.5, n_admm=150, chambolle_iter=100,
     u = torch.zeros_like(x)
 
     w = lam / (rho + 1e-12)
-    for _ in range(n_admm):
+    for iteration in range(n_admm):
+        previous_z = z.clone()
         x = solve(ATb + rho * (z - u))            # exact x-step (Woodbury)
         zt = TVPrior._chambolle((x + u).reshape(H, W), w, chambolle_iter).reshape(-1)
         z = zt.clamp(min=0) if nonneg else zt
         u = u + x - z
+        if progress_callback is not None:
+            physical = z * float(b_scale)
+            residual = A @ physical - y
+            progress_callback(
+                iteration + 1,
+                {
+                    "data_fidelity": float(0.5 * residual.square().sum()),
+                    "primal_residual": float(
+                        (x - z).norm() * float(b_scale)
+                    ),
+                    "dual_residual": float(
+                        rho * (z - previous_z).norm() * float(b_scale)
+                    ),
+                },
+            )
     # Conditioning is strictly an internal numerical device.  The returned
     # image stays on the physical forward-model scale so callers can safely
     # compare it with raw measurements.
@@ -110,6 +127,101 @@ def dgi_image(patterns, measurements):
     pat = patterns.cpu().numpy() if torch.is_tensor(patterns) else np.asarray(patterns)
     y = measurements.cpu().numpy() if torch.is_tensor(measurements) else np.asarray(measurements)
     return torch.as_tensor(dgi_reconstruct(pat, y), dtype=torch.float32)
+
+
+def calibrate_reconstruction_physical(
+    reconstruction, patterns, measurements, frame_indices
+):
+    """Recover gain and DC offset from training measurements only.
+
+    For a conditioned candidate ``v``, solve
+    ``y ~= gain * <P, v> + offset * sum(P)`` and return
+    ``gain * v + offset``.  The second column restores the image-domain DC
+    component removed by z-score conditioning.
+    """
+    video = np.asarray(
+        reconstruction.detach().cpu().numpy()
+        if torch.is_tensor(reconstruction)
+        else reconstruction,
+        dtype=np.float64,
+    )
+    physical_patterns = np.asarray(
+        patterns.detach().cpu().numpy() if torch.is_tensor(patterns) else patterns,
+        dtype=np.float64,
+    )
+    target = np.asarray(
+        measurements.detach().cpu().numpy()
+        if torch.is_tensor(measurements)
+        else measurements,
+        dtype=np.float64,
+    )
+    indices = np.asarray(
+        frame_indices.detach().cpu().numpy()
+        if torch.is_tensor(frame_indices)
+        else frame_indices,
+        dtype=np.int64,
+    )
+    predicted = np.einsum(
+        "khw,khw->k", physical_patterns, video[indices]
+    )
+    pattern_dc = physical_patterns.sum(axis=(1, 2))
+    design = np.column_stack((predicted, pattern_dc))
+    coefficients, *_ = np.linalg.lstsq(design, target, rcond=None)
+    calibrated = coefficients[0] * video + coefficients[1]
+    if not np.isfinite(calibrated).all():
+        raise ValueError("training-only physical calibration is non-finite")
+    return calibrated.astype(np.float32)
+
+
+def unique_optimizer_parameter_count(optimizer) -> int:
+    """Count each trainable tensor owned by an optimizer exactly once."""
+    unique = {}
+    for group in optimizer.param_groups:
+        for parameter in group["params"]:
+            if parameter.requires_grad:
+                unique[id(parameter)] = parameter
+    return sum(parameter.numel() for parameter in unique.values())
+
+
+def legacy_acquisition_view(data):
+    """Map live legacy ``SPIData`` names into the strict core array names."""
+    holdout_patterns = getattr(data, "eval_patterns", None)
+    holdout_measurements = getattr(data, "eval_measurements", None)
+    holdout_indices = getattr(data, "eval_frame_idx", None)
+    patterns = data.patterns
+    measurements = data.measurements
+    indices = data.frame_idx
+    if holdout_patterns is None:
+        mask = (np.arange(data.K) % 10) == 7
+        if not np.any(mask) or np.all(mask):
+            raise ValueError("legacy SPIData cannot provide a holdout split")
+        holdout_patterns = patterns[mask]
+        holdout_measurements = measurements[mask]
+        holdout_indices = indices[mask]
+        patterns = patterns[~mask]
+        measurements = measurements[~mask]
+        indices = indices[~mask]
+    holdout_K = 0 if holdout_patterns is None else int(len(holdout_patterns))
+    return SimpleNamespace(
+        patterns=patterns,
+        measurements=measurements,
+        frame_indices=indices,
+        frame_idx=indices,
+        time_grid=data.t_grid,
+        t_grid=data.t_grid,
+        holdout_patterns=holdout_patterns,
+        holdout_measurements=holdout_measurements,
+        holdout_frame_indices=holdout_indices,
+        eval_patterns=holdout_patterns,
+        eval_measurements=holdout_measurements,
+        eval_frame_idx=holdout_indices,
+        holdout_K=holdout_K,
+        H=data.H,
+        W=data.W,
+        T=data.T,
+        K=int(len(patterns)),
+        time_assignment_mode="uniform",
+    )
 
 
 def holdout_residual(recon, eval_patterns, eval_measurements, eval_frame_idx):

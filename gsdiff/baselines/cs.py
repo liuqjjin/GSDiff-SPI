@@ -8,7 +8,7 @@ import torch
 
 from gsdiff.experiments.objectives import heldout_normalized_l2
 
-from .common import admm_tv, build_operator
+from .common import admm_tv, build_operator, legacy_acquisition_view
 
 
 LAMBDA_GRID = [1e-3, 3e-3, 1e-2, 3e-2, 1e-1, 3e-1, 1e0]
@@ -74,11 +74,18 @@ def run_static_cs(acquisition, semantic_config: Mapping[str, object], algorithm_
     all_patterns = np.concatenate((acquisition.patterns, holdout[0]), axis=0)
     all_measurements = np.concatenate((acquisition.measurements, holdout[1]), axis=0)
     A_all = build_operator(torch.as_tensor(all_patterns, dtype=torch.float32, device=device)).to(device)
+    history: list[dict[str, object]] = []
+
+    def observe(iteration, metrics):
+        history.append({"kind": "iteration", "iteration": iteration, **metrics})
+
     final = admm_tv(A_all, torch.as_tensor(all_measurements, dtype=torch.float32, device=device), H, W,
                     float(selected), rho=float(solver["rho"]), n_admm=int(solver["n_admm"]),
-                    chambolle_iter=int(solver["chambolle_iter"]), nonneg=bool(solver["nonnegative"]))
+                    chambolle_iter=int(solver["chambolle_iter"]), nonneg=bool(solver["nonnegative"]),
+                    progress_callback=observe)
     return final.unsqueeze(0).repeat(T, 1, 1).detach().cpu().numpy(), {
         "selected_hyperparameters": {"lambda": selected}, "selection": selection,
+        "history": tuple(history),
     }
 
 
@@ -91,26 +98,73 @@ def run_perframe_cs(acquisition, semantic_config: Mapping[str, object], algorith
     holdout = _holdout(acquisition)
     H, W, T = acquisition.H, acquisition.W, acquisition.T
 
-    def solve(patterns: np.ndarray, measurements: np.ndarray, indices: np.ndarray, lam: float) -> np.ndarray:
+    def solve(
+        patterns: np.ndarray, measurements: np.ndarray, indices: np.ndarray,
+        lam: float, *, observe: bool = False,
+    ) -> tuple[np.ndarray, tuple[dict[str, object], ...]]:
         frames = []
+        frame_histories: list[list[dict[str, float]]] = []
         for frame in range(T):
             mask = indices == frame
             if not np.any(mask):
                 raise ValueError("each frame requires at least one measurement")
             A = build_operator(torch.as_tensor(patterns[mask], dtype=torch.float32, device=device)).to(device)
             y = torch.as_tensor(measurements[mask], dtype=torch.float32, device=device)
+            frame_history: list[dict[str, float]] = []
+
+            def record(_iteration, metrics):
+                frame_history.append(metrics)
+
             frames.append(admm_tv(A, y, H, W, lam, rho=float(solver["rho"]),
                                   n_admm=int(solver["n_admm"]), chambolle_iter=int(solver["chambolle_iter"]),
-                                  nonneg=bool(solver["nonnegative"])))
-        return torch.stack(frames).detach().cpu().numpy()
+                                  nonneg=bool(solver["nonnegative"]),
+                                  progress_callback=record if observe else None))
+            if observe:
+                frame_histories.append(frame_history)
+        history = ()
+        if observe:
+            history = tuple(
+                {
+                    "kind": "iteration",
+                    "iteration": iteration + 1,
+                    "data_fidelity": float(np.mean([
+                        rows[iteration]["data_fidelity"]
+                        for rows in frame_histories
+                    ])),
+                    "primal_residual": float(np.mean([
+                        rows[iteration]["primal_residual"]
+                        for rows in frame_histories
+                    ])),
+                    "dual_residual": float(np.mean([
+                        rows[iteration]["dual_residual"]
+                        for rows in frame_histories
+                    ])),
+                }
+                for iteration in range(int(solver["n_admm"]))
+            )
+        return torch.stack(frames).detach().cpu().numpy(), history
 
     candidates = list(solver["lambda_grid"])
-    candidate_reconstructions = [solve(acquisition.patterns, acquisition.measurements, acquisition.frame_indices, float(lam)) for lam in candidates]
+    candidate_reconstructions = [
+        solve(
+            acquisition.patterns, acquisition.measurements,
+            acquisition.frame_indices, float(lam),
+        )[0]
+        for lam in candidates
+    ]
     selected, selection = _selection(candidates, candidate_reconstructions, holdout)
-    final = solve(np.concatenate((acquisition.patterns, holdout[0]), axis=0),
-                  np.concatenate((acquisition.measurements, holdout[1]), axis=0),
-                  np.concatenate((acquisition.frame_indices, holdout[2]), axis=0), float(selected))
-    return final, {"selected_hyperparameters": {"lambda": selected}, "selection": selection}
+    final, history = solve(
+        np.concatenate((acquisition.patterns, holdout[0]), axis=0),
+        np.concatenate((acquisition.measurements, holdout[1]), axis=0),
+        np.concatenate((acquisition.frame_indices, holdout[2]), axis=0),
+        float(selected),
+        observe=True,
+    )
+    return final, {
+        "selected_hyperparameters": {"lambda": selected},
+        "selection": selection,
+        "history": history,
+    }
 
 
 # Compatibility entry points are intentionally separate from strict dispatch.
@@ -118,7 +172,9 @@ def static_tvcs(data, device="cpu", rho=0.5, n_admm=150, lam_grid=LAMBDA_GRID):
     from ._evaluation import evaluate_video
     semantic = {"solver": {"rho": rho, "n_admm": n_admm, "chambolle_iter": 100,
                              "lambda_grid": list(lam_grid), "nonnegative": True}}
-    reconstruction, details = run_static_cs(data, semantic, None, device)
+    reconstruction, details = run_static_cs(
+        legacy_acquisition_view(data), semantic, None, device
+    )
     psnrs, mean = evaluate_video(data.gt_frames, reconstruction)
     return reconstruction, {"method": "static_tvcs", "lambda": details["selected_hyperparameters"]["lambda"],
                             "mean_psnr": mean, "per_frame_psnr": psnrs,
@@ -129,7 +185,9 @@ def perframe_tvcs(data, device="cpu", rho=0.5, n_admm=120, lam_grid=LAMBDA_GRID)
     from ._evaluation import evaluate_video
     semantic = {"solver": {"rho": rho, "n_admm": n_admm, "chambolle_iter": 100,
                              "lambda_grid": list(lam_grid), "nonnegative": True}}
-    reconstruction, details = run_perframe_cs(data, semantic, None, device)
+    reconstruction, details = run_perframe_cs(
+        legacy_acquisition_view(data), semantic, None, device
+    )
     psnrs, mean = evaluate_video(data.gt_frames, reconstruction)
     return reconstruction, {"method": "perframe_tvcs", "lambda": details["selected_hyperparameters"]["lambda"],
                             "mean_psnr": mean, "per_frame_psnr": psnrs,

@@ -20,7 +20,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .recinr_model import ReCINR, ReCINRConfig
-from .common import dgi_image, holdout_residual
+from .common import (
+    calibrate_reconstruction_physical,
+    dgi_image,
+    holdout_residual,
+    unique_optimizer_parameter_count,
+)
 
 
 # ── Variant (b): ReCINR's canonical REPRESENTATION + rigid SE(2) motion ──
@@ -280,20 +285,37 @@ def run_recinr(acquisition, semantic_config, algorithm_seed, device: str):
     target = ((measurements - measurements.mean()) / (measurements.std(unbiased=False) + 1e-8)).view(1, -1)
     network = ReCINR(config).to(device)
     canonical_parameters = [network.scene.features, *network.scene.renderer.parameters()]
+    history: list[dict[str, object]] = []
+    parameter_count = 0
     dgi = dgi_image(acquisition.patterns, acquisition.measurements).to(device)
     dgi_target = ((dgi - dgi.mean()) / (dgi.std() + 1e-8)).view(1, 1, H, W)
     anchor = torch.tensor([config.anchor_tau], device=device)
     if config.warm_epochs:
         warm_optimizer = torch.optim.Adam(network.parameters(), lr=config.lr0)
+        parameter_count = max(
+            parameter_count, unique_optimizer_parameter_count(warm_optimizer)
+        )
         network.scene.set_pe_progress(0.0)
-        for _ in range(config.warm_epochs):
+        for warm_step in range(config.warm_epochs):
             warm_optimizer.zero_grad()
             image, _ = network.scene(anchor)
-            F.mse_loss((image - image.mean()) / (image.std(unbiased=False) + 1e-8), dgi_target).backward()
+            warm_loss = F.mse_loss(
+                (image - image.mean()) / (image.std(unbiased=False) + 1e-8),
+                dgi_target,
+            )
+            warm_loss.backward()
             warm_optimizer.step()
+            history.append({
+                "kind": "step",
+                "step": len(history) + 1,
+                "loss": float(warm_loss.detach()),
+                "learning_rate": float(warm_optimizer.param_groups[0]["lr"]),
+            })
     warp_parameters = [parameter for parameter in network.parameters() if not any(parameter is fixed for fixed in canonical_parameters)]
     optimizer = torch.optim.Adam(warp_parameters, lr=config.lr0)
-    parameter_count = sum(parameter.numel() for group in optimizer.param_groups for parameter in group["params"])
+    parameter_count = max(
+        parameter_count, unique_optimizer_parameter_count(optimizer)
+    )
     schedule = None
     total_steps = int(config.flow_only_epochs + config.epochs)
     anneal_steps = max(1, int(config.pe_anneal_frac * total_steps))
@@ -303,7 +325,9 @@ def run_recinr(acquisition, semantic_config, algorithm_seed, device: str):
             for parameter in canonical_parameters:
                 parameter.requires_grad_(True)
             optimizer = torch.optim.Adam(network.parameters(), lr=config.lr0)
-            parameter_count = sum(parameter.numel() for group in optimizer.param_groups for parameter in group["params"])
+            parameter_count = max(
+                parameter_count, unique_optimizer_parameter_count(optimizer)
+            )
             schedule = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, config.epochs), eta_min=config.lr1)
         if step < config.flow_only_epochs:
             for parameter in canonical_parameters:
@@ -325,15 +349,37 @@ def run_recinr(acquisition, semantic_config, algorithm_seed, device: str):
         loss.backward(); torch.nn.utils.clip_grad_norm_(network.parameters(), 1.0); optimizer.step()
         if schedule is not None:
             schedule.step()
+        history.append({
+            "kind": "step",
+            "step": len(history) + 1,
+            "loss": float(loss.detach()),
+            "data_fidelity": float(
+                F.mse_loss(predicted[0].detach(), target[0]).detach()
+            ),
+            "learning_rate": float(optimizer.param_groups[0]["lr"]),
+        })
         if step >= config.flow_only_epochs and (step % int(solver["snapshot_every"]) == 0 or step == total_steps - 1):
             with torch.no_grad():
-                reconstruction = network.get_key_estimates(time_grid)[0][:, 0].cpu().numpy()
+                conditioned = network.get_key_estimates(time_grid)[0][:, 0].cpu().numpy()
+            reconstruction = calibrate_reconstruction_physical(
+                conditioned,
+                acquisition.patterns,
+                acquisition.measurements,
+                acquisition.frame_indices,
+            )
             score = holdout_residual(reconstruction, *holdout)
             if best_score is None or score < best_score:
                 best_reconstruction, best_score = reconstruction, score
     with torch.no_grad():
         network.scene.set_pe_progress(1.0)
         if best_reconstruction is None:
-            best_reconstruction = network.get_key_estimates(time_grid)[0][:, 0].cpu().numpy()
+            conditioned = network.get_key_estimates(time_grid)[0][:, 0].cpu().numpy()
+            best_reconstruction = calibrate_reconstruction_physical(
+                conditioned,
+                acquisition.patterns,
+                acquisition.measurements,
+                acquisition.frame_indices,
+            )
     return best_reconstruction, {"selected_hyperparameters": None, "selection": None,
-                                 "parameter_count": parameter_count}
+                                 "parameter_count": parameter_count,
+                                 "history": tuple(history)}

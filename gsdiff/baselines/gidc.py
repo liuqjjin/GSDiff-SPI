@@ -20,7 +20,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .common import build_operator, dgi_image, holdout_residual
+from .common import (
+    build_operator,
+    calibrate_reconstruction_physical,
+    dgi_image,
+    holdout_residual,
+    unique_optimizer_parameter_count,
+)
 
 
 def _zscore(a):
@@ -213,13 +219,15 @@ def run_gidc3dtv(acquisition, semantic_config, algorithm_seed, device: str):
     target = _zscore(measurements)
     candidates = [{"xi_xy": xy, "xi_t": temporal} for xy in solver["xi_xy"] for temporal in solver["xi_t"]]
     rows, best_video, best_candidate, best_value, parameter_count = [], None, None, None, 0
+    best_history: tuple[dict[str, object], ...] = ()
     for candidate in candidates:
         torch.manual_seed(int(algorithm_seed.seed_u32))
         network = GIDCUNet2D(in_channels=2, channels=solver["unet_channels"]).to(device).train()
         optimizer = torch.optim.Adam(network.parameters(), lr=float(solver["lr"]),
                                      betas=tuple(solver["betas"]), eps=float(solver["adam_epsilon"]))
-        parameter_count = sum(parameter.numel() for group in optimizer.param_groups for parameter in group["params"])
+        parameter_count = unique_optimizer_parameter_count(optimizer)
         snapshot, snapshot_objective = None, None
+        candidate_history: list[dict[str, object]] = []
         for step in range(int(solver["n_steps"])):
             for group in optimizer.param_groups:
                 group["lr"] = _lr_at(step, float(solver["lr"]))
@@ -228,8 +236,25 @@ def run_gidc3dtv(acquisition, semantic_config, algorithm_seed, device: str):
             data_loss = F.mse_loss(_zscore(_measure_dynamic(A, video, indices, T)), target)
             loss = data_loss + float(candidate["xi_xy"]) * _tv2d(_zscore(video)) + float(candidate["xi_t"]) * (video[1:] - video[:-1]).abs().mean()
             loss.backward(); optimizer.step()
-            if step % int(solver["eval_every"]) == 0 or step == int(solver["n_steps"]) - 1:
-                value = video.detach().cpu().numpy()
+            candidate_history.append({
+                "kind": "step",
+                "step": step + 1,
+                "loss": float(loss.detach()),
+                "data_fidelity": float(data_loss.detach()),
+                "learning_rate": float(optimizer.param_groups[0]["lr"]),
+            })
+            if (
+                (step + 1) % int(solver["eval_every"]) == 0
+                or step == int(solver["n_steps"]) - 1
+            ):
+                with torch.no_grad():
+                    conditioned = network(input_tensor)[:, 0].cpu().numpy()
+                value = calibrate_reconstruction_physical(
+                    conditioned,
+                    acquisition.patterns,
+                    acquisition.measurements,
+                    acquisition.frame_indices,
+                )
                 objective = holdout_residual(value, *holdout)
                 if snapshot_objective is None or objective < snapshot_objective:
                     snapshot, snapshot_objective = value, objective
@@ -242,8 +267,10 @@ def run_gidc3dtv(acquisition, semantic_config, algorithm_seed, device: str):
                      "value": objective.value})
         if best_value is None or objective.value < best_value:
             best_video, best_candidate, best_value = snapshot, candidate, objective.value
+            best_history = tuple(candidate_history)
     assert best_video is not None and best_candidate is not None
     return best_video, {"selected_hyperparameters": best_candidate,
                         "selection": {"formula_id": "heldout-normalized-l2-v1", "candidate_grid": candidates,
                                       "selected_candidate": best_candidate, "rows": rows},
-                        "parameter_count": parameter_count}
+                        "parameter_count": parameter_count,
+                        "history": best_history}

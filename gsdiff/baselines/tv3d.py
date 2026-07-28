@@ -8,7 +8,7 @@ import torch
 
 from gsdiff.experiments.objectives import heldout_normalized_l2
 
-from .common import dgi_image
+from .common import dgi_image, legacy_acquisition_view
 
 
 class _Op:
@@ -62,7 +62,10 @@ def _op_norm(op, n_iter=30, seed=0):
     return float(torch.sqrt(eigenvalue))
 
 
-def _chambolle_pock(op, y, tmask, lam_xy, lam_t, iters, L, X0):
+def _chambolle_pock(
+    op, y, tmask, lam_xy, lam_t, iters, L, X0,
+    progress_callback=None,
+):
     tau = sigma = 1.0 / max(float(L), 1e-12)
     T, H, W = op.T, op.H, op.W
     mask = tmask.float()
@@ -71,7 +74,7 @@ def _chambolle_pock(op, y, tmask, lam_xy, lam_t, iters, L, X0):
     y_dx = torch.zeros(T, H, W - 1, device=op.dev)
     y_dy = torch.zeros(T, H - 1, W, device=op.dev)
     y_dt = torch.zeros(T - 1, H, W, device=op.dev)
-    for _ in range(iters):
+    for iteration in range(iters):
         y_a = ((y_a + sigma * op.forward(Xbar) - sigma * y) / (1.0 + sigma)) * mask
         y_dx = (y_dx + sigma * _dx(Xbar)).clamp(-lam_xy, lam_xy)
         y_dy = (y_dy + sigma * _dy(Xbar)).clamp(-lam_xy, lam_xy)
@@ -80,6 +83,12 @@ def _chambolle_pock(op, y, tmask, lam_xy, lam_t, iters, L, X0):
         next_x = (X - tau * dual).clamp(min=0.0)
         Xbar = 2.0 * next_x - X
         X = next_x
+        if progress_callback is not None:
+            residual = (op.forward(X) - y) * mask
+            progress_callback(
+                iteration + 1,
+                {"data_fidelity": float(0.5 * residual.square().sum())},
+            )
     return X
 
 
@@ -131,15 +140,27 @@ def run_tv3d(acquisition, semantic_config: Mapping[str, object], algorithm_seed,
     all_scale = float(all_y.std(unbiased=False)) + 1e-12
     all_initial = _initial(all_op, all_patterns, all_measurements, T, all_scale)
     all_norm = 1.01 * _op_norm(all_op, n_iter=int(solver["opnorm_iterations"]), seed=algorithm_seed.seed_u32)
-    final = _chambolle_pock(all_op, all_y / all_scale, torch.ones(all_op.M, dtype=torch.bool, device=device), selected["lambda_xy"], selected["lambda_t"], int(solver["iterations"]), all_norm, all_initial)
+    history: list[dict[str, object]] = []
+
+    def observe(iteration, metrics):
+        history.append({"kind": "iteration", "iteration": iteration, **metrics})
+
+    final = _chambolle_pock(
+        all_op, all_y / all_scale,
+        torch.ones(all_op.M, dtype=torch.bool, device=device),
+        selected["lambda_xy"], selected["lambda_t"],
+        int(solver["iterations"]), all_norm, all_initial,
+        progress_callback=observe,
+    )
     return (final * all_scale).detach().cpu().numpy(), {
         "selected_hyperparameters": selected,
         "selection": {"formula_id": "heldout-normalized-l2-v1", "candidate_grid": candidates, "selected_candidate": selected, "rows": rows},
+        "history": tuple(history),
     }
 
 
 def tv3d(data, device="cuda", iters=500, lam_xy_grid=(3e-3, 3e-2, 3e-1), lam_t_grid=(1e-3, 1e-2, 1e-1, 1e0)):
     from ._evaluation import evaluate_video
-    reconstruction, details = run_tv3d(data, {"solver": {"iterations": iters, "opnorm_iterations": 30, "lambda_xy": list(lam_xy_grid), "lambda_t": list(lam_t_grid)}}, type("Seed", (), {"seed_u32": 0})(), device)
+    reconstruction, details = run_tv3d(legacy_acquisition_view(data), {"solver": {"iterations": iters, "opnorm_iterations": 30, "lambda_xy": list(lam_xy_grid), "lambda_t": list(lam_t_grid)}}, type("Seed", (), {"seed_u32": 0})(), device)
     psnrs, mean = evaluate_video(data.gt_frames, reconstruction)
     return reconstruction, {"method": "tv3d", "lam_xy": details["selected_hyperparameters"]["lambda_xy"], "lam_t": details["selected_hyperparameters"]["lambda_t"], "mean_psnr": mean, "per_frame_psnr": psnrs}

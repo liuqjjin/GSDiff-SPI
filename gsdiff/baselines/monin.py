@@ -201,10 +201,19 @@ def run_monin(acquisition, semantic_config, algorithm_seed, device: str):
     compensated = _build_Acomp(patterns, indices, translation, method=str(solver["interpolation"])).to(device)
     candidates = list(solver["lambda_grid"])
     rows, selected, selected_video, selected_value = [], None, None, None
+    selected_history: tuple[dict[str, object], ...] = ()
     for candidate in candidates:
+        candidate_history: list[dict[str, object]] = []
+
+        def observe(iteration, metrics):
+            candidate_history.append(
+                {"kind": "iteration", "iteration": iteration, **metrics}
+            )
+
         canonical = admm_tv(compensated, measurements.to(device), H, W, float(candidate),
                             rho=float(solver["rho"]), n_admm=int(solver["n_admm"]),
-                            chambolle_iter=int(solver["chambolle_iter"]))
+                            chambolle_iter=int(solver["chambolle_iter"]),
+                            progress_callback=observe)
         video = _backwarp_video(canonical, translation, T, method=str(solver["interpolation"]))
         from gsdiff.experiments.objectives import heldout_normalized_l2
         objective = heldout_normalized_l2(video, *holdout)
@@ -213,8 +222,10 @@ def run_monin(acquisition, semantic_config, algorithm_seed, device: str):
                      "value": objective.value})
         if selected_value is None or objective.value < selected_value:
             selected, selected_video, selected_value = candidate, video, objective.value
+            selected_history = tuple(candidate_history)
     assert selected is not None and selected_video is not None
     motion = np.column_stack((translation, np.zeros(T, dtype=translation.dtype)))
     return selected_video, motion, {"selected_hyperparameters": {"lambda": selected},
                                     "selection": {"formula_id": "heldout-normalized-l2-v1", "candidate_grid": candidates,
-                                                  "selected_candidate": selected, "rows": rows}}
+                                                  "selected_candidate": selected, "rows": rows},
+                                    "history": selected_history}
