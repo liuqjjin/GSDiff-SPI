@@ -865,6 +865,14 @@ def _validate_methods_registry(protocol: Mapping[str, object]) -> None:
             )
             if not isinstance(profile["semantic_config"], Mapping):
                 raise ValueError("method semantic config must be a mapping")
+            for field in (
+                "publication_eligible",
+                "selection_eligible",
+                "promotion_eligible",
+                "execution_ready",
+            ):
+                if type(profile[field]) is not bool:
+                    raise ValueError("method profile policy booleans must be exact booleans")
             profile_policy = {
                 key: value
                 for key, value in profile.items()

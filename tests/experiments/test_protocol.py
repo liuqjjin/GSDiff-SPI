@@ -595,6 +595,23 @@ def test_method_registry_rejects_rehashed_profile_policy_mutations(mutate):
         protocol.validate_protocol(invalid)
 
 
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda document: document["methods"][0]["profiles"]["publication-v1"].__setitem__("publication_eligible", 1),
+        lambda document: document["methods"][0]["profiles"]["controller-cpu-smoke-v1"].__setitem__("publication_eligible", 0),
+        lambda document: document["methods"][0]["profiles"]["publication-v1"].__setitem__("selection_eligible", 1.0),
+        lambda document: document["methods"][0]["profiles"]["controller-cpu-smoke-v1"].__setitem__("selection_eligible", 0.0),
+    ],
+)
+def test_method_registry_rejects_rehashed_profile_policy_boolean_type_spoofs(mutate):
+    invalid = copy.deepcopy(_load("methods-v1.yaml"))
+    mutate(invalid)
+    _refresh_hashes(invalid)
+    with pytest.raises(ValueError, match="profile policy"):
+        protocol.validate_protocol(invalid)
+
+
 def test_ablation_axes_shortlist_lanes_and_workflow_counts_are_locked():
     ablations = _load("ablations-v1.yaml")
 
