@@ -39,7 +39,7 @@ from gsdiff.experiments.methods import (
 
 SOURCE_ROOT = Path(__file__).resolve().parents[2]
 REGISTRY = SOURCE_ROOT / "configs" / "protocols" / "methods-v1.yaml"
-PYTHON = Path(r"D:\conda\envs\spi\python.exe")
+PYTHON = Path(sys.executable)
 DATASET_IDENTITY_SHA256 = "1" * 64
 DIFFUSION_CHECKPOINT_ID = "gsdiff-diffusion-prior-v1"
 DIFFUSION_CHECKPOINT = SOURCE_ROOT / "checkpoints" / "diffusion_prior.pt"

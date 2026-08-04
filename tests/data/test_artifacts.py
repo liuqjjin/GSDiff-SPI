@@ -38,7 +38,7 @@ from gsdiff.data.simulation import generate_spi_data
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-AUTHORITATIVE_PYTHON = Path(r"D:\conda\envs\spi\python.exe")
+AUTHORITATIVE_PYTHON = Path(sys.executable)
 SEMANTIC_STRING_FIELDS = (
     "pattern_family",
     "noise_convention",

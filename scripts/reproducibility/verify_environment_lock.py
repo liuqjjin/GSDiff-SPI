@@ -16,6 +16,7 @@ from gsdiff.experiments.identity import (  # noqa: E402
     canonical_json_bytes,
     collect_environment_fingerprint,
     sha256_bytes,
+    verify_environment_requirements,
 )
 
 
@@ -24,6 +25,9 @@ DEFAULT_LOCK_PATH = (
     / "docs"
     / "reproducibility"
     / "environment-lock.json"
+)
+DEFAULT_REQUIREMENTS_LOCK_PATH = (
+    Path(__file__).resolve().parents[2] / "requirements-lock.txt"
 )
 
 _LOCK_SCHEMA = {
@@ -95,9 +99,13 @@ def _load_lock(path: Path) -> dict[str, object]:
 
 
 def verify_environment_lock(
-    path: Path | str = DEFAULT_LOCK_PATH, *, strict: bool
+    path: Path | str = DEFAULT_LOCK_PATH,
+    *,
+    strict: bool,
+    requirements_lock: Path | str | None = None,
 ) -> dict[str, object]:
-    lock = _load_lock(Path(path))
+    environment_path = Path(path)
+    lock = _load_lock(environment_path)
     stored_fingerprint = lock["fingerprint"]
     recomputed_hash = sha256_bytes(canonical_json_bytes(stored_fingerprint))
     if lock["fingerprint_sha256"] != recomputed_hash:
@@ -106,6 +114,7 @@ def verify_environment_lock(
             "match the canonical fingerprint payload"
         )
 
+    dependencies_sha256 = None
     if strict:
         current_fingerprint = collect_environment_fingerprint()
         if canonical_json_bytes(current_fingerprint) != canonical_json_bytes(
@@ -122,8 +131,21 @@ def verify_environment_lock(
             raise EnvironmentLockError(
                 "current environment mismatch in: " + ", ".join(fields)
             )
+        if requirements_lock is not None:
+            try:
+                summary = verify_environment_requirements(
+                    requirements_lock,
+                    environment_path,
+                    live_fingerprint=current_fingerprint,
+                )
+            except ValueError as exc:
+                raise EnvironmentLockError(
+                    f"requirements lock mismatch: {exc}"
+                ) from exc
+            dependencies_sha256 = summary["dependencies_sha256"]
 
     return {
+        "dependencies_sha256": dependencies_sha256,
         "fingerprint_sha256": recomputed_hash,
         "strict": strict,
     }
@@ -143,7 +165,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--strict",
         action="store_true",
-        help="also require the current runtime to match the locked fingerprint",
+        help=(
+            "require requirements, the stored fingerprint, and the current "
+            "runtime to match"
+        ),
+    )
+    parser.add_argument(
+        "--requirements-lock",
+        type=Path,
+        default=DEFAULT_REQUIREMENTS_LOCK_PATH,
+        help="requirements-lock.txt path used by strict verification",
     )
     parser.add_argument(
         "--write",
@@ -163,7 +194,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"{args.path} fingerprint_sha256={lock['fingerprint_sha256']}"
             )
         else:
-            summary = verify_environment_lock(args.path, strict=args.strict)
+            summary = verify_environment_lock(
+                args.path,
+                strict=args.strict,
+                requirements_lock=(args.requirements_lock if args.strict else None),
+            )
             print(
                 "environment_lock_verification=passed "
                 f"strict={str(args.strict).lower()} "

@@ -4,10 +4,9 @@ This workstation uses one authoritative interpreter for dependency locking,
 verification, and all reported tests:
 
 ```text
-Interpreter: D:\conda\envs\spi\python.exe
-Install: D:\conda\envs\spi\python.exe -m pip install -r requirements-dev.txt
-CPU tests: D:\conda\envs\spi\python.exe -m pytest -m "not cuda" -q
-CUDA tests: D:\conda\envs\spi\python.exe -m pytest -m cuda -q
+Interpreter: D:\conda\envs\gsdiff-spi\python.exe
+CPU tests: D:\conda\envs\gsdiff-spi\python.exe -m pytest -m "not cuda" -q
+CUDA tests: D:\conda\envs\gsdiff-spi\python.exe -m pytest -m cuda -q
 ```
 
 The portable Python tests compare runtime metadata to `sys.executable`; the
@@ -19,10 +18,10 @@ interpreter assertion.
 Command:
 
 ```powershell
-D:\conda\envs\spi\python.exe -c "import platform,torch; print(platform.python_version()); print(torch.__version__); print(torch.version.cuda); print(torch.cuda.get_device_name(0))"
+D:\conda\envs\gsdiff-spi\python.exe -c "import platform,torch; print(platform.python_version()); print(torch.__version__); print(torch.version.cuda); print(torch.cuda.get_device_name(0))"
 ```
 
-Observed output on 2026-07-27:
+Observed output on 2026-08-04:
 
 ```text
 3.12.13
@@ -34,7 +33,7 @@ NVIDIA GeForce RTX 5060 Ti
 The canonical environment lock additionally records NVIDIA driver `596.21`,
 compute capability `12.0`, and 17,102,864,384 bytes of device memory. Its
 fingerprint SHA-256 is
-`b5d6922a9f3a9638ee8826b9a74f00998cd3ac81aa25c03de016358e0e435a56`.
+`4a51ef8440bf725b369a9ce40534a8d2a19d7a994b636c7aa2125e83bb92dc1f`.
 
 ## Dependency and environment locks
 
@@ -44,11 +43,19 @@ in `requirements-lock.txt`. `requirements-dev.txt` adds the test and schema
 validation pins. Publication experiments must match
 `docs/reproducibility/environment-lock.json`, not only the minimum constraints.
 
-The exact distribution lock was captured after the dev install using:
+The dedicated environment is created and populated with exact binary pins:
 
 ```powershell
-D:\conda\envs\spi\python.exe -m pip list --format=freeze
+C:\Users\admin\miniconda3\Scripts\conda.exe create --prefix D:\conda\envs\gsdiff-spi --override-channels -c conda-forge --no-default-packages python=3.12.13 pip=26.1.2 setuptools=82.0.1 wheel=0.47.0 packaging=26.2 -y
+D:\conda\envs\gsdiff-spi\python.exe -m pip install --index-url https://download.pytorch.org/whl/cu128 --only-binary=:all: --no-deps torch==2.8.0
+$nonTorchPins = Get-Content requirements-lock.txt | Where-Object { $_ -notmatch '^torch==' }
+D:\conda\envs\gsdiff-spi\python.exe -m pip install --only-binary=:all: --no-deps @nonTorchPins
 ```
+
+`requirements-lock.txt` contains 68 unique normalized records. The live
+runtime has the same 68 records exactly; it does not install `inr-spi`,
+`recinr`, `recinr-rebuild`, `build`, or `pyproject-hooks`. ReCINR execution
+uses the repository's vendored `gsdiff.baselines.recinr*` modules.
 
 The canonical environment fingerprint contains:
 
@@ -81,14 +88,17 @@ usernames, paths, and unrelated host configuration are excluded.
 Regenerate and verify the lock with:
 
 ```powershell
-D:\conda\envs\spi\python.exe scripts\reproducibility\verify_environment_lock.py docs\reproducibility\environment-lock.json --write
-D:\conda\envs\spi\python.exe scripts\reproducibility\verify_environment_lock.py --strict
+D:\conda\envs\gsdiff-spi\python.exe scripts\reproducibility\verify_environment_lock.py docs\reproducibility\environment-lock.json --write
+D:\conda\envs\gsdiff-spi\python.exe scripts\reproducibility\verify_environment_lock.py --strict
 ```
 
-Strict verification recomputes both the stored payload hash and the complete
-current fingerprint. A self-consistent edited payload still fails when any
-dependency, Python ABI field, numerical environment value, platform, PyTorch
-build, CUDA driver, or GPU device differs.
+Strict verification requires `requirements-lock.txt`, the stored environment
+payload, and the complete current fingerprint to agree. A self-consistent
+edited payload still fails when its distributions differ from the requirements
+lock, or when any dependency, Python ABI field, numerical environment value,
+platform, PyTorch build, CUDA driver, or GPU device differs from the live
+runtime. Use `--requirements-lock PATH` only when intentionally verifying an
+alternate requirements lock.
 
 ## Canonical experiment identities
 
@@ -219,8 +229,8 @@ skips.
 Fresh JUnit evidence is generated and checked with an explicit UTC boundary:
 
 ```powershell
-D:\conda\envs\spi\python.exe -m pytest -q --junitxml=<report-path>
-D:\conda\envs\spi\python.exe scripts\reproducibility\verify_pytest_junit.py <report-path> --created-after-utc <ISO-8601-UTC>
+D:\conda\envs\gsdiff-spi\python.exe -m pytest -q --junitxml=<report-path>
+D:\conda\envs\gsdiff-spi\python.exe scripts\reproducibility\verify_pytest_junit.py <report-path> --created-after-utc <ISO-8601-UTC>
 ```
 
 The verifier rejects missing or malformed XML, zero tests, failures, errors,

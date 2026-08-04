@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 
 import numpy as np
 import pytest
@@ -31,7 +32,7 @@ from gsdiff.experiments.methods import (
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-PYTHON = Path(r"D:\conda\envs\spi\python.exe")
+PYTHON = Path(sys.executable)
 TRUTH_SEEKING_CHILD = (
     REPO_ROOT
     / "tests"

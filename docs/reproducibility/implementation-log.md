@@ -2152,3 +2152,48 @@ plan-completion closure is claimed here.
 
 This re-closes the corrective implementation ledger only. The immutable
 post-reclosure completion gate is still pending and is not claimed here.
+
+## Dedicated authoritative runtime migration (2026-08-04)
+
+- Created the sole project runtime with
+  `C:\Users\admin\miniconda3\Scripts\conda.exe create --prefix
+  D:\conda\envs\gsdiff-spi --override-channels -c conda-forge
+  --no-default-packages python=3.12.13 pip=26.1.2 setuptools=82.0.1
+  wheel=0.47.0 packaging=26.2 -y`.
+- Installed Torch separately from the official CUDA 12.8 wheel index with
+  `--only-binary=:all: --no-deps torch==2.8.0`. Two direct pip transfers were
+  truncated by `IncompleteRead`. The resumable fallback used the exact
+  official PEP 503 wheel URL, recovered from one additional TLS close, and
+  produced a 3,461,384,651-byte wheel with SHA-256
+  `0ad925202387f4e7314302a1b4f8860fa824357f9b1466d7992bf276370ebcff`,
+  matching the official link fragment before local `--no-deps` installation.
+- Installed all 67 non-Torch lock pins together with
+  `--only-binary=:all: --no-deps`. The resulting runtime is Python `3.12.13`,
+  Torch `2.8.0+cu128`, CUDA build `12.8`, and cuDNN `91002`, with CUDA
+  available on `NVIDIA GeForce RTX 5060 Ti` and NVIDIA driver `596.21`.
+- `requirements-lock.txt`, the canonical environment JSON, and the live
+  runtime each contain the same 68 unique normalized distributions. The five
+  stale residues `inr-spi`, `recinr`, `recinr-rebuild`, `build`, and
+  `pyproject-hooks` are absent; the repository's vendored
+  `gsdiff.baselines.recinr*` implementation remains the method source.
+- The canonical writer produced fingerprint
+  `4a51ef8440bf725b369a9ce40534a8d2a19d7a994b636c7aa2125e83bb92dc1f`.
+  Strict requirements/environment/live verification passed. `pip check`
+  reported `No broken requirements found.`, and an independent normalized
+  comparison reported 68 locked and 68 installed records with no missing or
+  extra distribution.
+- TDD evidence: the rewritten stale-distribution contract was RED at
+  `1 failed, 15 passed`; the two strict CLI trio tests were RED at `2 failed`
+  because `--requirements-lock` did not yet exist. The completed focused suite
+  was GREEN at `18 passed in 2.06s`.
+- Approved Task 4 boundary gate: `820 passed, 8 skipped in 371.67s`; all eight
+  skips were the documented Windows capability cases.
+- Adapter/campaign/GSDiff gate: `207 passed, 1 skipped in 190.84s`; all four
+  former environment-lock-preflight failures executed and passed, and the
+  remaining skip was the documented checkpoint-symlink privilege case.
+- Full non-CUDA gate: `2192 passed, 17 skipped, 1 deselected in 645.87s`;
+  all 19 former environment-lock-preflight failures executed and passed.
+- Real CUDA gate: `1 passed, 2209 deselected in 2.01s`, with zero CUDA skips.
+- `python -m compileall -q gsdiff scripts train.py`, Draft 2020-12 schema
+  checks for all four repository schemas, `git diff --check`, and exact
+  `configs/protocols` no-diff all completed with exit `0`.
