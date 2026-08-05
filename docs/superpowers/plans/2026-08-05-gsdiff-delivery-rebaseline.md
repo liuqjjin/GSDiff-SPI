@@ -60,6 +60,25 @@ criteria:
 No implementation or review may broaden this boundary without a new explicit
 user decision.
 
+## Authority and Supersession Decisions
+
+This tracked rebaseline is the sole implementation authority for Tasks 1–6.
+Earlier local `.superpowers/sdd` briefs remain useful audit history, but any
+conflicting interface or hardening requirement in those untracked briefs is
+superseded here and cannot reopen the delivery boundary.
+
+- `phase_id` is an identity-bound resolved execution label, not a scientific
+  `ExperimentCell` field. Decision and replay therefore cannot reuse one run
+  identity; replay remains an independently executed publication-commit check.
+- `PhasePlan` binds protocol membership, datasets, frozen selection, and the
+  confirmatory prerequisite. It does not gain a separate `required_code_role`
+  interface. The publication commit is instead verified from every physical
+  run record and bound across phase completions and the final results lock.
+- Protocol-v1 atomic JSON publication requires sibling temporary bytes,
+  file-data flush, replace, canonical/schema readback, and hash comparison.
+  Native Windows directory-handle fsync and same-account malicious path races
+  remain outside this rebaseline's ordinary-research failure boundary.
+
 ---
 
 ### Task 1: Freeze and Close the Existing Atomic Runner
@@ -136,7 +155,7 @@ recovery, complete-manifest-last, no-clobber promotion, blind child boundary,
 and scientific identity binding. Findings outside the operational boundary are
 recorded as backlog and do not restart implementation.
 
-- [ ] **Step 6: Commit and push the runner checkpoint**
+- [x] **Step 6: Commit and push the runner checkpoint**
 
 ```powershell
 git diff --cached --check
@@ -152,6 +171,11 @@ Stage only the reviewed Task 1 files and this rebaseline plan. Never force push.
 **Files:**
 
 - Create `gsdiff/experiments/phases.py`.
+- Create `gsdiff/experiments/contracts.py` for independent phase, statistics,
+  and publication-lock contracts.
+- Create `gsdiff/experiments/path_roles.py` and
+  `gsdiff/experiments/versioned_json.py` for bounded local path separation and
+  strict canonical schema validation.
 - Create `gsdiff/experiments/aggregation.py`.
 - Create `gsdiff/experiments/statistics.py`.
 - Create `scripts/experiments/aggregate_campaign.py`.
@@ -161,20 +185,28 @@ Stage only the reviewed Task 1 files and this rebaseline plan. Never force push.
 - Create `tests/experiments/test_aggregation.py`.
 - Create `tests/experiments/test_statistics.py`.
 - Create `tests/experiments/test_results_lock.py`.
-- Modify `scripts/experiments/run_campaign.py` only to require an explicit
+- Create `tests/experiments/test_document_contracts.py`.
+- Modify `gsdiff/experiments/manifest.py` only where strict complete-record
+  discovery requires an exact manifest-path contract.
+- Modify `scripts/experiments/run_campaign.py` to require an explicit
   versioned `--phase` and explicit `--artifact-root` before campaign execution.
+- Modify `scripts/run_eval_matrix.py` only to preserve those required arguments
+  through the compatibility wrapper.
+- Add strict JSON Schemas for phase expectations, phase aggregates, statistics
+  controls, partial reports, and the publication results lock.
 
 **Interfaces:**
 
 ```python
 @dataclass(frozen=True)
 class LogicalRunKey:
+    phase_id: str
+    acquisition_config_id: str
+    method_config_id: str
     method_id: str
     target_id: str
     motion_id: str
-    acquisition_config_id: str
     seed: int
-    phase_id: str
 
 
 def load_complete_records(
@@ -182,7 +214,7 @@ def load_complete_records(
     *,
     phase_id: str,
     expected_identities: Mapping[LogicalRunKey, str],
-) -> tuple[dict[str, object], ...]: ...
+) -> tuple[CompleteMetricRecord, ...]: ...
 
 
 def aggregate_seed_metrics(
@@ -197,42 +229,50 @@ def aggregate_seed_metrics(
 def merge_aggregate(
     existing: Mapping[str, object],
     incoming: Mapping[str, object],
+    *,
+    phase_evidence_contract: PhaseEvidenceContract,
+    statistics_contract: StatisticsContract,
 ) -> dict[str, object]: ...
 ```
 
-- [ ] **Step 1: RED phase separation**
+- [x] **Step 1: RED phase separation**
 
 Test that decision, replay, stress, primary-selection, and confirmatory phase
 views materialize only their declared seeds/methods/cells. A decision/replay
 identity must not satisfy a different phase, and confirmatory cells must not be
 constructed before the 630-run prerequisite record verifies.
 
-- [ ] **Step 2: GREEN phase materialization**
+- [x] **Step 2: GREEN phase materialization**
 
 Implement fixed protocol-v1 phase views and exact expected identity maps.
 Avoid free-form filters, environment overrides, remote refs, and receipt chains.
 
-- [ ] **Step 3: RED/GREEN exact complete-record loading**
+- [x] **Step 3: RED/GREEN exact complete-record loading**
 
 Reject missing, failed, dirty, unblinded, mixed-version, nonfinite, duplicate,
 ambiguous, or wrong-phase inputs. Ignore unrelated immutable runs. Write a
 separate atomic `partial-report.json` and leave the last complete aggregate
 byte-identical when coverage is incomplete.
 
-- [ ] **Step 4: RED/GREEN deterministic paired statistics**
+- [x] **Step 4: RED/GREEN deterministic paired statistics**
 
 Produce per-seed rows, mean, sample SD (`ddof=1`), paired effects, and the fixed
 seed-cluster bootstrap. For `n < 2`, emit JSON `null` for SD/CI; never emit NaN
 or infinity.
 
-- [ ] **Step 5: RED/GREEN atomic aggregate and lock refusal**
+- [x] **Step 5: RED/GREEN atomic aggregate and lock refusal**
 
 Validate schema, write a sibling temporary file, flush, replace, reload, and
 compare canonical hash. `lock_results.py` refuses partial coverage, wrong
 phase, dirty/unblinded/mixed/nonfinite evidence, and paper data that cannot be
 regenerated.
 
-- [ ] **Step 6: Verify, review, commit, and push**
+Task 2 closes the structure and refusal contracts only. A real
+`results-lock-v1` remains deliberately unreachable until Task 3 materializes
+validated authority for stress, confirmatory, supplement, OOD, and failure
+phases. Mock-backed lock tests do not constitute a production results lock.
+
+- [x] **Step 6: Verify, review, commit, and push**
 
 ```powershell
 D:\conda\envs\gsdiff-spi\python.exe -m pytest `
@@ -259,6 +299,9 @@ readiness evidence, and the implementation ledger.
   never invent missing history.
 - [ ] Prove corrected datasets, checkpoint hashes, GPU/disk preflight, and
   phase counts.
+- [ ] Materialize tracked authority inputs for stress, confirmatory,
+  supplement-only, OOD, and failure phases; remove their fail-closed CLI block
+  only after each exact PhasePlan can be rebuilt from validated inputs.
 - [ ] Change `execution_ready` only after the corresponding evidence verifies.
 - [ ] Run an 11-method non-publication pilot and use measured times to report a
   realistic campaign ETA.

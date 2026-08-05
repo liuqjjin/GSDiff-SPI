@@ -253,6 +253,10 @@ def validate_aggregate_index(
             raise TypeError(
                 "artifact_root must be a Path for physical aggregate validation"
             )
+        if set(manifest_paths) != set(expected):
+            raise ValueError(
+                "manifest path identities must exactly equal expected identities"
+            )
         environment_hashes = _verify_environment_evidence(
             requirements_lock,
             environment_lock,
@@ -306,6 +310,10 @@ def build_aggregate_index(
     if type(expected_identity_sha256s) is not list:
         raise TypeError("expected identities must be an exact list")
     expected = list(expected_identity_sha256s)
+    if set(manifest_paths) != set(expected):
+        raise ValueError(
+            "manifest path identities must exactly equal expected identities"
+        )
     records: list[dict[str, str]] = []
     environment_hashes = _verify_environment_evidence(
         requirements_lock,

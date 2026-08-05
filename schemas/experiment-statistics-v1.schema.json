@@ -1,0 +1,276 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "experiment-statistics-v1.schema.json",
+  "title": "GSDiff-SPI finite seed-cluster statistics v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "phase_id",
+    "required_seeds",
+    "n_bootstrap",
+    "bootstrap_seed",
+    "summaries",
+    "paired_effects"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "experiment-statistics-v1"
+    },
+    "phase_id": {
+      "$ref": "#/$defs/id"
+    },
+    "required_seeds": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "n_bootstrap": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "bootstrap_seed": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "summaries": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/summary"
+      }
+    },
+    "paired_effects": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/paired_effect"
+      }
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "metric": {
+      "enum": [
+        "psnr_global_affine",
+        "ssim_global_affine",
+        "nrmse_global_affine_l2",
+        "psnr_legacy_per_frame_minmax"
+      ]
+    },
+    "nullable_nonnegative_number": {
+      "oneOf": [
+        {
+          "type": "number",
+          "minimum": 0
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "seed_value": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "seed",
+        "value"
+      ],
+      "properties": {
+        "seed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "value": {
+          "type": "number"
+        }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scientific_contract_sha256",
+        "acquisition_config_id",
+        "target_id",
+        "motion_id",
+        "method_id",
+        "method_config_id",
+        "metric",
+        "per_seed",
+        "n",
+        "mean",
+        "sample_sd"
+      ],
+      "properties": {
+        "scientific_contract_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "acquisition_config_id": {
+          "$ref": "#/$defs/id"
+        },
+        "target_id": {
+          "$ref": "#/$defs/id"
+        },
+        "motion_id": {
+          "$ref": "#/$defs/id"
+        },
+        "method_id": {
+          "$ref": "#/$defs/id"
+        },
+        "method_config_id": {
+          "$ref": "#/$defs/id"
+        },
+        "metric": {
+          "$ref": "#/$defs/metric"
+        },
+        "per_seed": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/seed_value"
+          }
+        },
+        "n": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "mean": {
+          "type": "number"
+        },
+        "sample_sd": {
+          "$ref": "#/$defs/nullable_nonnegative_number"
+        }
+      }
+    },
+    "paired_seed_effect": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "seed",
+        "paired_cells",
+        "mean_effect"
+      ],
+      "properties": {
+        "seed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "paired_cells": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "mean_effect": {
+          "type": "number"
+        }
+      }
+    },
+    "bootstrap_ci": {
+      "oneOf": [
+        {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "prefixItems": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            }
+          ],
+          "items": false
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "paired_effect": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "comparison_id",
+        "scientific_contract_sha256",
+        "method_id",
+        "method_config_id",
+        "comparator_id",
+        "comparator_config_id",
+        "metric",
+        "effect_direction",
+        "metric_direction",
+        "per_seed",
+        "n",
+        "mean",
+        "sample_sd",
+        "bootstrap_ci"
+      ],
+      "properties": {
+        "comparison_id": {
+          "$ref": "#/$defs/id"
+        },
+        "scientific_contract_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "method_id": {
+          "$ref": "#/$defs/id"
+        },
+        "method_config_id": {
+          "$ref": "#/$defs/id"
+        },
+        "comparator_id": {
+          "$ref": "#/$defs/id"
+        },
+        "comparator_config_id": {
+          "$ref": "#/$defs/id"
+        },
+        "metric": {
+          "$ref": "#/$defs/metric"
+        },
+        "effect_direction": {
+          "const": "method_minus_comparator"
+        },
+        "metric_direction": {
+          "enum": [
+            "higher_is_better",
+            "lower_is_better"
+          ]
+        },
+        "per_seed": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/paired_seed_effect"
+          }
+        },
+        "n": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "mean": {
+          "type": "number"
+        },
+        "sample_sd": {
+          "$ref": "#/$defs/nullable_nonnegative_number"
+        },
+        "bootstrap_ci": {
+          "$ref": "#/$defs/bootstrap_ci"
+        }
+      }
+    }
+  }
+}

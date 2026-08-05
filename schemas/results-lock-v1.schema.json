@@ -1,0 +1,169 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "results-lock-v1.schema.json",
+  "title": "GSDiff-SPI publication results lock v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "status",
+    "publication_lock_contract_sha256",
+    "code_commit",
+    "metric_version",
+    "dependencies_sha256",
+    "environment_lock_sha256",
+    "source_snapshot_sha256",
+    "source_projection_sha256",
+    "requested_runtime_device",
+    "phases",
+    "total_records",
+    "regeneration_command"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "results-lock-v1"
+    },
+    "status": {
+      "const": "complete"
+    },
+    "publication_lock_contract_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "code_commit": {
+      "$ref": "#/$defs/commit"
+    },
+    "metric_version": {
+      "const": "metrics-v1"
+    },
+    "dependencies_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "environment_lock_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "source_snapshot_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "source_projection_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "requested_runtime_device": {
+      "type": "string",
+      "pattern": "^(?:cpu|cuda:(?:0|[1-9][0-9]*))$"
+    },
+    "phases": {
+      "type": "array",
+      "minItems": 7,
+      "maxItems": 7,
+      "uniqueItems": true,
+      "prefixItems": [
+        {
+          "allOf": [
+            {"$ref": "#/$defs/phase"},
+            {"properties": {"phase_id": {"const": "selection-replay-v1"}, "record_count": {"const": 207}}}
+          ]
+        },
+        {
+          "allOf": [
+            {"$ref": "#/$defs/phase"},
+            {"properties": {"phase_id": {"const": "selection-stress-v1"}, "record_count": {"const": 126}}}
+          ]
+        },
+        {
+          "allOf": [
+            {"$ref": "#/$defs/phase"},
+            {"properties": {"phase_id": {"const": "primary-selection-v1"}, "record_count": {"const": 297}}}
+          ]
+        },
+        {
+          "allOf": [
+            {"$ref": "#/$defs/phase"},
+            {"properties": {"phase_id": {"const": "primary-confirmatory-v1"}, "record_count": {"const": 198}}}
+          ]
+        },
+        {
+          "allOf": [
+            {"$ref": "#/$defs/phase"},
+            {"properties": {"phase_id": {"const": "supplement-grid-v1"}, "record_count": {"const": 231}}}
+          ]
+        },
+        {
+          "allOf": [
+            {"$ref": "#/$defs/phase"},
+            {"properties": {"phase_id": {"const": "ood-v1"}, "record_count": {"const": 198}}}
+          ]
+        },
+        {
+          "allOf": [
+            {"$ref": "#/$defs/phase"},
+            {"properties": {"phase_id": {"const": "failure-v1"}, "record_count": {"const": 180}}}
+          ]
+        }
+      ],
+      "items": false
+    },
+    "total_records": {
+      "type": "integer",
+      "const": 1437
+    },
+    "regeneration_command": {
+      "type": "array",
+      "minItems": 2,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "phase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "phase_id",
+        "phase_sha256",
+        "execution_profile",
+        "aggregate_sha256",
+        "phase_evidence_contract_sha256",
+        "statistics_contract_sha256",
+        "record_count"
+      ],
+      "properties": {
+        "phase_id": {
+          "$ref": "#/$defs/id"
+        },
+        "phase_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "execution_profile": {
+          "$ref": "#/$defs/id"
+        },
+        "aggregate_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "phase_evidence_contract_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "statistics_contract_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "record_count": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    }
+  }
+}

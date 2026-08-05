@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "phase-statistics-contract-v1.schema.json",
+  "title": "GSDiff-SPI phase statistics contract v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "phase_id",
+    "phase_sha256",
+    "metric_version",
+    "required_seeds",
+    "comparisons",
+    "n_bootstrap",
+    "bootstrap_seed"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "phase-statistics-contract-v1"
+    },
+    "phase_id": {
+      "$ref": "#/$defs/id"
+    },
+    "phase_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "metric_version": {
+      "const": "metrics-v1"
+    },
+    "required_seeds": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "comparisons": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/comparison"
+      }
+    },
+    "n_bootstrap": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "bootstrap_seed": {
+      "type": "integer",
+      "minimum": 0
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "metric": {
+      "enum": [
+        "psnr_global_affine",
+        "ssim_global_affine",
+        "nrmse_global_affine_l2",
+        "psnr_legacy_per_frame_minmax"
+      ]
+    },
+    "comparison": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "comparison_id",
+        "method_id",
+        "comparator_id",
+        "metric",
+        "method_config_id",
+        "comparator_config_id"
+      ],
+      "properties": {
+        "comparison_id": {
+          "$ref": "#/$defs/id"
+        },
+        "method_id": {
+          "$ref": "#/$defs/id"
+        },
+        "comparator_id": {
+          "$ref": "#/$defs/id"
+        },
+        "metric": {
+          "$ref": "#/$defs/metric"
+        },
+        "method_config_id": {
+          "$ref": "#/$defs/id"
+        },
+        "comparator_config_id": {
+          "$ref": "#/$defs/id"
+        }
+      }
+    }
+  }
+}

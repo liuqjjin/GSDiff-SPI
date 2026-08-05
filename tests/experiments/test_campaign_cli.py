@@ -85,21 +85,126 @@ def test_campaign_device_vocabulary_requires_indexed_cuda():
         [
             "--protocol",
             str(REPO_ROOT / "configs/protocols/pilot-v1.yaml"),
+            "--phase",
+            "pilot-v1",
+            "--artifact-root",
+            str(REPO_ROOT / "artifacts"),
             "--device",
             "cuda:0",
         ]
     )
     assert parsed.device == "cuda:0"
+    assert parsed.phase == "pilot-v1"
     for alias in ("cuda", "cuda:00", "cuda:01"):
         with pytest.raises(SystemExit):
             parser.parse_args(
                 [
                     "--protocol",
                     str(REPO_ROOT / "configs/protocols/pilot-v1.yaml"),
+                    "--phase",
+                    "pilot-v1",
+                    "--artifact-root",
+                    str(REPO_ROOT / "artifacts"),
                     "--device",
                     alias,
                 ]
             )
+
+
+@pytest.mark.parametrize("missing", ["phase", "artifact-root"])
+def test_campaign_parser_requires_explicit_phase_and_artifact_root(missing):
+    parser = _load_run_campaign_cli()._parser()
+    arguments = [
+        "--protocol",
+        str(REPO_ROOT / "configs/protocols/pilot-v1.yaml"),
+        "--phase",
+        "pilot-v1",
+        "--artifact-root",
+        str(REPO_ROOT / "artifacts"),
+        "--device",
+        "cpu",
+    ]
+    option = f"--{missing}"
+    index = arguments.index(option)
+    del arguments[index : index + 2]
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(arguments)
+
+
+def test_campaign_phase_and_acquisition_labels_enter_identity_base_config():
+    cli = _load_run_campaign_cli()
+    digest = "a" * 64
+
+    decision = cli._phase_identity_base_config(
+        phase_id="selection-decision-v1",
+        acquisition_config_id="base",
+        method_config_sha256=digest,
+    )
+    replay = cli._phase_identity_base_config(
+        phase_id="selection-replay-v1",
+        acquisition_config_id="base",
+        method_config_sha256=digest,
+    )
+    stress = cli._phase_identity_base_config(
+        phase_id="selection-decision-v1",
+        acquisition_config_id="stress-snr-db-15-v1",
+        method_config_sha256=digest,
+    )
+
+    assert decision == {
+        "phase_id": "selection-decision-v1",
+        "acquisition_config_id": "base",
+        "method_config_sha256": digest,
+    }
+    assert decision != replay
+    assert decision != stress
+
+
+@pytest.mark.parametrize("phase", ["pilot-v1", "ood-v1", "failure-v1"])
+def test_direct_campaign_phases_have_exact_execution_membership(phase):
+    cli = _load_run_campaign_cli()
+
+    assert cli._require_materialized_phase_execution(phase) is None
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [
+        "selection-decision-v1",
+        "selection-replay-v1",
+        "selection-stress-v1",
+        "primary-selection-v1",
+        "primary-confirmatory-v1",
+        "supplement-grid-v1",
+    ],
+)
+def test_partitioned_or_delta_phases_fail_closed_until_cli_materializes_them(
+    phase,
+):
+    cli = _load_run_campaign_cli()
+
+    with pytest.raises(ValueError, match="materialization"):
+        cli._require_materialized_phase_execution(phase)
+
+
+@pytest.mark.parametrize("phase", ["pilot", "Pilot-v1", "pilot-v01", "pilot_v1"])
+def test_campaign_parser_rejects_noncanonical_phase_ids(phase):
+    parser = _load_run_campaign_cli()._parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "--protocol",
+                str(REPO_ROOT / "configs/protocols/pilot-v1.yaml"),
+                "--phase",
+                phase,
+                "--artifact-root",
+                str(REPO_ROOT / "artifacts"),
+                "--device",
+                "cpu",
+            ]
+        )
 
 
 def test_campaign_runtime_metadata_uses_requested_cuda_index(monkeypatch):
@@ -139,6 +244,7 @@ def test_out_of_range_cuda_is_refused_before_artifacts_or_source_access(
     artifact_root = tmp_path / "must-not-be-created"
     campaign = {
         "document_kind": "campaign",
+        "campaign_id": "pilot-v1",
         "execution_ready": True,
         "method_budgets": {"dgi": 1},
     }
@@ -161,6 +267,8 @@ def test_out_of_range_cuda_is_refused_before_artifacts_or_source_access(
         [
             "--protocol",
             str(tmp_path / "ready.yaml"),
+            "--phase",
+            "pilot-v1",
             "--artifact-root",
             str(artifact_root),
             "--device",
@@ -271,6 +379,10 @@ def test_campaign_script_isolated_mode_ignores_pythonpath_and_sitecustomize(
             str(RUN_CAMPAIGN_SCRIPT.resolve()),
             "--protocol",
             str(REPO_ROOT / "configs/protocols/pilot-v1.yaml"),
+            "--phase",
+            "pilot-v1",
+            "--artifact-root",
+            str(tmp_path / "artifacts"),
             "--device",
             "cpu",
         ],
@@ -445,8 +557,22 @@ def test_runner_dataset_catalog_rejects_staging_added_during_verification(
         )
 
 
-def test_task5_campaign_rejects_nonready_protocol_before_artifacts_or_child(
-    tmp_path, capsys, monkeypatch
+@pytest.mark.parametrize(
+    ("protocol_name", "phase"),
+    [
+        ("pilot-v1.yaml", "pilot-v1"),
+        ("supplement-grid-v1.yaml", "supplement-grid-v1"),
+        ("ood-v1.yaml", "ood-v1"),
+        ("failure-v1.yaml", "failure-v1"),
+        ("primary-v1.yaml", "primary-selection-v1"),
+        ("primary-v1.yaml", "primary-confirmatory-v1"),
+        ("ablations-v1.yaml", "selection-decision-v1"),
+        ("ablations-v1.yaml", "selection-replay-v1"),
+        ("ablations-v1.yaml", "selection-stress-v1"),
+    ],
+)
+def test_task5_campaign_accepts_only_declared_phase_before_readiness_gate(
+    protocol_name, phase, tmp_path, capsys, monkeypatch
 ):
     cli = _load_run_campaign_cli()
     artifact_root = tmp_path / "must-not-be-created"
@@ -458,7 +584,9 @@ def test_task5_campaign_rejects_nonready_protocol_before_artifacts_or_child(
     return_code = cli.main(
         [
             "--protocol",
-            str(REPO_ROOT / "configs/protocols/pilot-v1.yaml"),
+            str(REPO_ROOT / "configs/protocols" / protocol_name),
+            "--phase",
+            phase,
             "--artifact-root",
             str(artifact_root),
             "--device",
@@ -473,6 +601,75 @@ def test_task5_campaign_rejects_nonready_protocol_before_artifacts_or_child(
     assert not artifact_root.exists()
 
 
+@pytest.mark.parametrize(
+    ("campaign", "phase"),
+    [
+        (
+            {
+                "document_kind": "campaign",
+                "campaign_id": "pilot-v1",
+                "execution_ready": False,
+            },
+            "unknown-v1",
+        ),
+        (
+            {
+                "document_kind": "campaign",
+                "campaign_id": "primary-v1",
+                "execution_ready": False,
+            },
+            "primary-v1",
+        ),
+        (
+            {
+                "document_kind": "campaign",
+                "campaign_id": "unknown-v1",
+                "execution_ready": False,
+            },
+            "unknown-v1",
+        ),
+        (
+            {
+                "document_kind": "ablation",
+                "execution_ready": False,
+            },
+            "pilot-v1",
+        ),
+    ],
+)
+def test_campaign_rejects_unknown_or_mismatched_phase_before_readiness_or_artifacts(
+    campaign, phase, tmp_path, capsys, monkeypatch
+):
+    cli = _load_run_campaign_cli()
+    artifact_root = tmp_path / "must-not-be-created"
+    monkeypatch.setattr(cli, "load_protocol", lambda path: campaign)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("invalid phase reached readiness or artifact access")
+
+    monkeypatch.setattr(cli, "_require_versioned_budget_contract", forbidden)
+    monkeypatch.setattr(cli, "_run_ready_campaign", forbidden)
+
+    return_code = cli.main(
+        [
+            "--protocol",
+            str(tmp_path / "protocol.yaml"),
+            "--phase",
+            phase,
+            "--artifact-root",
+            str(artifact_root),
+            "--device",
+            "cpu",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert return_code == 1
+    assert captured.out == ""
+    assert captured.err == "campaign execution refused: ValueError\n"
+    assert not artifact_root.exists()
+
+
 def test_ready_campaign_without_versioned_budget_contract_fails_before_artifacts(
     tmp_path,
     capsys,
@@ -482,6 +679,7 @@ def test_ready_campaign_without_versioned_budget_contract_fails_before_artifacts
     artifact_root = tmp_path / "must-not-be-created"
     campaign = {
         "document_kind": "campaign",
+        "campaign_id": "pilot-v1",
         "execution_ready": True,
         "method_budgets": {"dgi": 1},
     }
@@ -496,6 +694,8 @@ def test_ready_campaign_without_versioned_budget_contract_fails_before_artifacts
         [
             "--protocol",
             str(tmp_path / "ready.yaml"),
+            "--phase",
+            "pilot-v1",
             "--artifact-root",
             str(artifact_root),
             "--device",
@@ -574,6 +774,7 @@ def test_legacy_script_entrypoints_refuse_nonisolated_python_before_imports(
 )
 def test_legacy_wrappers_launch_canonical_isolated_campaign_command(
     script_name: str,
+    tmp_path: Path,
     monkeypatch,
     capsys,
 ):
@@ -605,6 +806,10 @@ def test_legacy_wrappers_launch_canonical_isolated_campaign_command(
     arguments = [
         "--protocol",
         str(REPO_ROOT / "configs/protocols/pilot-v1.yaml"),
+        "--phase",
+        "pilot-v1",
+        "--artifact-root",
+        str(tmp_path / "artifacts"),
         "--device",
         "cpu",
     ]
@@ -633,7 +838,9 @@ def test_legacy_wrappers_launch_canonical_isolated_campaign_command(
     assert "execution-not-ready" in captured.err
 
 
-def test_task5_legacy_entrypoint_translates_versioned_campaign_id(capsys):
+def test_task5_legacy_entrypoint_translates_versioned_campaign_id(
+    tmp_path, capsys
+):
     path = REPO_ROOT / "scripts/run_eval_matrix.py"
     spec = importlib.util.spec_from_file_location("legacy_campaign_id", path)
     assert spec is not None and spec.loader is not None
@@ -642,13 +849,72 @@ def test_task5_legacy_entrypoint_translates_versioned_campaign_id(capsys):
     spec.loader.exec_module(module)
 
     return_code = module.main(
-        ["--campaign", "pilot-v1", "--device", "cpu"]
+        [
+            "--campaign",
+            "pilot-v1",
+            "--artifact-root",
+            str(tmp_path / "artifacts"),
+            "--device",
+            "cpu",
+        ]
     )
 
     captured = capsys.readouterr()
     assert return_code == 1
     assert "deprecated" in captured.err.lower()
     assert "execution-not-ready" in captured.err
+
+
+def test_legacy_campaign_selector_preserves_one_explicit_phase(
+    tmp_path, monkeypatch
+):
+    path = REPO_ROOT / "scripts/run_eval_matrix.py"
+    spec = importlib.util.spec_from_file_location(
+        "legacy_explicit_phase", path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    observed = {}
+
+    class Completed:
+        returncode = 1
+        stdout = ""
+        stderr = "campaign execution refused: execution-not-ready\n"
+
+    def capture(command, **kwargs):
+        observed["command"] = command
+        return Completed()
+
+    monkeypatch.setattr(module.main.__globals__["subprocess"], "run", capture)
+    artifact_root = tmp_path / "artifacts"
+
+    return_code = module.main(
+        [
+            "--campaign",
+            "primary-v1",
+            "--phase",
+            "primary-confirmatory-v1",
+            "--artifact-root",
+            str(artifact_root),
+            "--device",
+            "cpu",
+        ]
+    )
+
+    assert return_code == 1
+    forwarded = observed["command"][6:]
+    assert forwarded == [
+        "--protocol",
+        str(REPO_ROOT / "configs/protocols/primary-v1.yaml"),
+        "--phase",
+        "primary-confirmatory-v1",
+        "--artifact-root",
+        str(artifact_root),
+        "--device",
+        "cpu",
+    ]
 
 
 def _publish_controlled_pilot_dataset(

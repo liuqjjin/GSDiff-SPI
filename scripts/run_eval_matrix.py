@@ -51,10 +51,13 @@ def main(argv: list[str] | None = None) -> int:
         if re.fullmatch(r"[a-z0-9][a-z0-9_-]*-v[0-9]+", campaign_id) is None:
             print("deprecated wrapper requires a versioned --campaign", file=sys.stderr)
             return 2
-        arguments[index : index + 2] = [
+        replacement = [
             "--protocol",
             str(REPO_ROOT / "configs/protocols" / f"{campaign_id}.yaml"),
         ]
+        if "--phase" not in arguments:
+            replacement.extend(["--phase", campaign_id])
+        arguments[index : index + 2] = replacement
     if arguments.count("--protocol") != 1:
         print("deprecated wrapper requires --protocol", file=sys.stderr)
         return 2
@@ -68,6 +71,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     allowed = {
         "--protocol",
+        "--phase",
         "--artifact-root",
         "--device",
         "--checkpoint",

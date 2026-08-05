@@ -2197,3 +2197,67 @@ post-reclosure completion gate is still pending and is not claimed here.
 - `python -m compileall -q gsdiff scripts train.py`, Draft 2020-12 schema
   checks for all four repository schemas, `git diff --check`, and exact
   `configs/protocols` no-diff all completed with exit `0`.
+
+## Atomic runner checkpoint closure (2026-08-05)
+
+- Closed the original atomic-runner boundary without adding a second claim
+  protocol or native filesystem writer. The reviewed checkpoint is commit
+  `f6809fdfc27960caa06f96a9bd9b1c83562fe634` on
+  `debug/admm-vs-sgd`; it was pushed non-force and the local/remote divergence
+  was `0/0` after publication.
+- Fresh provenance tests completed at `174 passed, 1 skipped`; the uninterrupted
+  runner suite completed at `327 passed, 3 skipped`; the focused integration
+  gate completed at `1099 passed, 13 skipped`.
+- The full non-CUDA gate completed at
+  `2586 passed, 21 skipped, 2 deselected`. The real CUDA gate completed at
+  `2 passed, 2607 deselected`, with CUDA cases actually executed rather than
+  accepted as an all-skipped run.
+- `compileall`, schema validation, the isolated campaign CLI, strict runtime
+  lock verification, `pip check`, `git diff --check`, and exact
+  `configs/protocols` no-diff all passed. Independent review closed with
+  `SPEC=0`, `CODE=0`, and `SECURITY=0` within the declared ordinary-research
+  failure boundary.
+
+## Phase-aware aggregation core closure (2026-08-06)
+
+- Added fixed protocol-v1 phase plans, independently derived phase/statistics/
+  publication contracts, strict physical complete-record loading, deterministic
+  paired statistics, canonical versioned JSON, bounded read/write path roles,
+  phase aggregation and verification CLIs, and the fixed seven-phase
+  `results-lock-v1` structure.
+- Phase identities bind the resolved execution phase, acquisition and method
+  configuration IDs, dataset identity, source/environment/runtime evidence,
+  scientific contract, and method/checkpoint provenance. Wrong-phase,
+  incomplete, dirty, unblinded, mixed, nonfinite, duplicate, or structurally
+  self-consistent but scientifically mismatched evidence is rejected.
+- Atomic publications validate before writing, use a sibling temporary file,
+  flush and replace, then reload schema-valid canonical bytes and compare their
+  hash. Explicit and implicit read authorities, including the dedicated runtime
+  prefix, cannot overlap an output path.
+- RED evidence included phase separation and the 630-run confirmatory gate,
+  exact PhasePlan dataset coverage, wrong scientific-contract substitution,
+  public aggregate merge reconstruction, strict results-lock reads, and runtime
+  prefix output aliases. The final focused suite completed at
+  `213 passed, 1 skipped`; the skip is the documented Windows symlink privilege
+  case.
+- A monolithic non-CUDA invocation reached its 3,604-second tool limit without
+  a test failure. Exact collection-preserving partitioning was therefore used
+  for auditable closure. All 2,852 non-CUDA cases executed: `2830 passed` and
+  `22 skipped`. Every skip was an enumerated Windows filesystem or unsupported
+  audit-operation capability; no test was skipped because of the environment
+  lock. The runner's 329 non-CUDA nodes were covered exactly once in their
+  successful slices: `326 passed, 3 skipped`. Long runner duration was traced
+  to deliberate per-test process, recovery, and durability waits of up to
+  111 seconds rather than a hung process.
+- The real CUDA gate completed at `2 passed, 2852 deselected in 8.45s`, with
+  both CUDA cases actually executed. `compileall`, all four CLI help paths
+  (campaign help in required isolated mode), strict environment-lock
+  verification, `pip check`, `git diff --check`, and exact
+  `configs/protocols` no-diff all passed. The verified environment fingerprint
+  remains
+  `4a51ef8440bf725b369a9ce40534a8d2a19d7a994b636c7aa2125e83bb92dc1f`.
+- Independent final review found `SPEC=0`, `CODE=0`, `SECURITY=0`, and no
+  P0/P1/P2 findings. This closes Task 2's structure and fail-closed contracts,
+  not publication evidence: a real results lock remains intentionally
+  unreachable until Task 3 materializes validated authority for stress,
+  confirmatory, supplement, OOD, and failure phases.

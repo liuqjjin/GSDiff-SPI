@@ -1,0 +1,217 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "experiment-phase-aggregate-v1.schema.json",
+  "title": "GSDiff-SPI complete phase aggregate v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "status",
+    "phase_id",
+    "phase_sha256",
+    "metric_version",
+    "phase_evidence_contract_sha256",
+    "statistics_contract_sha256",
+    "records",
+    "summary"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "experiment-phase-aggregate-v1"
+    },
+    "status": {
+      "const": "complete"
+    },
+    "phase_id": {
+      "$ref": "#/$defs/id"
+    },
+    "phase_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "metric_version": {
+      "const": "metrics-v1"
+    },
+    "phase_evidence_contract_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "statistics_contract_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "records": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/record"
+      }
+    },
+    "summary": {
+      "$ref": "experiment-statistics-v1.schema.json"
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "logical_run_key": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "phase_id",
+        "acquisition_config_id",
+        "method_config_id",
+        "method_id",
+        "target_id",
+        "motion_id",
+        "seed"
+      ],
+      "properties": {
+        "phase_id": {
+          "$ref": "#/$defs/id"
+        },
+        "acquisition_config_id": {
+          "$ref": "#/$defs/id"
+        },
+        "method_config_id": {
+          "$ref": "#/$defs/id"
+        },
+        "method_id": {
+          "$ref": "#/$defs/id"
+        },
+        "target_id": {
+          "$ref": "#/$defs/id"
+        },
+        "motion_id": {
+          "$ref": "#/$defs/id"
+        },
+        "seed": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "checkpoints": {
+      "type": "object",
+      "propertyNames": {
+        "pattern": "^[a-z0-9][a-z0-9_-]*$"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/sha256"
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "psnr_global_affine",
+        "ssim_global_affine",
+        "nrmse_global_affine_l2",
+        "psnr_legacy_per_frame_minmax"
+      ],
+      "properties": {
+        "psnr_global_affine": {
+          "type": "number"
+        },
+        "ssim_global_affine": {
+          "type": "number"
+        },
+        "nrmse_global_affine_l2": {
+          "type": "number"
+        },
+        "psnr_legacy_per_frame_minmax": {
+          "type": "number"
+        }
+      }
+    },
+    "record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "scientific_contract_id",
+        "scientific_contract_sha256",
+        "method_config_sha256",
+        "checkpoints_sha256",
+        "dataset_identity_sha256",
+        "run_identity_sha256",
+        "manifest_sha256",
+        "metrics_sha256",
+        "metric_version",
+        "code_commit",
+        "dependencies_sha256",
+        "environment_lock_sha256",
+        "source_snapshot_sha256",
+        "source_projection_sha256",
+        "requested_runtime_device",
+        "execution_profile",
+        "metrics"
+      ],
+      "properties": {
+        "key": {
+          "$ref": "#/$defs/logical_run_key"
+        },
+        "scientific_contract_id": {
+          "$ref": "#/$defs/id"
+        },
+        "scientific_contract_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "method_config_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "checkpoints_sha256": {
+          "$ref": "#/$defs/checkpoints"
+        },
+        "dataset_identity_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "run_identity_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "manifest_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "metrics_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "metric_version": {
+          "const": "metrics-v1"
+        },
+        "code_commit": {
+          "$ref": "#/$defs/commit"
+        },
+        "dependencies_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "environment_lock_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "source_snapshot_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "source_projection_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "requested_runtime_device": {
+          "type": "string",
+          "pattern": "^(?:cpu|cuda:(?:0|[1-9][0-9]*))$"
+        },
+        "execution_profile": {
+          "$ref": "#/$defs/id"
+        },
+        "metrics": {
+          "$ref": "#/$defs/metrics"
+        }
+      }
+    }
+  }
+}

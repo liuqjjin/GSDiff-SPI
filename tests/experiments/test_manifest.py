@@ -1218,6 +1218,71 @@ def test_validate_aggregate_verifies_environment_and_reads_manifest_once(
     assert calls == {"environment": 1, "manifest_read": 1}
 
 
+def test_build_aggregate_rejects_extra_manifest_path_before_loading(
+    tmp_path: Path, monkeypatch
+):
+    identity = "1" * 64
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("aggregate attempted to load a manifest")
+
+    monkeypatch.setattr(manifest_module, "_load_complete_manifest_raw", forbidden)
+
+    with pytest.raises(ValueError, match="manifest path identities"):
+        build_aggregate_index(
+            campaign_id="primary-v1",
+            campaign_sha256="2" * 64,
+            protocol_sha256="3" * 64,
+            scientific_contract_id="gsdiff-sim-v1",
+            scientific_contract_sha256="4" * 64,
+            metric_version="metrics-v1",
+            expected_identity_sha256s=[identity],
+            manifest_paths={
+                identity: tmp_path / "runs" / identity / "manifest.json",
+                "5" * 64: tmp_path / "unexpected.json",
+            },
+            artifact_root=tmp_path,
+        )
+
+
+def test_validate_aggregate_rejects_extra_manifest_path_before_loading(
+    tmp_path: Path, monkeypatch
+):
+    identity = "1" * 64
+    index = {
+        "schema_version": "experiment-aggregate-v1",
+        "document_kind": "campaign-index",
+        "campaign_id": "primary-v1",
+        "campaign_sha256": "2" * 64,
+        "protocol_sha256": "3" * 64,
+        "scientific_contract_id": "gsdiff-sim-v1",
+        "scientific_contract_sha256": "4" * 64,
+        "metric_version": "metrics-v1",
+        "expected_identity_sha256s": [identity],
+        "run_manifests": [
+            {
+                "identity_sha256": identity,
+                "manifest_sha256": "6" * 64,
+            }
+        ],
+    }
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("aggregate attempted to load a manifest")
+
+    monkeypatch.setattr(manifest_module, "_load_complete_manifest_raw", forbidden)
+
+    with pytest.raises(ValueError, match="manifest path identities"):
+        validate_aggregate_index(
+            index,
+            manifest_paths={
+                identity: tmp_path / "runs" / identity / "manifest.json",
+                "5" * 64: tmp_path / "unexpected.json",
+            },
+            artifact_root=tmp_path,
+        )
+
+
 def test_build_aggregate_cross_checks_contract_during_physical_pass(
     tmp_path: Path,
 ):

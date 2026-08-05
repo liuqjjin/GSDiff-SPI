@@ -94,6 +94,21 @@ _SOURCE_ROOTS = (
 )
 
 _RUNTIME_DEVICE = re.compile(r"(?:cpu|cuda:(?:0|[1-9][0-9]*))\Z", re.ASCII)
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
+_PHASE_ID = re.compile(
+    r"[a-z0-9]+(?:-[a-z0-9]+)*-v[1-9][0-9]*\Z",
+    re.ASCII,
+)
+_UNPARTITIONED_CAMPAIGN_IDS = frozenset(
+    {"pilot-v1", "supplement-grid-v1", "ood-v1", "failure-v1"}
+)
+_PRIMARY_PHASE_IDS = frozenset(
+    {"primary-selection-v1", "primary-confirmatory-v1"}
+)
+_ABLATION_PHASE_IDS = frozenset(
+    {"selection-decision-v1", "selection-replay-v1", "selection-stress-v1"}
+)
+_DIRECT_EXECUTION_PHASE_IDS = frozenset({"pilot-v1", "ood-v1", "failure-v1"})
 
 
 def _canonical_runtime_device(value: str) -> str:
@@ -102,6 +117,33 @@ def _canonical_runtime_device(value: str) -> str:
             "device must be canonical cpu or cuda:N"
         )
     return value
+
+
+def _canonical_phase_id(value: str) -> str:
+    if _PHASE_ID.fullmatch(value) is None:
+        raise argparse.ArgumentTypeError("phase must be canonical ...-vN")
+    return value
+
+
+def _phase_identity_base_config(
+    *,
+    phase_id: str,
+    acquisition_config_id: str,
+    method_config_sha256: str,
+) -> dict[str, str]:
+    _canonical_phase_id(phase_id)
+    if type(acquisition_config_id) is not str or not acquisition_config_id:
+        raise ValueError("acquisition config ID must be a nonempty string")
+    if (
+        type(method_config_sha256) is not str
+        or _SHA256.fullmatch(method_config_sha256) is None
+    ):
+        raise ValueError("method config digest must be a lowercase SHA-256")
+    return {
+        "phase_id": phase_id,
+        "acquisition_config_id": acquisition_config_id,
+        "method_config_sha256": method_config_sha256,
+    }
 
 
 def _preflight_requested_device(requested_runtime_device: str) -> int | None:
@@ -143,7 +185,8 @@ def _runtime_manifest(
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="run_campaign.py")
     parser.add_argument("--protocol", type=Path, required=True)
-    parser.add_argument("--artifact-root", type=Path, default=Path("artifacts"))
+    parser.add_argument("--phase", type=_canonical_phase_id, required=True)
+    parser.add_argument("--artifact-root", type=Path, required=True)
     parser.add_argument("--device", type=_canonical_runtime_device, required=True)
     parser.add_argument("--checkpoint", action="append", default=[])
     parser.add_argument("--minimum-free-bytes", type=int, default=1_073_741_824)
@@ -154,8 +197,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         arguments = _parser().parse_args(argv)
         campaign = load_protocol(arguments.protocol)
-        if campaign.get("document_kind") != "campaign":
-            raise ValueError("protocol is not a campaign document")
+        _require_phase_protocol_match(arguments.phase, campaign)
         if campaign.get("execution_ready") is not True:
             print(
                 "campaign execution refused: execution-not-ready",
@@ -172,6 +214,34 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
 
+def _require_phase_protocol_match(
+    phase_id: str,
+    protocol: dict[str, object],
+) -> None:
+    document_kind = protocol.get("document_kind")
+    if document_kind == "campaign":
+        campaign_id = protocol.get("campaign_id")
+        if campaign_id in _UNPARTITIONED_CAMPAIGN_IDS:
+            allowed_phases = frozenset({campaign_id})
+        elif campaign_id == "primary-v1":
+            allowed_phases = _PRIMARY_PHASE_IDS
+        else:
+            raise ValueError("campaign ID is not phase-enabled")
+    elif document_kind == "ablation":
+        allowed_phases = _ABLATION_PHASE_IDS
+    else:
+        raise ValueError("protocol document kind is not phase-enabled")
+    if phase_id not in allowed_phases:
+        raise ValueError("phase does not match the protocol")
+
+
+def _require_materialized_phase_execution(phase_id: str) -> None:
+    if phase_id not in _DIRECT_EXECUTION_PHASE_IDS:
+        raise ValueError(
+            "phase execution refused: exact phase materialization is not implemented"
+        )
+
+
 def _require_versioned_budget_contract(campaign: dict[str, object]) -> None:
     del campaign
     raise ValueError(
@@ -183,6 +253,7 @@ def _run_ready_campaign(
     arguments: argparse.Namespace,
     campaign: dict[str, object],
 ) -> int:
+    _require_materialized_phase_execution(arguments.phase)
     if arguments.minimum_free_bytes < 0:
         raise ValueError("minimum free bytes must be nonnegative")
     _preflight_requested_device(arguments.device)
@@ -309,7 +380,11 @@ def _run_ready_campaign(
             canonical_json_bytes(materialization_logical)
         ).hexdigest()
         config_resolved = _identity_bound_config(
-            {"method_config_sha256": method.method_config_sha256},
+            _phase_identity_base_config(
+                phase_id=arguments.phase,
+                acquisition_config_id=cell.acquisition_config_id,
+                method_config_sha256=method.method_config_sha256,
+            ),
             requested_runtime_device=arguments.device,
             source_snapshot_sha256=source_snapshot.snapshot_sha256,
             source_projection_sha256=expected_source_snapshot_sha256,

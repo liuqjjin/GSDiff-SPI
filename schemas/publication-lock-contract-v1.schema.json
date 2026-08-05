@@ -1,0 +1,148 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "publication-lock-contract-v1.schema.json",
+  "title": "GSDiff-SPI publication lock membership contract v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "contract_id",
+    "required_phases",
+    "required_total_records"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "publication-lock-contract-v1"
+    },
+    "contract_id": {
+      "const": "gsdiff-publication-results-v1"
+    },
+    "required_phases": {
+      "type": "array",
+      "minItems": 7,
+      "maxItems": 7,
+      "prefixItems": [
+        {
+          "$ref": "#/$defs/selection_replay"
+        },
+        {
+          "$ref": "#/$defs/selection_stress"
+        },
+        {
+          "$ref": "#/$defs/primary_selection"
+        },
+        {
+          "$ref": "#/$defs/primary_confirmatory"
+        },
+        {
+          "$ref": "#/$defs/supplement_grid"
+        },
+        {
+          "$ref": "#/$defs/ood"
+        },
+        {
+          "$ref": "#/$defs/failure"
+        }
+      ],
+      "items": false
+    },
+    "required_total_records": {
+      "const": 1437
+    }
+  },
+  "$defs": {
+    "selection_replay": {
+      "$ref": "#/$defs/phase_row",
+      "properties": {
+        "phase_id": {
+          "const": "selection-replay-v1"
+        },
+        "expected_record_count": {
+          "const": 207
+        }
+      }
+    },
+    "selection_stress": {
+      "$ref": "#/$defs/phase_row",
+      "properties": {
+        "phase_id": {
+          "const": "selection-stress-v1"
+        },
+        "expected_record_count": {
+          "const": 126
+        }
+      }
+    },
+    "primary_selection": {
+      "$ref": "#/$defs/phase_row",
+      "properties": {
+        "phase_id": {
+          "const": "primary-selection-v1"
+        },
+        "expected_record_count": {
+          "const": 297
+        }
+      }
+    },
+    "primary_confirmatory": {
+      "$ref": "#/$defs/phase_row",
+      "properties": {
+        "phase_id": {
+          "const": "primary-confirmatory-v1"
+        },
+        "expected_record_count": {
+          "const": 198
+        }
+      }
+    },
+    "supplement_grid": {
+      "$ref": "#/$defs/phase_row",
+      "properties": {
+        "phase_id": {
+          "const": "supplement-grid-v1"
+        },
+        "expected_record_count": {
+          "const": 231
+        }
+      }
+    },
+    "ood": {
+      "$ref": "#/$defs/phase_row",
+      "properties": {
+        "phase_id": {
+          "const": "ood-v1"
+        },
+        "expected_record_count": {
+          "const": 198
+        }
+      }
+    },
+    "failure": {
+      "$ref": "#/$defs/phase_row",
+      "properties": {
+        "phase_id": {
+          "const": "failure-v1"
+        },
+        "expected_record_count": {
+          "const": 180
+        }
+      }
+    },
+    "phase_row": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "phase_id",
+        "expected_record_count"
+      ],
+      "properties": {
+        "phase_id": {
+          "type": "string"
+        },
+        "expected_record_count": {
+          "type": "integer"
+        }
+      }
+    }
+  }
+}

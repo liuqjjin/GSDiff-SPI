@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "experiment-partial-report-v1.schema.json",
+  "title": "GSDiff-SPI incomplete phase report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "status",
+    "phase_id",
+    "expected_count",
+    "available_complete",
+    "missing"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "experiment-partial-report-v1"
+    },
+    "status": {
+      "const": "partial"
+    },
+    "phase_id": {
+      "$ref": "#/$defs/id"
+    },
+    "expected_count": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "available_complete": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "missing": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/logical_run_key"
+      }
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "logical_run_key": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "phase_id",
+        "acquisition_config_id",
+        "method_config_id",
+        "method_id",
+        "target_id",
+        "motion_id",
+        "seed"
+      ],
+      "properties": {
+        "phase_id": {
+          "$ref": "#/$defs/id"
+        },
+        "acquisition_config_id": {
+          "$ref": "#/$defs/id"
+        },
+        "method_config_id": {
+          "$ref": "#/$defs/id"
+        },
+        "method_id": {
+          "$ref": "#/$defs/id"
+        },
+        "target_id": {
+          "$ref": "#/$defs/id"
+        },
+        "motion_id": {
+          "$ref": "#/$defs/id"
+        },
+        "seed": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    }
+  }
+}
