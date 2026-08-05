@@ -26,7 +26,7 @@ _STAGING_UUID = re.compile(
     flags=re.IGNORECASE,
 )
 METHODS_REGISTRY_PROTOCOL_SHA256 = (
-    "ef3d613267360538f4ac0e6301f6a854b8d0487eecde5ed98cf51ee6a8a0275c"
+    "c2dbf832389948b6a43174bbcd37874116a26794b233715067597b67f7a962bf"
 )
 
 
@@ -102,6 +102,62 @@ def canonical_method_id(method_id: str) -> str:
     if canonical not in CANONICAL_METHOD_IDS:
         raise ValueError(f"unknown method: {method_id!r}")
     return canonical
+
+
+def native_iteration_contract_v1(method: ResolvedMethod) -> dict[str, object]:
+    """Derive one method's native iteration unit and exact positive budget."""
+    if type(method) is not ResolvedMethod:
+        raise TypeError("method must be a ResolvedMethod")
+    semantics = method.semantic_config
+    solver = semantics.get("solver")
+    if method.method_id == "dgi":
+        unit = semantics.get("native_unit")
+        budget = _positive_exact_int(
+            semantics.get("native_budget"),
+            field="semantic_config.native_budget",
+        )
+        if type(unit) is not str or not unit:
+            raise ValueError("semantic_config.native_unit must be a nonempty string")
+        return {"unit": unit, "budget": budget}
+    if not isinstance(solver, Mapping):
+        raise ValueError("method solver semantics are missing")
+    if method.method_id in {"static_cs", "perframe_cs", "monin"}:
+        unit = "admm-iteration"
+        budget = _positive_exact_int(
+            solver.get("n_admm"), field="semantic_config.solver.n_admm"
+        )
+    elif method.method_id == "tv3d":
+        unit = "primal-dual-iteration"
+        budget = _positive_exact_int(
+            solver.get("iterations"), field="semantic_config.solver.iterations"
+        )
+    elif method.method_id == "gidc3dtv":
+        unit = "adam-step"
+        budget = _positive_exact_int(
+            solver.get("n_steps"), field="semantic_config.solver.n_steps"
+        )
+    elif method.method_id == "recinr":
+        unit = "optimization-step"
+        budget = sum(
+            _positive_exact_int(
+                solver.get(name), field=f"semantic_config.solver.{name}"
+            )
+            for name in ("warm_steps", "flow_steps", "joint_steps")
+        )
+    elif method.method_id in {"siren", "recinr_se2"}:
+        unit = "sgd-step"
+        budget = _positive_exact_int(
+            solver.get("sgd_steps"), field="semantic_config.solver.sgd_steps"
+        )
+    elif method.method_id in {"gsdiff_tv", "gsdiff_diffusion"}:
+        unit = "outer-iteration"
+        budget = _positive_exact_int(
+            solver.get("outer_iterations"),
+            field="semantic_config.solver.outer_iterations",
+        )
+    else:
+        raise ValueError("unknown native method iteration binding")
+    return {"unit": unit, "budget": budget}
 
 
 def resolve_method_semantics(
@@ -313,6 +369,12 @@ def _checkpoint_requirements(value: object) -> tuple[CheckpointRequirement, ...]
 def _require_sha256(name: str, value: object) -> str:
     if type(value) is not str or _SHA256.fullmatch(value) is None:
         raise ValueError(f"{name} must be 64 lowercase hexadecimal characters")
+    return value
+
+
+def _positive_exact_int(value: object, *, field: str) -> int:
+    if type(value) is not int or value <= 0:
+        raise ValueError(f"{field} must be an exact positive integer")
     return value
 
 

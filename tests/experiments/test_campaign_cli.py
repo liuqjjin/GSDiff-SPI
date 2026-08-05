@@ -2,6 +2,7 @@ import importlib.util
 import hashlib
 import json
 import os
+import copy
 from pathlib import Path
 import shlex
 import shutil
@@ -708,6 +709,186 @@ def test_ready_campaign_without_versioned_budget_contract_fails_before_artifacts
     assert captured.out == ""
     assert captured.err == "campaign execution refused: ValueError\n"
     assert not artifact_root.exists()
+
+
+def _ready_protocol_with_budgets(name: str, budgets: dict[str, int]):
+    document = yaml.safe_load(
+        (REPO_ROOT / "configs" / "protocols" / name).read_text(
+            encoding="utf-8"
+        )
+    )
+    ready = copy.deepcopy(document)
+    ready["execution_ready"] = True
+    ready["method_budgets"] = dict(budgets)
+    return ready
+
+
+PILOT_NATIVE_BUDGETS = {
+    "dgi": 1,
+    "static_cs": 1,
+    "perframe_cs": 1,
+    "tv3d": 1,
+    "monin": 1,
+    "gidc3dtv": 1,
+    "recinr": 3,
+    "siren": 1,
+    "recinr_se2": 1,
+    "gsdiff_tv": 1,
+    "gsdiff_diffusion": 1,
+}
+
+
+PUBLICATION_NATIVE_BUDGETS = {
+    "dgi": 1,
+    "static_cs": 150,
+    "perframe_cs": 120,
+    "tv3d": 500,
+    "monin": 150,
+    "gidc3dtv": 2500,
+    "recinr": 1900,
+    "siren": 4000,
+    "recinr_se2": 3000,
+    "gsdiff_tv": 80,
+    "gsdiff_diffusion": 80,
+}
+
+
+@pytest.mark.parametrize(
+    ("protocol_name", "budgets"),
+    [
+        ("pilot-v1.yaml", PILOT_NATIVE_BUDGETS),
+        ("primary-v1.yaml", PUBLICATION_NATIVE_BUDGETS),
+    ],
+)
+def test_versioned_budget_contract_matches_resolved_native_semantics(
+    protocol_name,
+    budgets,
+):
+    cli = _load_run_campaign_cli()
+    campaign = _ready_protocol_with_budgets(protocol_name, budgets)
+
+    assert cli._require_versioned_budget_contract(campaign) is None
+
+
+@pytest.mark.parametrize("mutation", ["missing", "extra", "changed"])
+def test_versioned_budget_contract_rejects_nonexact_budget_maps(mutation):
+    cli = _load_run_campaign_cli()
+    budgets = dict(PILOT_NATIVE_BUDGETS)
+    if mutation == "missing":
+        budgets.pop("dgi")
+    elif mutation == "extra":
+        budgets["undeclared"] = 1
+    else:
+        budgets["recinr"] = 1
+    campaign = _ready_protocol_with_budgets("pilot-v1.yaml", budgets)
+
+    with pytest.raises((TypeError, ValueError), match="budget|method"):
+        cli._require_versioned_budget_contract(campaign)
+
+
+def test_cpu_smoke_profile_rejects_cuda_before_ready_campaign_execution(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    cli = _load_run_campaign_cli()
+    campaign = _ready_protocol_with_budgets(
+        "pilot-v1.yaml",
+        PILOT_NATIVE_BUDGETS,
+    )
+    artifact_root = tmp_path / "must-not-be-created"
+    monkeypatch.setattr(cli, "load_protocol", lambda path: campaign)
+    monkeypatch.setattr(
+        cli,
+        "_require_versioned_budget_contract",
+        lambda protocol: None,
+    )
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("CUDA smoke reached ready campaign execution")
+
+    monkeypatch.setattr(cli, "_run_ready_campaign", forbidden)
+
+    result = cli.main(
+        [
+            "--protocol",
+            str(tmp_path / "pilot-v1.yaml"),
+            "--phase",
+            "pilot-v1",
+            "--artifact-root",
+            str(artifact_root),
+            "--device",
+            "cuda:0",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert captured.out == ""
+    assert captured.err == "campaign execution refused: ValueError\n"
+    assert not artifact_root.exists()
+
+
+def _resolved_dgi_profile(profile: str):
+    return resolve_method_semantics(
+        "dgi",
+        method_config_id="default",
+        base_config={},
+        measurements_metadata={
+            "H": 32,
+            "W": 32,
+            "T": 4,
+            "K": 128,
+            "holdout_K": 16,
+        },
+        execution_profile=profile,
+    )
+
+
+def test_campaign_method_policy_accepts_only_exact_cpu_pilot_smoke():
+    cli = _load_run_campaign_cli()
+    smoke = _resolved_dgi_profile("pilot-smoke-v1")
+    campaign = {
+        "campaign_id": "pilot-v1",
+        "execution_profile": "pilot-smoke-v1",
+    }
+
+    assert cli._require_campaign_method_policy(
+        smoke,
+        phase_id="pilot-v1",
+        campaign=campaign,
+        requested_runtime_device="cpu",
+    ) is None
+
+    for changed in (
+        {"phase_id": "ood-v1"},
+        {"campaign": {**campaign, "campaign_id": "ood-v1"}},
+        {"campaign": {**campaign, "execution_profile": "ood-full-v1"}},
+        {"requested_runtime_device": "cuda:0"},
+    ):
+        arguments = {
+            "phase_id": "pilot-v1",
+            "campaign": campaign,
+            "requested_runtime_device": "cpu",
+        }
+        arguments.update(changed)
+        with pytest.raises(ValueError, match="promotable"):
+            cli._require_campaign_method_policy(smoke, **arguments)
+
+
+def test_campaign_method_policy_keeps_publication_method_promotable():
+    cli = _load_run_campaign_cli()
+    publication = _resolved_dgi_profile("publication-v1")
+
+    assert cli._require_campaign_method_policy(
+        publication,
+        phase_id="ood-v1",
+        campaign={
+            "campaign_id": "ood-v1",
+            "execution_profile": "ood-full-v1",
+        },
+        requested_runtime_device="cuda:0",
+    ) is None
 
 
 @pytest.mark.parametrize(

@@ -11,6 +11,7 @@ from gsdiff.experiments.methods import (
     CANONICAL_METHOD_IDS,
     canonical_method_id,
     derive_algorithm_seed,
+    native_iteration_contract_v1,
     resolve_method_semantics,
 )
 from gsdiff.experiments.identity import canonical_json_bytes
@@ -74,7 +75,7 @@ def test_method_resolution_request_snapshots_raw_resolver_inputs() -> None:
 
 def test_methods_registry_protocol_anchor_is_locked() -> None:
     assert methods_module.METHODS_REGISTRY_PROTOCOL_SHA256 == (
-        "ef3d613267360538f4ac0e6301f6a854b8d0487eecde5ed98cf51ee6a8a0275c"
+        "c2dbf832389948b6a43174bbcd37874116a26794b233715067597b67f7a962bf"
     )
 
 
@@ -89,6 +90,74 @@ def resolve_publication(method_id: str, *, base_config: dict[str, object]):
 def test_registry_contains_exactly_eleven_canonical_ids() -> None:
     assert CANONICAL_METHOD_IDS == METHODS
     assert len(CANONICAL_METHOD_IDS) == len(set(CANONICAL_METHOD_IDS))
+
+
+@pytest.mark.parametrize(
+    ("profile", "config_id", "expected_budgets"),
+    [
+        (
+            "publication-v1",
+            "default",
+            (1, 150, 120, 500, 150, 2500, 1900, 4000, 3000, 80, 80),
+        ),
+        (
+            "controller-cpu-smoke-v1",
+            "smoke-default-v1",
+            (1, 1, 1, 1, 1, 1, 3, 1, 1, 1, 1),
+        ),
+    ],
+)
+def test_native_iteration_contract_derives_every_method_budget(
+    profile: str,
+    config_id: str,
+    expected_budgets: tuple[int, ...],
+) -> None:
+    expected_units = (
+        "pass",
+        "admm-iteration",
+        "admm-iteration",
+        "primal-dual-iteration",
+        "admm-iteration",
+        "adam-step",
+        "optimization-step",
+        "sgd-step",
+        "sgd-step",
+        "outer-iteration",
+        "outer-iteration",
+    )
+
+    for method_id, expected_unit, expected_budget in zip(
+        METHODS,
+        expected_units,
+        expected_budgets,
+        strict=True,
+    ):
+        base_config = (
+            {"gaussian_count": 1000}
+            if method_id in {"gsdiff_tv", "gsdiff_diffusion"}
+            else {}
+        )
+        method = resolve_method_semantics(
+            method_id,
+            method_config_id=config_id,
+            base_config=base_config,
+            measurements_metadata=_measurements_metadata(),
+            execution_profile=profile,
+            registry_path=REGISTRY,
+        )
+
+        assert native_iteration_contract_v1(method) == {
+            "unit": expected_unit,
+            "budget": expected_budget,
+        }
+
+
+def test_native_iteration_contract_returns_a_fresh_mapping() -> None:
+    method = resolve_publication("dgi", base_config={})
+    first = native_iteration_contract_v1(method)
+    first["budget"] = 99
+
+    assert native_iteration_contract_v1(method) == {"unit": "pass", "budget": 1}
 
 
 def test_alias_is_input_only() -> None:

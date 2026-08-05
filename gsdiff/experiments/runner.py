@@ -797,6 +797,26 @@ def _process_vram_from_counter_records(
     return total if matched else None
 
 
+def _is_exact_cpu_pilot_smoke(
+    method: ResolvedMethod,
+    plan: RunExecutionPlan,
+) -> bool:
+    resolution = plan.resolution_request
+    return (
+        resolution.requested_method_config_id == "default"
+        and method.requested_method_config_id == "default"
+        and method.method_config_id == "smoke-default-v1"
+        and resolution.requested_execution_profile == "pilot-smoke-v1"
+        and method.execution_profile == "controller-cpu-smoke-v1"
+        and plan.config_resolved.get("phase_id") == "pilot-v1"
+        and plan.requested_runtime_device == "cpu"
+        and method.publication_eligible is False
+        and method.selection_eligible is False
+        and method.promotion_eligible is False
+        and method.convergence_status == "smoke-only/not-convergence-assessed"
+    )
+
+
 def _validate_authoritative_request(
     request: RunRequest,
     plan: RunExecutionPlan,
@@ -827,18 +847,22 @@ def _validate_authoritative_request(
     )
     if canonical_method != request.method:
         raise ValueError("request method does not match authoritative resolution")
+    exact_cpu_pilot_smoke = _is_exact_cpu_pilot_smoke(canonical_method, plan)
     if not (
         request.cell.method_config_id
         == plan.resolution_request.requested_method_config_id
         == canonical_method.requested_method_config_id
-        == canonical_method.method_config_id
+    ) or (
+        canonical_method.method_config_id
+        != canonical_method.requested_method_config_id
+        and not exact_cpu_pilot_smoke
     ):
         raise ValueError(
             "experiment cell method_config_id disagrees with method resolution"
         )
     if not canonical_method.execution_ready or canonical_method.execution_blockers:
         raise ValueError("method execution is not ready")
-    if not canonical_method.promotion_eligible:
+    if not canonical_method.promotion_eligible and not exact_cpu_pilot_smoke:
         raise ValueError("method is not promotion eligible")
     compute_cap = _compute_cap(canonical_method)
     runner_config = plan.config_resolved.get("runner_execution")

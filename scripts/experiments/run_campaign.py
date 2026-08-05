@@ -13,6 +13,7 @@ if __name__ == "__main__" and not sys.flags.isolated:
 sys.dont_write_bytecode = True
 
 import argparse
+from collections.abc import Mapping
 import hashlib
 import os
 from pathlib import Path
@@ -53,6 +54,7 @@ from gsdiff.experiments.identity import (
 from gsdiff.experiments.methods import (
     MethodResolutionRequest,
     derive_algorithm_seed,
+    native_iteration_contract_v1,
     resolve_method_semantics,
 )
 from gsdiff.experiments.execution import _materialization_identity_documents
@@ -205,6 +207,11 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 1
         _require_versioned_budget_contract(campaign)
+        _require_execution_device_contract(
+            arguments.phase,
+            campaign,
+            arguments.device,
+        )
         return _run_ready_campaign(arguments, campaign)
     except (OSError, TypeError, ValueError) as error:
         print(
@@ -243,10 +250,125 @@ def _require_materialized_phase_execution(phase_id: str) -> None:
 
 
 def _require_versioned_budget_contract(campaign: dict[str, object]) -> None:
-    del campaign
-    raise ValueError(
-        "ready campaign lacks an approved versioned native-budget contract"
+    if campaign.get("document_kind") != "campaign":
+        raise ValueError(
+            "native-budget resolution for this protocol kind is not implemented"
+        )
+    matrix = campaign.get("matrix")
+    acquisition_configs = campaign.get("acquisition_configs")
+    budgets = campaign.get("method_budgets")
+    if not isinstance(matrix, Mapping):
+        raise ValueError("campaign matrix must be a mapping")
+    if not isinstance(acquisition_configs, Mapping) or not acquisition_configs:
+        raise ValueError("campaign acquisition configs must be a nonempty mapping")
+    methods = matrix.get("methods")
+    method_config_ids = matrix.get("method_config_ids")
+    if not isinstance(methods, list) or not all(type(item) is str for item in methods):
+        raise TypeError("campaign methods must be an exact string list")
+    if len(methods) != len(set(methods)):
+        raise ValueError("campaign methods must be unique")
+    if not isinstance(method_config_ids, Mapping) or set(method_config_ids) != set(methods):
+        raise ValueError("campaign method config IDs must match methods")
+    if not isinstance(budgets, Mapping) or set(budgets) != set(methods):
+        raise ValueError("campaign method budgets must match methods exactly")
+
+    registry_path = REPO_ROOT / "configs" / "protocols" / "methods-v1.yaml"
+    registry = load_protocol(registry_path)
+    execution_profile = campaign.get("execution_profile")
+    if type(execution_profile) is not str:
+        raise TypeError("campaign execution profile must be a string")
+    for method_id in methods:
+        declared_budget = budgets[method_id]
+        if type(declared_budget) is not int or declared_budget <= 0:
+            raise TypeError("campaign method budget must be an exact positive integer")
+        resolved_budgets: set[int] = set()
+        for acquisition in acquisition_configs.values():
+            metadata = _budget_measurements_metadata(acquisition)
+            base_config = _declared_base_config(
+                registry,
+                method_id=method_id,
+                execution_profile=execution_profile,
+            )
+            resolved = resolve_method_semantics(
+                method_id,
+                method_config_id=method_config_ids[method_id],
+                base_config=base_config,
+                measurements_metadata=metadata,
+                execution_profile=execution_profile,
+                registry_path=registry_path,
+            )
+            native = native_iteration_contract_v1(resolved)
+            resolved_budgets.add(native["budget"])
+        if resolved_budgets != {declared_budget}:
+            raise ValueError(
+                f"method budget disagrees with resolved native semantics: {method_id}"
+            )
+
+
+def _budget_measurements_metadata(acquisition: object) -> dict[str, int]:
+    if not isinstance(acquisition, Mapping):
+        raise TypeError("acquisition config must be a mapping")
+    image_size = acquisition.get("image_size")
+    if (
+        not isinstance(image_size, list)
+        or len(image_size) != 2
+        or any(type(value) is not int or value <= 0 for value in image_size)
+    ):
+        raise ValueError("acquisition image size must contain two positive integers")
+    fields = {
+        "T": acquisition.get("num_frames"),
+        "K": acquisition.get("train_measurements"),
+        "holdout_K": acquisition.get("holdout_measurements"),
+    }
+    if any(type(value) is not int or value <= 0 for value in fields.values()):
+        raise ValueError("acquisition dimensions must be positive integers")
+    return {
+        "H": image_size[0],
+        "W": image_size[1],
+        "T": fields["T"],
+        "K": fields["K"],
+        "holdout_K": fields["holdout_K"],
+    }
+
+
+def _require_execution_device_contract(
+    phase_id: str,
+    campaign: dict[str, object],
+    requested_runtime_device: str,
+) -> None:
+    """Keep the controller smoke profile on its declared CPU-only lane."""
+    if phase_id != "pilot-v1":
+        return
+    if campaign.get("execution_profile") != "pilot-smoke-v1":
+        raise ValueError("pilot phase requires the locked smoke profile")
+    if requested_runtime_device != "cpu":
+        raise ValueError("pilot smoke execution is CPU-only")
+
+
+def _require_campaign_method_policy(
+    method,
+    *,
+    phase_id: str,
+    campaign: Mapping[str, object],
+    requested_runtime_device: str,
+) -> None:
+    if method.promotion_eligible:
+        return
+    exact_cpu_pilot_smoke = (
+        phase_id == "pilot-v1"
+        and campaign.get("campaign_id") == "pilot-v1"
+        and campaign.get("execution_profile") == "pilot-smoke-v1"
+        and requested_runtime_device == "cpu"
+        and method.requested_method_config_id == "default"
+        and method.method_config_id == "smoke-default-v1"
+        and method.execution_profile == "controller-cpu-smoke-v1"
+        and method.publication_eligible is False
+        and method.selection_eligible is False
+        and method.promotion_eligible is False
+        and method.convergence_status == "smoke-only/not-convergence-assessed"
     )
+    if not exact_cpu_pilot_smoke:
+        raise ValueError("campaign contains a non-promotable method")
 
 
 def _run_ready_campaign(
@@ -342,8 +464,12 @@ def _run_ready_campaign(
         )
         if not method.execution_ready or method.execution_blockers:
             raise ValueError("campaign contains an unresolved method")
-        if not method.promotion_eligible:
-            raise ValueError("campaign contains a non-promotable method")
+        _require_campaign_method_policy(
+            method,
+            phase_id=arguments.phase,
+            campaign=campaign,
+            requested_runtime_device=arguments.device,
+        )
         checkpoint_store: dict[str, Path] = {}
         checkpoint_hashes: dict[str, str] = {}
         for requirement in method.checkpoint_requirements:

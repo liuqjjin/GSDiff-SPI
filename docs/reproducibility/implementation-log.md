@@ -2261,3 +2261,42 @@ post-reclosure completion gate is still pending and is not claimed here.
   not publication evidence: a real results lock remains intentionally
   unreachable until Task 3 materializes validated authority for stress,
   confirmatory, supplement, OOD, and failure phases.
+
+## Task 3 readiness re-audit and pilot contract (2026-08-05)
+
+- A fresh three-way read-only audit found that Task 3 was not a readiness-flag
+  change. The pilot was blocked by an unconditional budget placeholder, its
+  intentional method-config alias, the publication promotion guard, and
+  missing smoke compute caps. The 207-cell ablation plan also lacks complete
+  executable semantics for its 23 candidates; those scientific inputs remain
+  fail-closed.
+- The local diffusion-prior v1 bytes match the declared registry hash, but its
+  historical training commit, environment, dataset binding, and loss history
+  cannot be proven. Its legacy generator also includes the exact `tank` and
+  `usaf` evaluation targets. V1 remains historical and blocked; no provenance
+  was invented or backfilled.
+- The recovery order and stop gates are frozen in
+  `docs/superpowers/plans/2026-08-05-task3-readiness-recovery.md`.
+- Added one shared native-iteration contract derived from resolved method
+  semantics. It is now the authority for method-child evidence and campaign
+  budget validation. The exact publication budgets are
+  `1,150,120,500,150,2500,1900,4000,3000,80,80`; the corresponding smoke
+  budgets are `1,1,1,1,1,1,3,1,1,1,1` in canonical method order.
+- Added the already frozen 1,800-second and 15,032,385,536-byte safety cap to
+  all eleven smoke semantic profiles. The methods-registry protocol hash is
+  now `c2dbf832389948b6a43174bbcd37874116a26794b233715067597b67f7a962bf`.
+- The runner and campaign controller narrowly accept nonpromotion only for
+  `pilot-v1`, requested profile `pilot-smoke-v1`, requested config `default`,
+  authoritative normalization to
+  `controller-cpu-smoke-v1/smoke-default-v1`, and device `cpu`. Every nearby
+  profile, config, phase, device, or eligibility mutation remains rejected.
+  Checkpoint-provenance enforcement was not relaxed.
+- RED evidence covered the missing native-budget API, missing compute cap,
+  unconditional campaign-budget refusal, CUDA smoke acceptance, and rejection
+  of the declared pilot alias. GREEN evidence includes 8 campaign-contract
+  tests, 12 runner policy tests, and a focused regression of
+  `439 passed, 1 skipped`; the skip is the documented Windows symlink
+  privilege case.
+- The pilot remains `execution_ready: false` with null budgets until a
+  target-disjoint, independently verified diffusion-prior v2 exists. No
+  experiment or training run was started in this package.

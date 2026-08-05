@@ -909,6 +909,36 @@ def _request(identity=None, execution_plan=None) -> RunRequest:
     )
 
 
+def _pilot_smoke_policy_fixture():
+    resolution_request = MethodResolutionRequest(
+        requested_method_id="dgi",
+        requested_method_config_id="default",
+        base_config={},
+        measurements_metadata={},
+        requested_execution_profile="pilot-smoke-v1",
+    )
+    method = resolve_method_semantics(
+        "dgi",
+        method_config_id="default",
+        base_config={},
+        measurements_metadata={},
+        execution_profile="pilot-smoke-v1",
+        registry_path=ROOT / "configs/protocols/methods-v1.yaml",
+    )
+    plan = replace(
+        _plan(),
+        resolution_request=resolution_request,
+        requested_runtime_device="cpu",
+        config_resolved={
+            "phase_id": "pilot-v1",
+            "runner_execution": {
+                "python_executable_sha256": _PYTHON_EXECUTABLE_SHA256,
+            },
+        },
+    )
+    return method, plan
+
+
 def _load_dataset_builder():
     path = ROOT / "scripts/experiments/build_datasets.py"
     spec = importlib.util.spec_from_file_location("runner_dataset_builder", path)
@@ -1059,6 +1089,110 @@ def test_runner_public_api_keeps_two_argument_execution_with_explicit_evidence()
         "request",
         "artifact_root",
     ]
+
+
+def test_nonpromotable_pilot_smoke_policy_accepts_only_the_declared_alias():
+    method, plan = _pilot_smoke_policy_fixture()
+
+    assert runner_module._is_exact_cpu_pilot_smoke(method, plan) is True
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "direct-normalized-config",
+        "direct-normalized-profile",
+        "normalized-config",
+        "normalized-profile",
+        "phase",
+        "cuda",
+        "publication-eligible",
+        "selection-eligible",
+        "promotion-eligible",
+        "convergence",
+    ],
+)
+def test_nonpromotable_pilot_smoke_policy_rejects_near_misses(
+    mutation: str,
+):
+    method, plan = _pilot_smoke_policy_fixture()
+    if mutation == "direct-normalized-config":
+        resolution = replace(
+            plan.resolution_request,
+            requested_method_config_id="smoke-default-v1",
+        )
+        method = resolve_method_semantics(
+            "dgi",
+            method_config_id="smoke-default-v1",
+            base_config={},
+            measurements_metadata={},
+            execution_profile="pilot-smoke-v1",
+            registry_path=ROOT / "configs/protocols/methods-v1.yaml",
+        )
+        plan = replace(plan, resolution_request=resolution)
+    elif mutation == "direct-normalized-profile":
+        resolution = replace(
+            plan.resolution_request,
+            requested_method_config_id="smoke-default-v1",
+            requested_execution_profile="controller-cpu-smoke-v1",
+        )
+        method = resolve_method_semantics(
+            "dgi",
+            method_config_id="smoke-default-v1",
+            base_config={},
+            measurements_metadata={},
+            execution_profile="controller-cpu-smoke-v1",
+            registry_path=ROOT / "configs/protocols/methods-v1.yaml",
+        )
+        plan = replace(plan, resolution_request=resolution)
+    elif mutation == "normalized-config":
+        method = replace(method, method_config_id="default")
+    elif mutation == "normalized-profile":
+        method = replace(method, execution_profile="publication-v1")
+    elif mutation == "phase":
+        plan = replace(
+            plan,
+            config_resolved={
+                **plan.config_resolved,
+                "phase_id": "primary-selection-v1",
+            },
+        )
+    elif mutation == "cuda":
+        plan = replace(plan, requested_runtime_device="cuda:0")
+    elif mutation == "publication-eligible":
+        method = replace(method, publication_eligible=True)
+    elif mutation == "selection-eligible":
+        method = replace(method, selection_eligible=True)
+    elif mutation == "promotion-eligible":
+        method = replace(method, promotion_eligible=True)
+    else:
+        assert mutation == "convergence"
+        method = replace(method, convergence_status="convergence-required")
+    assert runner_module._is_exact_cpu_pilot_smoke(method, plan) is False
+
+
+def test_authoritative_request_allows_exact_pilot_alias_to_reach_compute_cap(
+    monkeypatch,
+):
+    method, plan = _pilot_smoke_policy_fixture()
+    request = _request(execution_plan=plan)
+    request = replace(
+        request,
+        cell=replace(
+            request.cell,
+            campaign_id="pilot-v1",
+            method_config_id="default",
+        ),
+        method=method,
+    )
+
+    def reached_compute_cap(_method):
+        raise RuntimeError("reached authoritative compute cap")
+
+    monkeypatch.setattr(runner_module, "_compute_cap", reached_compute_cap)
+
+    with pytest.raises(RuntimeError, match="reached authoritative compute cap"):
+        _validate_authoritative_request(request, plan)
 
 
 def test_authoritative_request_rejects_campaign_execution_profile_mismatch(

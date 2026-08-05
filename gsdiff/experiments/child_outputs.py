@@ -44,7 +44,12 @@ from gsdiff.data._artifact_dataset import (
     _validate_blind_acquisition_spec,
 )
 
-from .methods import AlgorithmSeed, ResolvedMethod, thaw_json
+from .methods import (
+    AlgorithmSeed,
+    ResolvedMethod,
+    native_iteration_contract_v1,
+    thaw_json,
+)
 from .parameter_counts import (
     _expected_trainable_parameter_count_for_dimensions,
     expected_trainable_parameter_count,
@@ -273,44 +278,6 @@ def _validate_acquisition_contract(
         validate_array_descriptor(
             name, array, acquisition.array_descriptors[name]
         )
-
-
-def _native_iteration(method: ResolvedMethod) -> dict[str, object]:
-    semantics = method.semantic_config
-    solver = semantics.get("solver")
-    if method.method_id == "dgi":
-        return {
-            "unit": semantics["native_unit"],
-            "budget": semantics["native_budget"],
-        }
-    if not isinstance(solver, Mapping):
-        raise ArtifactValidationError("method solver semantics are missing")
-    if method.method_id in {"static_cs", "perframe_cs", "monin"}:
-        return {"unit": "admm-iteration", "budget": solver["n_admm"]}
-    if method.method_id == "tv3d":
-        return {
-            "unit": "primal-dual-iteration",
-            "budget": solver["iterations"],
-        }
-    if method.method_id == "gidc3dtv":
-        return {"unit": "adam-step", "budget": solver["n_steps"]}
-    if method.method_id == "recinr":
-        return {
-            "unit": "optimization-step",
-            "budget": (
-                solver["warm_steps"]
-                + solver["flow_steps"]
-                + solver["joint_steps"]
-            ),
-        }
-    if method.method_id in {"siren", "recinr_se2"}:
-        return {"unit": "sgd-step", "budget": solver["sgd_steps"]}
-    if method.method_id in {"gsdiff_tv", "gsdiff_diffusion"}:
-        return {
-            "unit": "outer-iteration",
-            "budget": solver["outer_iterations"],
-        }
-    raise ArtifactValidationError("unknown native method iteration binding")
 
 
 def _classical_parameter_count(
@@ -657,7 +624,7 @@ def _validate_result(
         raise ArtifactValidationError(
             "parameter_count does not match the locked classical formula"
         )
-    expected_iteration = _native_iteration(method)
+    expected_iteration = native_iteration_contract_v1(method)
     actual_iteration = {
         "unit": result.info["native_iteration_unit"],
         "budget": result.info["native_iteration_budget"],
@@ -775,7 +742,7 @@ _NATIVE_HISTORY_FIELDS = {
 
 
 def _history_contract(method: ResolvedMethod) -> dict[str, object]:
-    native = _native_iteration(method)
+    native = native_iteration_contract_v1(method)
     if method.method_id == "dgi":
         return {
             "kind": None,
@@ -1101,7 +1068,7 @@ def build_method_info_contract_v1(
         "execution_profile": method.execution_profile,
         "method_config_sha256": method.method_config_sha256,
         "semantic_config": thaw_json(method.semantic_config),
-        "native_iteration": _native_iteration(method),
+        "native_iteration": native_iteration_contract_v1(method),
         "warmup": _warmup_counts(method),
         "checkpoints": _expected_checkpoints(method),
         "convergence_status": method.convergence_status,
@@ -1504,7 +1471,7 @@ def write_method_child_outputs_v2(
         "semantic_config": thaw_json(method.semantic_config),
         "algorithm_seed": {"domain": "algorithm-seed-v1", "derivation_sha256": algorithm_seed.derivation_sha256, "seed_u32": algorithm_seed.seed_u32},
         "parameter_count": result.info["parameter_count"],
-        "native_iteration": _native_iteration(method),
+        "native_iteration": native_iteration_contract_v1(method),
         "warmup": _warmup_counts(method),
         "selected_hyperparameters": result.info["selected_hyperparameters"],
         "selection": result.info["selection"],
@@ -1716,7 +1683,7 @@ def validate_method_child_outputs_v2(
             "parameter_count does not match the locked classical formula"
         )
     if canonical_json_bytes(info["native_iteration"]) != canonical_json_bytes(
-        _native_iteration(expected_method)
+        native_iteration_contract_v1(expected_method)
     ):
         raise ArtifactValidationError(
             "native iteration metadata does not match parent method"

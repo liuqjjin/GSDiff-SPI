@@ -563,6 +563,29 @@ def test_method_registry_locks_canonical_lanes_and_confirmation_pair():
     )["lane"] == "diffusion"
 
 
+def test_smoke_profiles_bind_the_frozen_safety_compute_cap():
+    methods = _load("methods-v1.yaml")
+    expected_compute_cap = {
+        "wall_time_seconds": 1800,
+        "peak_vram_bytes": 15_032_385_536,
+        "on_exceed": "ineligible-retain-artifacts",
+    }
+
+    for entry in methods["methods"]:
+        semantic_config = entry["profiles"]["controller-cpu-smoke-v1"][
+            "semantic_config"
+        ]
+        assert semantic_config["compute_cap"] == expected_compute_cap
+
+    invalid = copy.deepcopy(methods)
+    invalid["methods"][0]["profiles"]["controller-cpu-smoke-v1"][
+        "semantic_config"
+    ]["compute_cap"]["wall_time_seconds"] = 1799
+    _refresh_hashes(invalid)
+    with pytest.raises(ValueError, match="semantic config"):
+        protocol.validate_protocol(invalid)
+
+
 @pytest.mark.parametrize(
     ("mutate", "message"),
     [
