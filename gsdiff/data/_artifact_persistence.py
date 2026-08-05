@@ -1447,6 +1447,158 @@ def _rename_directory_path_no_clobber(
     raise OSError(error_code, os.strerror(error_code))
 
 
+def _handle_bound_promotion_barrier(
+    source_dir: Path,
+    destination_dir: Path,
+) -> None:
+    """Private deterministic hook after pinning the promotion source."""
+
+
+def _promote_exact_directory_no_clobber(
+    source_dir: Path,
+    destination_dir: Path,
+    *,
+    expected_device: int,
+    expected_inode: int,
+) -> None:
+    """No-clobber promote the exact opened directory identity."""
+    if type(expected_device) is not int or type(expected_inode) is not int:
+        raise TypeError("promotion directory identity must use exact integers")
+    if os.name == "nt":
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+        ]
+        create_file.restype = ctypes.c_void_p
+        get_information = kernel32.GetFileInformationByHandleEx
+        get_information.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+        ]
+        get_information.restype = ctypes.c_int
+        rename_handle = kernel32.SetFileInformationByHandle
+        rename_handle.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+        ]
+        rename_handle.restype = ctypes.c_int
+        close = kernel32.CloseHandle
+        close.argtypes = [ctypes.c_void_p]
+        close.restype = ctypes.c_int
+        handle = create_file(
+            str(source_dir),
+            0x00010000 | 0x00000080,
+            0x1 | 0x2 | 0x4,
+            None,
+            3,
+            0x02000000 | 0x00200000,
+            None,
+        )
+        invalid = ctypes.c_void_p(-1).value
+        if handle in (None, invalid):
+            raise ArtifactValidationError(
+                "cannot open exact directory promotion source"
+            ) from ctypes.WinError(ctypes.get_last_error())
+        try:
+            file_id_info = _WindowsFileIdInfo()
+            if not get_information(
+                handle,
+                _FILE_ID_INFO_CLASS,
+                ctypes.byref(file_id_info),
+                ctypes.sizeof(file_id_info),
+            ):
+                raise ctypes.WinError(ctypes.get_last_error())
+            handle_identity = (
+                int(file_id_info.volume_serial_number),
+                int.from_bytes(
+                    bytes(file_id_info.file_id.identifier),
+                    byteorder="little",
+                ),
+            )
+            if handle_identity != (expected_device, expected_inode):
+                raise ArtifactValidationError(
+                    "promotion source is not the pinned directory identity"
+                )
+            _handle_bound_promotion_barrier(source_dir, destination_dir)
+            encoded_name = str(destination_dir.absolute()).encode("utf-16-le")
+            payload_size = _WindowsRenameInfo.file_name.offset + len(encoded_name)
+            buffer_size = payload_size + ctypes.sizeof(ctypes.c_wchar)
+            buffer = ctypes.create_string_buffer(buffer_size)
+            rename_info = _WindowsRenameInfo.from_buffer(buffer)
+            rename_info.flags = 0
+            rename_info.root_directory = None
+            rename_info.file_name_length = len(encoded_name)
+            ctypes.memmove(
+                ctypes.addressof(buffer) + _WindowsRenameInfo.file_name.offset,
+                encoded_name,
+                len(encoded_name),
+            )
+            if not rename_handle(
+                handle,
+                _FILE_RENAME_INFO_CLASS,
+                buffer,
+                buffer_size,
+            ):
+                error_code = ctypes.get_last_error()
+                if error_code in {80, 183}:
+                    raise FileExistsError(
+                        error_code,
+                        "promotion destination already exists",
+                    )
+                raise ctypes.WinError(error_code)
+        finally:
+            close(handle)
+    else:
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor = os.open(source_dir, flags)
+        try:
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) != (
+                expected_device,
+                expected_inode,
+            ):
+                raise ArtifactValidationError(
+                    "promotion source is not the pinned directory identity"
+                )
+            _handle_bound_promotion_barrier(source_dir, destination_dir)
+            observed = os.lstat(source_dir)
+            if (observed.st_dev, observed.st_ino) != (
+                expected_device,
+                expected_inode,
+            ):
+                raise ArtifactValidationError(
+                    "promotion source path changed after pinning"
+                )
+            _rename_directory_path_no_clobber(source_dir, destination_dir)
+        finally:
+            os.close(descriptor)
+    promoted = os.lstat(destination_dir)
+    if (
+        _is_link_or_reparse(promoted)
+        or not stat.S_ISDIR(promoted.st_mode)
+        or (promoted.st_dev, promoted.st_ino)
+        != (expected_device, expected_inode)
+    ):
+        raise ArtifactValidationError(
+            "promoted directory identity does not match the pinned source"
+        )
+
+
 def _quarantine_unexpected_final(final_dir: Path) -> Path:
     diagnostic = final_dir.with_name(
         f".{final_dir.name}.rejected-{os.urandom(12).hex()}"

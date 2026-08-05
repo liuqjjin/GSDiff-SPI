@@ -40,8 +40,15 @@ from gsdiff.data._artifact_io import (
     verify_safe_file_snapshot,
 )
 from gsdiff.data._artifact_models import SPIAcquisitionData
+from gsdiff.data._artifact_dataset import (
+    _validate_blind_acquisition_spec,
+)
 
 from .methods import AlgorithmSeed, ResolvedMethod, thaw_json
+from .parameter_counts import (
+    _expected_trainable_parameter_count_for_dimensions,
+    expected_trainable_parameter_count,
+)
 from .objectives import (
     gidc_snapshot_candidate_grid,
     recinr_snapshot_candidate_grid,
@@ -309,22 +316,13 @@ def _native_iteration(method: ResolvedMethod) -> dict[str, object]:
 def _classical_parameter_count(
     method: ResolvedMethod,
     acquisition: SPIAcquisitionData,
-) -> int | None:
-    if method.method_id == "dgi":
-        return 0
-    if method.method_id == "static_cs":
-        return acquisition.H * acquisition.W
-    if method.method_id in {"perframe_cs", "tv3d"}:
-        return acquisition.T * acquisition.H * acquisition.W
-    if method.method_id == "monin":
-        solver = method.semantic_config["solver"]
-        assert isinstance(solver, Mapping)
-        degree = _require_exact_int(
-            solver["polynomial_degree"],
-            "semantic_config.solver.polynomial_degree",
-        )
-        return acquisition.H * acquisition.W + 2 * degree
-    return None
+) -> int:
+    return _expected_trainable_parameter_count_for_dimensions(
+        method,
+        h=acquisition.H,
+        w=acquisition.W,
+        t=acquisition.T,
+    )
 
 
 def _candidate_spec(
@@ -364,12 +362,11 @@ def _candidate_spec(
     return None
 
 
-def _validate_selection(
-    method: ResolvedMethod,
+def _validate_selection_spec(
+    spec: _CandidateSpec | None,
     selected_hyperparameters: object,
     selection: object,
 ) -> None:
-    spec = _candidate_spec(method)
     if spec is None:
         if selected_hyperparameters is not None or selection is not None:
             raise ArtifactValidationError(
@@ -491,6 +488,18 @@ def _validate_selection(
         )
 
 
+def _validate_selection(
+    method: ResolvedMethod,
+    selected_hyperparameters: object,
+    selection: object,
+) -> None:
+    _validate_selection_spec(
+        _candidate_spec(method),
+        selected_hyperparameters,
+        selection,
+    )
+
+
 _HISTORY_INDEX_FIELDS = {
     "iteration": "iteration",
     "step": "step",
@@ -537,14 +546,13 @@ def _validate_history_row(row: Mapping[str, object], index: int) -> None:
         )
 
 
-def _validate_reconstruction_source(
-    method: ResolvedMethod,
+def _validate_reconstruction_source_spec(
+    spec: _CandidateSpec | None,
     selection: object,
     history: tuple[Mapping[str, object], ...] | list[object],
     *,
     field: str,
 ) -> None:
-    spec = _candidate_spec(method)
     source_rows = [
         (index, row)
         for index, row in enumerate(history)
@@ -591,6 +599,21 @@ def _validate_reconstruction_source(
         )
 
 
+def _validate_reconstruction_source(
+    method: ResolvedMethod,
+    selection: object,
+    history: tuple[Mapping[str, object], ...] | list[object],
+    *,
+    field: str,
+) -> None:
+    _validate_reconstruction_source_spec(
+        _candidate_spec(method),
+        selection,
+        history,
+        field=field,
+    )
+
+
 def _validate_result(
     result: MethodChildResult,
     acquisition: SPIAcquisitionData,
@@ -611,6 +634,11 @@ def _validate_result(
         dgi = np.asarray(result.dgi)
         if dgi.shape != (acquisition.H, acquisition.W) or not np.issubdtype(dgi.dtype, np.number) or np.iscomplexobj(dgi) or not np.isfinite(dgi).all():
             raise ArtifactValidationError("dgi shape or values are invalid")
+    _validate_auxiliary_arrays(
+        method,
+        reconstruction,
+        result.dgi,
+    )
     if result.estimated_motion_trajectory is not None:
         motion = np.asarray(result.estimated_motion_trajectory)
         if motion.shape != (acquisition.T, 3) or not np.issubdtype(motion.dtype, np.number) or np.iscomplexobj(motion) or not np.isfinite(motion).all():
@@ -625,10 +653,7 @@ def _validate_result(
         result.info["parameter_count"], "parameter_count"
     )
     expected_parameter_count = _classical_parameter_count(method, acquisition)
-    if (
-        expected_parameter_count is not None
-        and parameter_count != expected_parameter_count
-    ):
+    if parameter_count != expected_parameter_count:
         raise ArtifactValidationError(
             "parameter_count does not match the locked classical formula"
         )
@@ -663,6 +688,13 @@ def _validate_result(
         raise ArtifactValidationError(
             "native_motion_model must agree with trajectory presence"
         )
+    expected_motion = (
+        method.method_id == "monin" or method.execution_family == "gsdiff"
+    )
+    if (result.estimated_motion_trajectory is not None) is not expected_motion:
+        raise ArtifactValidationError(
+            "motion trajectory presence disagrees with method contract"
+        )
     if result.info["checkpoint_hashes"] != _expected_checkpoints(method):
         raise ArtifactValidationError("checkpoint_hashes do not match method requirements")
     _validate_selection(
@@ -676,6 +708,7 @@ def _validate_result(
     for index, row in enumerate(result.history):
         validate_exact_json_native(dict(row), f"history[{index}]")
         _validate_history_row(row, index)
+    _validate_full_history(result.history, _history_contract(method))
     _validate_reconstruction_source(
         method,
         result.info["selection"],
@@ -691,6 +724,35 @@ def _expected_checkpoints(method: ResolvedMethod) -> list[dict[str, str]]:
     ]
 
 
+def _dgi_presence(method: ResolvedMethod) -> str:
+    return (
+        "required"
+        if method.method_id
+        in {"dgi", "siren", "recinr_se2", "gsdiff_tv", "gsdiff_diffusion"}
+        else "forbidden"
+    )
+
+
+def _validate_auxiliary_arrays(
+    method: ResolvedMethod,
+    reconstruction: np.ndarray,
+    dgi: np.ndarray | None,
+) -> None:
+    required = _dgi_presence(method) == "required"
+    if (dgi is not None) is not required:
+        raise ArtifactValidationError(
+            "dgi auxiliary array presence disagrees with method contract"
+        )
+    if method.method_id == "dgi":
+        assert dgi is not None
+        if not np.array_equal(dgi, reconstruction[0]) or not np.all(
+            reconstruction == reconstruction[0]
+        ):
+            raise ArtifactValidationError(
+                "DGI reconstruction must repeat the exact dgi frame"
+            )
+
+
 def _warmup_counts(method: ResolvedMethod) -> dict[str, int]:
     solver = method.semantic_config.get("solver")
     if not isinstance(solver, Mapping):
@@ -700,6 +762,540 @@ def _warmup_counts(method: ResolvedMethod) -> dict[str, int]:
     if type(splitting) is not int or type(motion) is not int or splitting < 0 or motion < 0:
         raise ArtifactValidationError("method warmup counts must be nonnegative integers")
     return {"splitting": splitting, "motion": motion}
+
+
+_NATIVE_HISTORY_FIELDS = {
+    "admm-iteration": ("iteration", "iteration"),
+    "primal-dual-iteration": ("iteration", "iteration"),
+    "adam-step": ("step", "step"),
+    "optimization-step": ("step", "step"),
+    "sgd-step": ("step", "step"),
+    "outer-iteration": ("outer-iteration", "outer_iteration"),
+}
+
+
+def _history_contract(method: ResolvedMethod) -> dict[str, object]:
+    native = _native_iteration(method)
+    if method.method_id == "dgi":
+        return {
+            "kind": None,
+            "index_field": None,
+            "observed_count": 0,
+            "allowed_metric_fields": [],
+            "phases": [],
+            "final_required_metric_fields": [],
+        }
+    binding = _NATIVE_HISTORY_FIELDS.get(native["unit"])
+    if binding is None:
+        raise ArtifactValidationError("native history unit is unsupported")
+    kind, index_field = binding
+    budget = native["budget"]
+    assert type(budget) is int
+    if method.method_id in {"static_cs", "perframe_cs", "monin"}:
+        required = [
+            "data_fidelity",
+            "primal_residual",
+            "dual_residual",
+        ]
+        phases = [_history_phase(1, budget, required)]
+        allowed = required
+        final_required: list[str] = []
+    elif method.method_id == "tv3d":
+        required = ["data_fidelity"]
+        phases = [_history_phase(1, budget, required)]
+        allowed = required
+        final_required = []
+    elif method.method_id == "gidc3dtv":
+        required = ["loss", "data_fidelity", "learning_rate"]
+        phases = [_history_phase(1, budget, required)]
+        allowed = required
+        final_required = []
+    elif method.method_id == "recinr":
+        solver = method.semantic_config["solver"]
+        assert isinstance(solver, Mapping)
+        warm_steps = solver["warm_steps"]
+        assert type(warm_steps) is int and 0 <= warm_steps <= budget
+        phases = []
+        if warm_steps:
+            phases.append(
+                _history_phase(
+                    1,
+                    warm_steps,
+                    ["loss", "learning_rate"],
+                )
+            )
+        if warm_steps < budget:
+            phases.append(
+                _history_phase(
+                    warm_steps + 1,
+                    budget,
+                    ["loss", "data_fidelity", "learning_rate"],
+                )
+            )
+        allowed = ["loss", "data_fidelity", "learning_rate"]
+        final_required = []
+    elif method.method_id in {"siren", "recinr_se2"}:
+        required = ["loss", "data_fidelity"]
+        phases = [_history_phase(1, budget, required)]
+        allowed = [*required, "objective"]
+        final_required = ["objective"]
+    elif method.method_id in {"gsdiff_tv", "gsdiff_diffusion"}:
+        required = ["loss", "primal_residual", "dual_residual"]
+        phases = [_history_phase(1, budget, required)]
+        allowed = [*required, "objective"]
+        final_required = ["objective"]
+    else:
+        raise ArtifactValidationError("unknown method history metric contract")
+    return {
+        "kind": kind,
+        "index_field": index_field,
+        "observed_count": budget,
+        "allowed_metric_fields": allowed,
+        "phases": phases,
+        "final_required_metric_fields": final_required,
+    }
+
+
+def _history_phase(
+    start: int,
+    end: int,
+    required_metric_fields: list[str],
+) -> dict[str, object]:
+    return {
+        "start": start,
+        "end": end,
+        "required_metric_fields": required_metric_fields,
+    }
+
+
+def _validate_history_metrics(
+    row: Mapping[str, object],
+    policy: Mapping[str, object],
+    native_index: int,
+) -> None:
+    allowed = policy["allowed_metric_fields"]
+    phases = policy["phases"]
+    final_required = policy["final_required_metric_fields"]
+    observed = policy["observed_count"]
+    if (
+        type(allowed) is not list
+        or any(field not in _HISTORY_METRIC_FIELDS for field in allowed)
+        or len(allowed) != len(set(allowed))
+        or type(phases) is not list
+        or type(final_required) is not list
+        or any(field not in allowed for field in final_required)
+        or type(observed) is not int
+    ):
+        raise ArtifactValidationError("history metric contract is invalid")
+    matching = [
+        phase
+        for phase in phases
+        if isinstance(phase, Mapping)
+        and type(phase.get("start")) is int
+        and type(phase.get("end")) is int
+        and phase["start"] <= native_index <= phase["end"]
+    ]
+    if len(matching) != 1:
+        raise ArtifactValidationError("history metric phase contract is invalid")
+    phase = matching[0]
+    if set(phase) != {"start", "end", "required_metric_fields"}:
+        raise ArtifactValidationError("history metric phase contract is invalid")
+    required = phase["required_metric_fields"]
+    if (
+        type(required) is not list
+        or any(field not in allowed for field in required)
+        or len(required) != len(set(required))
+    ):
+        raise ArtifactValidationError("history metric phase contract is invalid")
+    present = set(row) & _HISTORY_METRIC_FIELDS
+    if not set(required).issubset(present) or not present.issubset(set(allowed)):
+        raise ArtifactValidationError(
+            "history row metrics disagree with the method contract"
+        )
+    if native_index == observed:
+        if not set(final_required).issubset(present):
+            raise ArtifactValidationError(
+                "final history row metrics disagree with the method contract"
+            )
+    elif "objective" in present:
+        raise ArtifactValidationError(
+            "objective is allowed only on the final method history row"
+        )
+
+
+def _validate_full_history(
+    history: tuple[Mapping[str, object], ...],
+    policy: Mapping[str, object],
+) -> None:
+    observed = policy["observed_count"]
+    if type(observed) is not int or observed < 0 or len(history) != observed:
+        raise ArtifactValidationError(
+            "history does not cover the exact native iteration budget"
+        )
+    kind = policy["kind"]
+    index_field = policy["index_field"]
+    for index, row in enumerate(history):
+        _validate_history_row(row, index)
+        if (
+            row["kind"] != kind
+            or type(index_field) is not str
+            or row[index_field] != index + 1
+        ):
+            raise ArtifactValidationError(
+                "history kind/index does not match native iteration order"
+            )
+        _validate_history_metrics(row, policy, index + 1)
+
+
+def _expected_sampled_history_indices(
+    policy: Mapping[str, object],
+    selection_contract: Mapping[str, object],
+    selection: object,
+) -> list[int]:
+    observed = policy["observed_count"]
+    assert type(observed) is int
+    if observed < 21:
+        return list(range(1, observed + 1))
+    zero_based = [
+        (observed - 1) * index // 20 for index in range(21)
+    ]
+    if selection_contract["reconstruction_source"] == "required":
+        if not isinstance(selection, Mapping):
+            raise ArtifactValidationError(
+                "snapshot history requires an identity-bound selection"
+            )
+        selected = selection["selected_candidate"]
+        if not isinstance(selected, Mapping):
+            raise ArtifactValidationError(
+                "snapshot history selected candidate is invalid"
+            )
+        selected_step = _require_exact_int(
+            selected.get("snapshot_step"),
+            "selection.selected_candidate.snapshot_step",
+            minimum=1,
+            maximum=observed,
+        )
+        source_index = selected_step - 1
+        if source_index not in zero_based:
+            replacement = min(
+                range(1, 20),
+                key=lambda index: (
+                    abs(zero_based[index] - source_index),
+                    index,
+                ),
+            )
+            zero_based[replacement] = source_index
+            zero_based.sort()
+    return [index + 1 for index in zero_based]
+
+
+def _validate_serialized_history_against_method(
+    convergence: Mapping[str, object],
+    method: ResolvedMethod,
+    selection: object,
+) -> None:
+    history_policy = _history_contract(method)
+    candidate = _candidate_spec(method)
+    selection_contract = {
+        "reconstruction_source": (
+            "required"
+            if candidate is not None and candidate.has_snapshot_state
+            else "forbidden"
+        )
+    }
+    expected_indices = _expected_sampled_history_indices(
+        history_policy,
+        selection_contract,
+        selection,
+    )
+    observed = history_policy["observed_count"]
+    assert type(observed) is int
+    expected_policy = (
+        "all-observations"
+        if observed < 21
+        else "floor-grid-21-with-reconstruction-source-v1"
+        if selection_contract["reconstruction_source"] == "required"
+        else "floor(i*(observed_count-1)/20), i=0..20"
+    )
+    history = convergence["history"]
+    if (
+        convergence["observed_count"] != observed
+        or convergence["serialized_count"] != len(expected_indices)
+        or convergence["sampling_policy"] != expected_policy
+        or type(history) is not list
+        or len(history) != len(expected_indices)
+    ):
+        raise ArtifactValidationError(
+            "method info history disagrees with parent native iteration contract"
+        )
+    kind = history_policy["kind"]
+    index_field = history_policy["index_field"]
+    for row, expected_index in zip(history, expected_indices, strict=True):
+        if (
+            not isinstance(row, Mapping)
+            or row["kind"] != kind
+            or type(index_field) is not str
+            or row[index_field] != expected_index
+        ):
+            raise ArtifactValidationError(
+                "method info sampled history index disagrees with parent contract"
+            )
+        _validate_history_metrics(row, history_policy, expected_index)
+
+
+def build_method_info_contract_v1(
+    method: ResolvedMethod,
+    expected_acquisition_spec: Mapping[str, object],
+) -> dict[str, object]:
+    """Build the path-free, parent-authoritative method-info contract."""
+    if type(method) is not ResolvedMethod:
+        raise TypeError("method must be a ResolvedMethod")
+    acquisition_spec = _validate_blind_acquisition_spec(
+        expected_acquisition_spec
+    )
+    dimensions = acquisition_spec["dimensions"]
+    assert isinstance(dimensions, Mapping)
+    parameter_count = expected_trainable_parameter_count(
+        method,
+        acquisition_spec,
+    )
+    candidate = _candidate_spec(method)
+    selection_contract: dict[str, object]
+    if candidate is None:
+        selection_contract = {
+            "formula_id": None,
+            "candidate_grid": None,
+            "selected_hyperparameter_keys": None,
+            "reconstruction_source": "forbidden",
+        }
+    else:
+        selection_contract = {
+            "formula_id": "heldout-normalized-l2-v1",
+            "candidate_grid": candidate.candidate_grid,
+            "selected_hyperparameter_keys": (
+                None
+                if candidate.selected_hyperparameter_keys is None
+                else list(candidate.selected_hyperparameter_keys)
+            ),
+            "reconstruction_source": (
+                "required" if candidate.has_snapshot_state else "forbidden"
+            ),
+        }
+    if method.method_id == "monin":
+        motion_policy = {
+            "presence": "required",
+            "native_model": "translation-polynomial",
+        }
+    elif method.execution_family == "gsdiff":
+        motion_policy = {
+            "presence": "required",
+            "native_model": "se2-polynomial",
+        }
+    else:
+        motion_policy = {"presence": "forbidden", "native_model": "none"}
+    contract = {
+        "schema": "method-info-contract-v1",
+        "method_id": method.method_id,
+        "method_config_id": method.method_config_id,
+        "execution_family": method.execution_family,
+        "execution_profile": method.execution_profile,
+        "method_config_sha256": method.method_config_sha256,
+        "semantic_config": thaw_json(method.semantic_config),
+        "native_iteration": _native_iteration(method),
+        "warmup": _warmup_counts(method),
+        "checkpoints": _expected_checkpoints(method),
+        "convergence_status": method.convergence_status,
+        "selection": selection_contract,
+        "motion_estimate": motion_policy,
+        "expected_parameter_count": parameter_count,
+        "history": _history_contract(method),
+        "auxiliary_arrays": {"dgi": _dgi_presence(method)},
+    }
+    validate_exact_json_native(contract, "method info contract")
+    return contract
+
+
+def validate_method_info_contract_v1(
+    info: Mapping[str, object],
+    contract: Mapping[str, object],
+) -> None:
+    """Cross-lock method-info evidence to its identity-bound contract."""
+    validate_exact_keys(
+        contract,
+        {
+            "schema",
+            "method_id",
+            "method_config_id",
+            "execution_family",
+            "execution_profile",
+            "method_config_sha256",
+            "semantic_config",
+            "native_iteration",
+            "warmup",
+            "checkpoints",
+            "convergence_status",
+            "selection",
+            "motion_estimate",
+            "expected_parameter_count",
+            "history",
+            "auxiliary_arrays",
+        },
+        "method info contract",
+    )
+    validate_exact_json_native(contract, "method info contract")
+    if contract["schema"] != "method-info-contract-v1":
+        raise ArtifactValidationError("method info contract schema is invalid")
+    auxiliary = contract["auxiliary_arrays"]
+    if (
+        type(auxiliary) is not dict
+        or set(auxiliary) != {"dgi"}
+        or auxiliary["dgi"] not in {"required", "forbidden"}
+    ):
+        raise ArtifactValidationError(
+            "method info auxiliary array contract is invalid"
+        )
+    direct_fields = (
+        "method_id",
+        "method_config_id",
+        "execution_family",
+        "execution_profile",
+        "method_config_sha256",
+        "semantic_config",
+        "native_iteration",
+        "warmup",
+        "checkpoints",
+    )
+    for field in direct_fields:
+        if canonical_json_bytes(info[field]) != canonical_json_bytes(
+            contract[field]
+        ):
+            raise ArtifactValidationError(
+                f"method info {field} disagrees with identity contract"
+            )
+    convergence = info["convergence"]
+    if (
+        not isinstance(convergence, Mapping)
+        or convergence["status"] != contract["convergence_status"]
+    ):
+        raise ArtifactValidationError(
+            "method info convergence disagrees with identity contract"
+        )
+    expected_parameter_count = contract["expected_parameter_count"]
+    if info["parameter_count"] != expected_parameter_count:
+        raise ArtifactValidationError(
+            "method info parameter_count disagrees with identity contract"
+        )
+    selection_contract = contract["selection"]
+    assert isinstance(selection_contract, Mapping)
+    selection = info["selection"]
+    selected = info["selected_hyperparameters"]
+    if selection_contract["formula_id"] is None:
+        candidate_spec = None
+    else:
+        candidate_grid = selection_contract["candidate_grid"]
+        key_values = selection_contract["selected_hyperparameter_keys"]
+        if (
+            selection_contract["formula_id"]
+            != "heldout-normalized-l2-v1"
+            or type(candidate_grid) is not list
+            or (
+                key_values is not None
+                and (
+                    type(key_values) is not list
+                    or any(type(item) is not str for item in key_values)
+                )
+            )
+            or selection_contract["reconstruction_source"]
+            not in {"required", "forbidden"}
+        ):
+            raise ArtifactValidationError(
+                "method info selection contract is invalid"
+            )
+        candidate_spec = _CandidateSpec(
+            list(candidate_grid),
+            None if key_values is None else tuple(key_values),
+            selection_contract["reconstruction_source"] == "required",
+        )
+    _validate_selection_spec(candidate_spec, selected, selection)
+    convergence_history = convergence["history"]
+    assert type(convergence_history) is list
+    _validate_reconstruction_source_spec(
+        candidate_spec,
+        selection,
+        convergence_history,
+        field="convergence.history",
+    )
+    history_policy = contract["history"]
+    if not isinstance(history_policy, Mapping):
+        raise ArtifactValidationError("method info history contract is invalid")
+    validate_exact_keys(
+        history_policy,
+        {
+            "kind",
+            "index_field",
+            "observed_count",
+            "allowed_metric_fields",
+            "phases",
+            "final_required_metric_fields",
+        },
+        "method info history contract",
+    )
+    observed_count = history_policy["observed_count"]
+    if (
+        type(observed_count) is not int
+        or observed_count < 0
+        or convergence["observed_count"] != observed_count
+    ):
+        raise ArtifactValidationError(
+            "method info history count disagrees with identity contract"
+        )
+    expected_indices = _expected_sampled_history_indices(
+        history_policy,
+        selection_contract,
+        selection,
+    )
+    expected_policy = (
+        "all-observations"
+        if observed_count < 21
+        else "floor-grid-21-with-reconstruction-source-v1"
+        if selection_contract["reconstruction_source"] == "required"
+        else "floor(i*(observed_count-1)/20), i=0..20"
+    )
+    if (
+        convergence["serialized_count"] != len(expected_indices)
+        or convergence["sampling_policy"] != expected_policy
+        or len(convergence_history) != len(expected_indices)
+    ):
+        raise ArtifactValidationError(
+            "method info sampled history disagrees with identity contract"
+        )
+    kind = history_policy["kind"]
+    index_field = history_policy["index_field"]
+    for row_index, (row, expected_index) in enumerate(
+        zip(convergence_history, expected_indices, strict=True)
+    ):
+        assert isinstance(row, Mapping)
+        if (
+            row["kind"] != kind
+            or type(index_field) is not str
+            or row[index_field] != expected_index
+        ):
+            raise ArtifactValidationError(
+                "method info sampled history kind/index disagrees with identity contract"
+            )
+        _validate_history_metrics(row, history_policy, expected_index)
+    motion = info["motion_estimate"]
+    assert isinstance(motion, Mapping)
+    motion_contract = contract["motion_estimate"]
+    assert isinstance(motion_contract, Mapping)
+    expected_present = motion_contract["presence"] == "required"
+    if (
+        motion["present"] is not expected_present
+        or motion["native_model"] != motion_contract["native_model"]
+    ):
+        raise ArtifactValidationError(
+            "method info motion estimate disagrees with identity contract"
+        )
 
 
 def _sample_history(history: tuple[Mapping[str, object], ...]) -> tuple[list[object], str]:
@@ -996,6 +1592,46 @@ def load_reconstruction_v2(path: Path) -> ReconstructionV2:
     return ReconstructionV2(metadata["dataset_identity_sha256"], metadata["method_id"], reconstruction, indices, time_grid, arrays.get("dgi"), arrays.get("estimated_motion_trajectory"), descriptors)
 
 
+def load_method_info_v2(path: Path) -> Mapping[str, object]:
+    """Load canonical method-info-v2 with intrinsic consistency checks."""
+    info, _digest = _parse_json_file(Path(path))
+    _validate_method_info_schema(info)
+    timing = info["child_timing"]
+    assert isinstance(timing, Mapping)
+    started = _require_utc(timing["started_at"], "child_timing.started_at")
+    finished = _require_utc(timing["finished_at"], "child_timing.finished_at")
+    elapsed = _require_finite_number(
+        timing["elapsed_seconds"],
+        "child_timing.elapsed_seconds",
+        minimum=0.0,
+    )
+    if finished < started or elapsed != (finished - started).total_seconds():
+        raise ArtifactValidationError("method info child timing is inconsistent")
+    convergence = info["convergence"]
+    assert isinstance(convergence, Mapping)
+    observed = convergence["observed_count"]
+    serialized = convergence["serialized_count"]
+    history = convergence["history"]
+    if (
+        type(observed) is not int
+        or type(serialized) is not int
+        or type(history) is not list
+        or serialized != len(history)
+        or serialized != (observed if observed < 21 else 21)
+    ):
+        raise ArtifactValidationError("method info convergence counts are inconsistent")
+    for index, row in enumerate(history):
+        if not isinstance(row, Mapping):
+            raise ArtifactValidationError("method info convergence row is invalid")
+        _validate_history_row(row, index)
+    checkpoints = info["checkpoints"]
+    assert type(checkpoints) is list
+    logical_ids = [item["logical_id"] for item in checkpoints]
+    if len(logical_ids) != len(set(logical_ids)):
+        raise ArtifactValidationError("method info checkpoints are duplicated")
+    return info
+
+
 def _load_schema() -> Mapping[str, object]:
     schema_path = Path(__file__).resolve().parents[2] / "schemas" / "method-info-v2.schema.json"
     with schema_path.open("r", encoding="utf-8") as stream:
@@ -1075,10 +1711,7 @@ def validate_method_child_outputs_v2(
     expected_parameter_count = _classical_parameter_count(
         expected_method, expected_acquisition
     )
-    if (
-        expected_parameter_count is not None
-        and parameter_count != expected_parameter_count
-    ):
+    if parameter_count != expected_parameter_count:
         raise ArtifactValidationError(
             "parameter_count does not match the locked classical formula"
         )
@@ -1116,6 +1749,13 @@ def validate_method_child_outputs_v2(
         selection=info["selection"],
         expected_status=expected_method.convergence_status,
     )
+    convergence = info["convergence"]
+    assert isinstance(convergence, Mapping)
+    _validate_serialized_history_against_method(
+        convergence,
+        expected_method,
+        info["selection"],
+    )
     if reconstruction.dataset_identity_sha256 != expected_dataset_identity_sha256 or reconstruction.method_id != expected_method.method_id:
         raise ArtifactValidationError("reconstruction metadata does not match parent request")
     expected_shape = (
@@ -1127,6 +1767,11 @@ def validate_method_child_outputs_v2(
         raise ArtifactValidationError(
             "reconstruction shape disagrees with expected acquisition"
         )
+    _validate_auxiliary_arrays(
+        expected_method,
+        reconstruction.reconstruction,
+        reconstruction.dgi,
+    )
     expected_frame_indices = np.arange(
         expected_acquisition.T, dtype=np.int64
     )

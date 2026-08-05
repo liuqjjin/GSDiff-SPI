@@ -19,8 +19,8 @@ from skimage.metrics import structural_similarity
 from ..utils import normalize_01_legacy_minmax, psnr_legacy_60db
 
 
-_FLOAT64_EPS = np.finfo(np.float64).eps
-_FLOAT64_MAX = np.finfo(np.float64).max
+_FLOAT64_EPS = float(np.finfo(np.float64).eps)
+_FLOAT64_MAX = float(np.finfo(np.float64).max)
 _PSNR_MSE_FLOOR = 1e-12
 _PSNR_CAP_DB = 120.0
 _SSIM_WIN_SIZE = 7
@@ -293,3 +293,70 @@ def evaluate_video_global_affine(
     }
     _require_finite_numbers(payload)
     return payload
+
+
+def validate_metrics_v1_payload(
+    value: object,
+    reconstruction: np.ndarray,
+) -> None:
+    """Validate truth-independent metrics-v1 structure and policy constants."""
+    if type(value) is not dict or set(value) != {
+        "psnr_global_affine",
+        "ssim_global_affine",
+        "nrmse_global_affine_l2",
+        "psnr_legacy_per_frame_minmax",
+        "alignment",
+        "definition_version",
+        "metric_definition",
+    }:
+        raise ValueError("metrics-v1 top-level shape is invalid")
+    if value["definition_version"] != "metrics-v1":
+        raise ValueError("metrics-v1 definition version is invalid")
+    alignment = value["alignment"]
+    if type(alignment) is not dict or set(alignment) != {"slope", "intercept"}:
+        raise ValueError("metrics-v1 alignment shape is invalid")
+    for field in (
+        "psnr_global_affine",
+        "ssim_global_affine",
+        "nrmse_global_affine_l2",
+        "psnr_legacy_per_frame_minmax",
+    ):
+        if type(value[field]) not in (int, float) or not np.isfinite(value[field]):
+            raise ValueError(f"metrics-v1 {field} must be finite")
+    for field in ("slope", "intercept"):
+        if type(alignment[field]) not in (int, float) or not np.isfinite(
+            alignment[field]
+        ):
+            raise ValueError(f"metrics-v1 alignment {field} must be finite")
+    if alignment["slope"] < 0:
+        raise ValueError("metrics-v1 alignment slope must be nonnegative")
+    if value["nrmse_global_affine_l2"] < 0:
+        raise ValueError("metrics-v1 NRMSE must be nonnegative")
+    if not -1.0 <= value["ssim_global_affine"] <= 1.0:
+        raise ValueError("metrics-v1 SSIM must be in [-1,1]")
+    recon64 = _as_float64_video(reconstruction, "reconstruction")
+    expected_definition = {
+        "alignment_scope": "one-affine-fit-over-all-video-pixels",
+        "nonnegative_slope": True,
+        "prediction_variance_threshold": _prediction_variance_threshold(recon64),
+        "prediction_variance_threshold_policy": (
+            "variance <= eps64 * max(1, max(abs(recon - mean(recon))))**2"
+        ),
+        "input_abs_evaluability_bound": _safe_input_abs_bound(recon64.size),
+        "input_abs_evaluability_bound_policy": (
+            "max(abs(input)) <= "
+            "(float64_max / (16 * number_of_video_values))**0.25"
+        ),
+        "alignment_output_clip": [0.0, 1.0],
+        "psnr_data_range": 1.0,
+        "psnr_mse_floor": _PSNR_MSE_FLOOR,
+        "psnr_cap_db": _PSNR_CAP_DB,
+        "ssim_data_range": 1.0,
+        "ssim_win_size": _SSIM_WIN_SIZE,
+        "ssim_win_size_policy": "fixed-7; requires H and W >= 7",
+        "nrmse_norm": "l2",
+        "nrmse_denominator_epsilon": _FLOAT64_EPS,
+    }
+    if value["metric_definition"] != expected_definition:
+        raise ValueError("metrics-v1 policy definition is invalid")
+    _require_finite_numbers(value)

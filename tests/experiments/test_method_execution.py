@@ -812,7 +812,7 @@ def test_materialization_identity_is_stable_across_absolute_stage_roots(
 @pytest.mark.parametrize(
     ("requested", "visible", "cuda_visible"),
     [
-        ("cpu", "cpu", None),
+        ("cpu", "cpu", "-1"),
         ("cuda:0", "cuda:0", "0"),
         ("cuda:1", "cuda:0", "1"),
     ],
@@ -821,7 +821,7 @@ def test_materialized_device_mapping_is_exact(
     tmp_path: Path,
     requested: str,
     visible: str,
-    cuda_visible: str | None,
+    cuda_visible: str,
 ) -> None:
     source, digest = measurement_source(tmp_path)
     execution = materialize(
@@ -837,10 +837,40 @@ def test_materialized_device_mapping_is_exact(
     assert config["runtime"]["child_runtime_device"] == visible
     device_index = execution.argv.index("--device")
     assert execution.argv[device_index + 1] == visible
-    if cuda_visible is None:
-        assert "CUDA_VISIBLE_DEVICES" not in execution.env
-    else:
-        assert execution.env["CUDA_VISIBLE_DEVICES"] == cuda_visible
+    assert execution.env["CUDA_VISIBLE_DEVICES"] == cuda_visible
+
+
+def test_cpu_materialized_child_cannot_observe_or_allocate_cuda(tmp_path: Path) -> None:
+    source, digest = measurement_source(tmp_path)
+    materialized = materialize(
+        tmp_path / "stage",
+        source,
+        digest,
+        requested_runtime_device="cpu",
+    )
+    probe = subprocess.run(
+        [
+            str(PYTHON),
+            "-c",
+                (
+                    "import torch\n"
+                    "print(torch.cuda.device_count())\n"
+                    "assert torch.cuda.device_count()==0\n"
+                    "try:\n torch.empty(1,device='cuda')\n"
+                    "except Exception:\n pass\n"
+                    "else:\n raise AssertionError('CUDA allocation succeeded')"
+                ),
+        ],
+        cwd=materialized.cwd,
+        env=dict(materialized.env),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert materialized.env["CUDA_VISIBLE_DEVICES"] == "-1"
+    assert probe.returncode == 0, probe.stderr
+    assert probe.stdout.strip() == "0"
 
 
 @pytest.mark.parametrize(
@@ -1176,8 +1206,10 @@ def test_materialized_environment_is_fresh_and_stage_scoped(
         "XDG_CACHE_HOME",
         "TORCH_HOME",
         "MPLCONFIGDIR",
+        "CUDA_VISIBLE_DEVICES",
     }
     assert set(execution.env) == allowed
+    assert execution.env["CUDA_VISIBLE_DEVICES"] == "-1"
     assert "PYTHONPATH" not in execution.env
     assert str(SOURCE_ROOT).lower() not in execution.env["PATH"].lower()
     for name in (

@@ -88,7 +88,7 @@ def _write_v2_outputs(output_dir: Path, request_path: Path) -> None:
         method_id="dgi",
         reconstruction=np.ones((2, 2, 2), dtype=np.float32),
         estimated_motion_trajectory=None,
-        dgi=None,
+        dgi=np.ones((2, 2), dtype=np.float32),
         info={
             "parameter_count": 0,
             "native_iteration_unit": "pass",

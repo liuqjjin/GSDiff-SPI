@@ -640,6 +640,78 @@ def test_git_state_disables_optional_locks_without_mutating_process_env(
     assert os.environ.get("GIT_OPTIONAL_LOCKS") == original
 
 
+def test_git_state_does_not_let_replace_refs_hide_dirty_sources(git_repo: Path):
+    claimed_commit = _git(git_repo, "rev-parse", "HEAD")
+    source = git_repo / "src" / "main.py"
+    source.write_text("VALUE = 2\n", encoding="utf-8")
+    _git(git_repo, "add", "src/main.py")
+    _git(git_repo, "commit", "-m", "replacement")
+    replacement_commit = _git(git_repo, "rev-parse", "HEAD")
+    _git(git_repo, "reset", "--soft", claimed_commit)
+    _git(git_repo, "replace", claimed_commit, replacement_commit)
+
+    assert _git(
+        git_repo, "status", "--porcelain=v1", "--untracked-files=all"
+    ) == ""
+
+    state = identity.git_state(git_repo, [Path("src")])
+
+    assert state["commit"] == claimed_commit
+    assert state["dirty"] is True
+
+
+def test_git_state_rejects_head_change_during_provenance_read(
+    git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    claimed_commit = _git(git_repo, "rev-parse", "HEAD")
+    source = git_repo / "src" / "main.py"
+    source.write_text("VALUE = 2\n", encoding="utf-8")
+    _git(git_repo, "add", "src/main.py")
+    _git(git_repo, "commit", "-m", "racing head")
+    racing_commit = _git(git_repo, "rev-parse", "HEAD")
+    _git(git_repo, "reset", "--hard", claimed_commit)
+    original_git_bytes = identity._git_bytes
+    changed = False
+
+    def racing_git_bytes(repo: Path, *args: str) -> bytes:
+        nonlocal changed
+        payload = original_git_bytes(repo, *args)
+        if args == ("rev-parse", "HEAD") and not changed:
+            changed = True
+            _git(git_repo, "reset", "--hard", racing_commit)
+        return payload
+
+    monkeypatch.setattr(identity, "_git_bytes", racing_git_bytes)
+
+    with pytest.raises(ValueError, match="provenance|HEAD|changed"):
+        identity.git_state(git_repo, [Path("src")])
+
+
+def test_git_state_rejects_index_change_during_provenance_read(
+    git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    source = git_repo / "src" / "main.py"
+    original_git_bytes = identity._git_bytes
+    changed = False
+
+    def racing_git_bytes(repo: Path, *args: str) -> bytes:
+        nonlocal changed
+        payload = original_git_bytes(repo, *args)
+        if args == ("ls-files", "--stage", "-z") and not changed:
+            changed = True
+            source.write_text("VALUE = 9\n", encoding="utf-8")
+            _git(git_repo, "add", "src/main.py")
+            source.write_text("VALUE = 1\n", encoding="utf-8")
+        return payload
+
+    monkeypatch.setattr(identity, "_git_bytes", racing_git_bytes)
+
+    with pytest.raises(ValueError, match="provenance|index|changed"):
+        identity.git_state(git_repo, [Path("src")])
+
+
 def test_git_state_treats_ignored_untracked_input_inside_source_root_as_dirty(
     git_repo: Path,
 ):

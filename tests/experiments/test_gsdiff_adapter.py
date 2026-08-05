@@ -306,6 +306,9 @@ def test_smoke_run_returns_canonical_truth_free_result(
     blind_acquisition: SPIAcquisitionData,
 ):
     from gsdiff.experiments.gsdiff_adapter import run_gsdiff_method
+    from gsdiff.experiments.parameter_counts import (
+        expected_trainable_parameter_count,
+    )
 
     method = _resolve(method_id, blind_acquisition)
     imported_before = set(sys.modules)
@@ -335,6 +338,28 @@ def test_smoke_run_returns_canonical_truth_free_result(
         result.info["parameter_count"]
         == EXPECTED_PARAMETER_COUNTS[method_id]
     )
+    assert expected_trainable_parameter_count(
+        method,
+        {
+            "schema_version": "blind-acquisition-spec-v1",
+            "dimensions": {
+                "H": blind_acquisition.H,
+                "W": blind_acquisition.W,
+                "T": blind_acquisition.T,
+                "K": blind_acquisition.K,
+                "holdout_K": blind_acquisition.holdout_K,
+            },
+            "acquisition": {
+                "pattern_family": "bernoulli",
+                "pattern_values": [0, 1],
+                "pattern_order": "sequential",
+                "time_assignment": "uniform",
+                "holdout_pattern_family": "uniform-random",
+                "noise_convention": "detector-absolute",
+                "noise_sigma_absolute": 0.0,
+            },
+        },
+    ) == EXPECTED_PARAMETER_COUNTS[method_id]
     forbidden = json.dumps(
         {"info": result.info, "history": result.history},
         sort_keys=True,

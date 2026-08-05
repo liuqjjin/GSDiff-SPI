@@ -9,23 +9,61 @@ import json
 import math
 import os
 from pathlib import Path, PurePosixPath
+import re
 import stat
 from typing import Any
 
 from jsonschema import Draft202012Validator
+import numpy as np
+
+from gsdiff.evaluation.metrics import (
+    evaluate_video_global_affine,
+    validate_metrics_v1_payload,
+)
+from gsdiff.data.artifacts import (
+    discover_dataset_directories,
+    verify_canonical_dataset_directory_discovery,
+    verify_dataset_directory,
+)
+from gsdiff.data._artifact_dataset import _validate_blind_acquisition_spec
 
 from .identity import (
     RunIdentity,
+    _authoritative_python_executable_evidence,
+    _authoritative_runtime_projection,
     build_run_identity,
     canonical_json_bytes,
     sha256_bytes,
     verify_environment_requirements,
 )
+from .audit import validate_audit_log
+from .dataset_binding import (
+    build_dataset_input_contract,
+    dataset_measurement_record,
+    validate_dataset_protocol_binding,
+)
+from .child_outputs import (
+    load_method_info_v2,
+    load_reconstruction_v2,
+    validate_method_info_contract_v1,
+)
+from .methods import (
+    METHODS_REGISTRY_PROTOCOL_SHA256,
+    derive_algorithm_seed,
+)
+from .source_snapshot import (
+    _load_canonical_manifest as _load_source_snapshot_manifest,
+)
+from ._windows_paths import windows_component_collision_key
 
 
 _ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_REQUIREMENTS_LOCK = _ROOT / "requirements-lock.txt"
 _DEFAULT_ENVIRONMENT_LOCK = _ROOT / "docs" / "reproducibility" / "environment-lock.json"
+_RUNTIME_DEVICE = re.compile(
+    r"(?:cpu|cuda:(?:0|[1-9][0-9]*))\Z",
+    re.ASCII,
+)
 _MANIFEST_SCHEMA = json.loads(
     (_ROOT / "schemas" / "experiment-manifest-v1.schema.json").read_text("utf-8")
 )
@@ -35,16 +73,37 @@ _AGGREGATE_SCHEMA = json.loads(
 _MANIFEST_VALIDATOR = Draft202012Validator(_MANIFEST_SCHEMA)
 _AGGREGATE_VALIDATOR = Draft202012Validator(_AGGREGATE_SCHEMA)
 _SHA256 = __import__("re").compile(r"^[0-9a-f]{64}$", __import__("re").ASCII)
-_RESERVED_WINDOWS_NAMES = frozenset(
-    {"con", "prn", "aux", "nul"}
-    | {f"com{number}" for number in range(1, 10)}
-    | {f"lpt{number}" for number in range(1, 10)}
-    | {"conin$", "conout$"}
-    | {f"com{suffix}" for suffix in "¹²³"}
-    | {f"lpt{suffix}" for suffix in "¹²³"}
+_RUNNER_ARTIFACT_CONTRACT = (
+    ("reconstruction", "outputs/reconstruction.npz", "reconstruction-v2"),
+    ("method-info", "outputs/method-info.json", "method-info-v2"),
+    ("stdout", "outputs/stdout.log", "text-v1"),
+    ("stderr", "outputs/stderr.log", "text-v1"),
+    ("resolved-config", "resolved-config.json", "resolved-run-config-v1"),
+    ("lifecycle", "lifecycle.json", "run-lifecycle-v1"),
+    ("audit", "evidence/audit.jsonl", "validated-method-audit-log-v1"),
+    (
+        "audit-validation",
+        "evidence/audit-validation.json",
+        "audit-validation-v1",
+    ),
+    (
+        "materialization-logical",
+        "evidence/materialization-logical.json",
+        "materialized-method-execution-v1",
+    ),
+    (
+        "resource-sampling",
+        "evidence/resource-sampling.json",
+        "run-resource-sampling-v1",
+    ),
+    (
+        "source-snapshot",
+        "evidence/source-snapshot.json",
+        "source-snapshot-v1",
+    ),
 )
-
-_StatSnapshot = tuple[int, int, int, int, int]
+_VRAM_SAMPLING_INTERVAL_MS = 250
+_StatSnapshot = tuple[int, int, int, int, int, int]
 
 
 @dataclass(frozen=True)
@@ -171,6 +230,7 @@ def validate_aggregate_index(
     value: Mapping[str, object],
     *,
     manifest_paths: Mapping[str, Path] | None = None,
+    artifact_root: Path | None = None,
     requirements_lock: Path | None = None,
     environment_lock: Path | None = None,
     live_fingerprint: Mapping[str, object] | None = None,
@@ -189,6 +249,10 @@ def validate_aggregate_index(
     if record_ids != expected:
         raise ValueError("campaign index coverage must exactly equal expected identities")
     if manifest_paths is not None:
+        if not isinstance(artifact_root, Path):
+            raise TypeError(
+                "artifact_root must be a Path for physical aggregate validation"
+            )
         environment_hashes = _verify_environment_evidence(
             requirements_lock,
             environment_lock,
@@ -200,6 +264,7 @@ def validate_aggregate_index(
                 raise ValueError("campaign index is missing a manifest path")
             verified = _load_complete_manifest_raw(
                 path,
+                artifact_root=artifact_root,
                 expected_identity_sha256=run_identity,
                 requirements_lock=requirements_lock,
                 environment_lock=environment_lock,
@@ -232,6 +297,7 @@ def build_aggregate_index(
     metric_version: str,
     expected_identity_sha256s: Sequence[str],
     manifest_paths: Mapping[str, Path],
+    artifact_root: Path,
     requirements_lock: Path | None = None,
     environment_lock: Path | None = None,
     live_fingerprint: Mapping[str, object] | None = None,
@@ -251,7 +317,9 @@ def build_aggregate_index(
         if not isinstance(path, Path):
             raise ValueError("expected identity has no manifest path")
         verified = _load_complete_manifest_raw(
-            path, expected_identity_sha256=run_identity,
+            path,
+            artifact_root=artifact_root,
+            expected_identity_sha256=run_identity,
             requirements_lock=requirements_lock, environment_lock=environment_lock,
             live_fingerprint=live_fingerprint,
             verified_environment_hashes=environment_hashes,
@@ -295,14 +363,17 @@ def build_aggregate_index(
 def load_complete_manifest(
     path: Path,
     *,
-    expected_identity_sha256: str | None = None,
+    artifact_root: Path,
+    expected_identity_sha256: str,
     requirements_lock: Path | None = None,
     environment_lock: Path | None = None,
     live_fingerprint: Mapping[str, object] | None = None,
 ) -> dict[str, object] | None:
     """Load a complete manifest; only this public API returns reusable data."""
     verified = _load_complete_manifest_raw(
-        path, expected_identity_sha256=expected_identity_sha256,
+        path,
+        artifact_root=artifact_root,
+        expected_identity_sha256=expected_identity_sha256,
         requirements_lock=requirements_lock, environment_lock=environment_lock,
         live_fingerprint=live_fingerprint,
     )
@@ -312,14 +383,33 @@ def load_complete_manifest(
 def _load_complete_manifest_raw(
     path: Path,
     *,
-    expected_identity_sha256: str | None = None,
+    artifact_root: Path,
+    expected_identity_sha256: str,
     requirements_lock: Path | None = None,
     environment_lock: Path | None = None,
     live_fingerprint: Mapping[str, object] | None = None,
     verified_environment_hashes: Mapping[str, str] | None = None,
 ) -> tuple[bytes, dict[str, object]] | None:
     """Load a physical clean complete run directory, otherwise fail closed."""
+    if not isinstance(artifact_root, Path):
+        raise TypeError("artifact_root must be a Path")
+    canonical_root = artifact_root.absolute()
     manifest_path = Path(path)
+    if (
+        type(expected_identity_sha256) is not str
+        or _SHA256.fullmatch(expected_identity_sha256) is None
+    ):
+        raise ValueError("expected manifest identity must be a SHA-256")
+    expected_manifest_path = (
+        canonical_root
+        / "runs"
+        / expected_identity_sha256
+        / "manifest.json"
+    )
+    if manifest_path.absolute() != expected_manifest_path:
+        raise ValueError(
+            "complete manifest must be under the explicit canonical artifact root"
+        )
     manifest_read, value = _load_unique_json(manifest_path)
     raw = manifest_read.raw
     if type(value) is not dict:
@@ -329,11 +419,7 @@ def _load_complete_manifest_raw(
         return None
     if value["code"]["dirty_worktree"]:
         raise ValueError("dirty complete manifests are diagnostic and not reusable")
-    if expected_identity_sha256 is not None and (
-        type(expected_identity_sha256) is not str
-        or _SHA256.fullmatch(expected_identity_sha256) is None
-        or value["identity_sha256"] != expected_identity_sha256
-    ):
+    if value["identity_sha256"] != expected_identity_sha256:
         raise ValueError("manifest identity does not match expected identity")
     if manifest_path.parent.name != value["identity_sha256"]:
         raise ValueError("complete manifest directory must be the full identity SHA-256")
@@ -366,6 +452,11 @@ def _load_complete_manifest_raw(
         value,
         initial_inventory=initial_inventory,
     )
+    _validate_complete_runner_contract(
+        manifest_path.parent,
+        value,
+        artifact_root=canonical_root,
+    )
     _verify_safe_read_path_unchanged(manifest_path, manifest_read, "manifest")
     # Task 5's atomic promotion is the writer-side boundary after this final
     # pathname check; this loader cannot lock out a mutation after it returns.
@@ -377,6 +468,10 @@ def _verify_environment_evidence(
     environment_lock: Path | None,
     live_fingerprint: Mapping[str, object] | None,
 ) -> dict[str, str]:
+    if live_fingerprint is not None:
+        raise ValueError(
+            "reusable manifest validation cannot trust a caller fingerprint"
+        )
     if requirements_lock is None and environment_lock is None:
         requirements_lock = _DEFAULT_REQUIREMENTS_LOCK
         environment_lock = _DEFAULT_ENVIRONMENT_LOCK
@@ -387,8 +482,542 @@ def _verify_environment_evidence(
     return verify_environment_requirements(
         requirements_lock,
         environment_lock,
-        live_fingerprint=live_fingerprint,
     )
+
+
+def _validate_complete_runner_contract(
+    run_dir: Path,
+    manifest: Mapping[str, object],
+    *,
+    artifact_root: Path,
+) -> None:
+    metrics_descriptor = manifest["metrics"]
+    artifacts = manifest["artifacts"]
+    assert type(metrics_descriptor) is dict and type(artifacts) is list
+    if metrics_descriptor["path"] != "outputs/metrics.json":
+        raise ValueError("runner metrics path violates the exact contract")
+    if len(artifacts) != len(_RUNNER_ARTIFACT_CONTRACT):
+        raise ValueError("runner artifact inventory violates the exact contract")
+    for descriptor, (role, relative, schema) in zip(
+        artifacts,
+        _RUNNER_ARTIFACT_CONTRACT,
+        strict=True,
+    ):
+        if (
+            descriptor["role"],
+            descriptor["path"],
+            descriptor["schema_version"],
+            descriptor["required"],
+        ) != (role, relative, schema, True):
+            raise ValueError("runner artifact descriptor violates the exact contract")
+
+    config = _read_canonical_output_json(
+        run_dir / "resolved-config.json",
+        noun="resolved config evidence",
+    )
+    manifest_config = manifest["config"]
+    assert type(manifest_config) is dict
+    if canonical_json_bytes(config) != canonical_json_bytes(
+        manifest_config["resolved"]
+    ):
+        raise ValueError("resolved config evidence disagrees with the manifest")
+    if type(config) is not dict:
+        raise ValueError("resolved config evidence must be an object")
+    runner_config = config.get("runner_execution")
+    if type(runner_config) is not dict or set(runner_config) != {
+        "schema",
+        "requested_runtime_device",
+        "source_snapshot_sha256",
+        "source_projection_sha256",
+        "compute_cap",
+        "materialization_logical_sha256",
+        "method_info_contract",
+        "dataset_input_contract",
+        "runtime_contract",
+        "python_executable_sha256",
+    }:
+        raise ValueError("resolved config lacks identity-bound runner evidence")
+    if (
+        runner_config["schema"] != "runner-execution-identity-v1"
+        or type(runner_config["requested_runtime_device"]) is not str
+        or _RUNTIME_DEVICE.fullmatch(
+            runner_config["requested_runtime_device"]
+        ) is None
+        or type(runner_config["source_snapshot_sha256"]) is not str
+        or _SHA256.fullmatch(runner_config["source_snapshot_sha256"]) is None
+        or type(runner_config["source_projection_sha256"]) is not str
+        or _SHA256.fullmatch(runner_config["source_projection_sha256"]) is None
+        or type(runner_config["materialization_logical_sha256"]) is not str
+        or _SHA256.fullmatch(
+            runner_config["materialization_logical_sha256"]
+        ) is None
+        or type(runner_config["python_executable_sha256"]) is not str
+        or _SHA256.fullmatch(runner_config["python_executable_sha256"]) is None
+    ):
+        raise ValueError("identity-bound runner config is invalid")
+    if (
+        type(config.get("method_config_sha256")) is not str
+        or _SHA256.fullmatch(config["method_config_sha256"]) is None
+    ):
+        raise ValueError("identity-bound method config digest is invalid")
+    runtime_contract = runner_config["runtime_contract"]
+    runtime = manifest["runtime"]
+    assert type(runtime) is dict
+    authoritative_runtime, runtime_hashes = _authoritative_runtime_projection(
+        _DEFAULT_REQUIREMENTS_LOCK,
+        _DEFAULT_ENVIRONMENT_LOCK,
+        runner_config["requested_runtime_device"],
+    )
+    _python_path, python_sha256, _python_signature = (
+        _authoritative_python_executable_evidence()
+    )
+    if (
+        type(runtime_contract) is not dict
+        or set(runtime_contract) != {"python", "pytorch", "cuda", "gpu", "os"}
+        or runtime_contract != authoritative_runtime
+        or authoritative_runtime
+        != {name: runtime[name] for name in ("python", "pytorch", "cuda", "gpu", "os")}
+        or runtime["dependencies_sha256"]
+        != runtime_hashes["dependencies_sha256"]
+        or runtime["environment_lock_sha256"]
+        != runtime_hashes["environment_lock_sha256"]
+        or runner_config["python_executable_sha256"] != python_sha256
+    ):
+        raise ValueError(
+            "manifest runtime disagrees with live authoritative identity contract"
+        )
+
+    lifecycle = _read_canonical_output_json(
+        run_dir / "lifecycle.json",
+        noun="lifecycle evidence",
+    )
+    if type(lifecycle) is not dict or set(lifecycle) != {
+        "schema",
+        "state",
+        "identity_sha256",
+        "owner_token",
+        "fence",
+    }:
+        raise ValueError("lifecycle evidence shape is invalid")
+    owner_token = lifecycle["owner_token"]
+    if (
+        lifecycle["schema"] != "run-lifecycle-v1"
+        or lifecycle["state"] != "complete"
+        or lifecycle["identity_sha256"] != manifest["identity_sha256"]
+        or type(owner_token) is not str
+        or __import__("re").fullmatch(r"[0-9a-f]{32}", owner_token, __import__("re").ASCII)
+        is None
+        or type(lifecycle["fence"]) is not int
+        or lifecycle["fence"] <= 0
+    ):
+        raise ValueError("lifecycle evidence violates the complete-run contract")
+
+    audit_validation = _read_canonical_output_json(
+        run_dir / "evidence/audit-validation.json",
+        noun="audit validation evidence",
+    )
+    if type(audit_validation) is not dict or set(audit_validation) != {
+        "schema",
+        "policy_sha256",
+        "audit_log_sha256",
+        "event_count",
+        "terminal_status",
+    }:
+        raise ValueError("audit validation evidence shape is invalid")
+    if (
+        audit_validation["schema"] != "validated-method-audit-log-v1"
+        or audit_validation["terminal_status"] != "success"
+        or type(audit_validation["event_count"]) is not int
+        or audit_validation["event_count"] < 2
+    ):
+        raise ValueError("audit validation evidence is not terminal-success")
+    independently_validated_audit = validate_audit_log(
+        run_dir / "evidence/audit.jsonl",
+        expected_policy_sha256=audit_validation["policy_sha256"],
+    )
+    if canonical_json_bytes(dict(independently_validated_audit)) != canonical_json_bytes(
+        audit_validation
+    ):
+        raise ValueError("audit validation evidence disagrees with the audit log")
+
+    source_raw = _read_regular_file(
+        run_dir / "evidence/source-snapshot.json",
+        "source snapshot evidence",
+    )
+    source_manifest = _load_source_snapshot_manifest(source_raw)
+    code = manifest["code"]
+    assert type(code) is dict
+    if source_manifest["commit"] != code["git_commit"]:
+        raise ValueError("source snapshot evidence disagrees with the code commit")
+    if source_manifest["snapshot_sha256"] != runner_config["source_snapshot_sha256"]:
+        raise ValueError("source snapshot evidence disagrees with resolved config")
+
+    logical = _read_canonical_output_json(
+        run_dir / "evidence/materialization-logical.json",
+        noun="materialization evidence",
+    )
+    if type(logical) is not dict or set(logical) != {
+        "schema",
+        "method_id",
+        "method_config_id",
+        "execution_profile",
+        "method_config_sha256",
+        "methods_registry_protocol_sha256",
+        "semantic_sha256",
+        "materialized_config_sha256",
+        "dataset_identity_sha256",
+        "measurements_file_sha256",
+        "expected_acquisition_spec",
+        "algorithm_seed",
+        "checkpoint_sha256",
+        "source_inventory",
+        "source_snapshot_sha256",
+        "requested_runtime_device",
+        "child_runtime_device",
+        "entrypoint",
+        "command_template",
+    } or logical.get("schema") != "materialized-method-execution-v1":
+        raise ValueError("materialization evidence schema is invalid")
+    if hashlib.sha256(canonical_json_bytes(logical)).hexdigest() != (
+        runner_config["materialization_logical_sha256"]
+    ):
+        raise ValueError("materialization evidence is not identity-bound")
+    protocol = manifest["protocol"]
+    inputs = manifest["inputs"]
+    execution = manifest["execution"]
+    assert all(type(item) is dict for item in (protocol, inputs, execution))
+    if (
+        logical.get("method_id") != protocol["method"]
+        or logical.get("method_config_sha256")
+        != config.get("method_config_sha256")
+        or logical.get("dataset_identity_sha256")
+        != inputs["dataset_identity_sha256"]
+        or logical.get("measurements_file_sha256")
+        != inputs["measurements_file_sha256"]
+        or logical.get("checkpoint_sha256") != inputs["checkpoints"]
+        or logical.get("command_template") != execution["command"]
+        or logical.get("method_config_sha256")
+        != config.get("method_config_sha256")
+    ):
+        raise ValueError("materialization evidence disagrees with the manifest")
+    source_inventory = source_manifest["inventory"]
+    assert type(source_inventory) is list
+    full_sources = {
+        item["path"]: item["sha256"]
+        for item in source_inventory
+        if type(item) is dict
+    }
+    selected_sources = logical.get("source_inventory")
+    if type(selected_sources) is not list or not selected_sources:
+        raise ValueError("materialization source inventory is invalid")
+    for item in selected_sources:
+        if (
+            type(item) is not dict
+            or set(item) != {"path", "sha256"}
+            or full_sources.get(item["path"]) != item["sha256"]
+        ):
+            raise ValueError("materialization source inventory is not in the snapshot")
+    selected_digest = sha256_bytes(canonical_json_bytes(selected_sources))
+    if logical.get("source_snapshot_sha256") != selected_digest:
+        raise ValueError("materialization source projection hash is invalid")
+    if (
+        logical.get("requested_runtime_device")
+        != runner_config["requested_runtime_device"]
+        or selected_digest != runner_config["source_projection_sha256"]
+        or logical.get("child_runtime_device")
+        != ("cpu" if logical.get("requested_runtime_device") == "cpu" else "cuda:0")
+    ):
+        raise ValueError("materialization evidence disagrees with resolved config")
+
+    resource = _read_canonical_output_json(
+        run_dir / "evidence/resource-sampling.json",
+        noun="resource sampling evidence",
+    )
+    if type(resource) is not dict or set(resource) != {
+        "schema",
+        "status",
+        "backend",
+        "sampling_interval_ms",
+        "sample_count",
+        "peak_vram_bytes",
+        "runtime_seconds",
+        "compute_cap",
+        "requested_runtime_device",
+    }:
+        raise ValueError("resource sampling evidence shape is invalid")
+    _validate_exact_json(resource)
+    requested_device = logical.get("requested_runtime_device")
+    is_cuda = (
+        type(requested_device) is str
+        and _RUNTIME_DEVICE.fullmatch(requested_device) is not None
+        and requested_device.startswith("cuda:")
+    )
+    expected_backend = (
+        "windows-gpu-process-memory-dedicated-usage-v1"
+        if is_cuda
+        else "cpu-no-vram-sampling-v1"
+        if requested_device == "cpu"
+        else None
+    )
+    expected_interval = _VRAM_SAMPLING_INTERVAL_MS if is_cuda else 0
+    if (
+        resource["schema"] != "run-resource-sampling-v1"
+        or resource["status"] != "complete"
+        or resource["backend"] != expected_backend
+        or resource["sampling_interval_ms"] != expected_interval
+        or resource["requested_runtime_device"] != requested_device
+        or resource["peak_vram_bytes"] != execution["peak_vram_bytes"]
+        or resource["runtime_seconds"] != execution["runtime_seconds"]
+        or type(resource["sample_count"]) is not int
+        or (
+            resource["sample_count"] < 1
+            if is_cuda
+            else resource["sample_count"] != 0
+        )
+        or type(resource["peak_vram_bytes"]) is not int
+        or resource["peak_vram_bytes"] < 0
+        or (requested_device == "cpu" and resource["peak_vram_bytes"] != 0)
+        or type(resource["runtime_seconds"]) not in (int, float)
+        or not math.isfinite(resource["runtime_seconds"])
+        or resource["runtime_seconds"] < 0
+    ):
+        raise ValueError("resource sampling evidence disagrees with execution")
+    compute_cap = resource["compute_cap"]
+    if (
+        type(compute_cap) is not dict
+        or set(compute_cap) != {
+            "wall_time_seconds",
+            "peak_vram_bytes",
+            "on_exceed",
+        }
+        or type(compute_cap["wall_time_seconds"]) is not int
+        or compute_cap["wall_time_seconds"] <= 0
+        or type(compute_cap["peak_vram_bytes"]) is not int
+        or compute_cap["peak_vram_bytes"] <= 0
+        or compute_cap["on_exceed"] != "ineligible-retain-artifacts"
+        or compute_cap != runner_config["compute_cap"]
+        or resource["runtime_seconds"] > compute_cap["wall_time_seconds"]
+        or resource["peak_vram_bytes"] > compute_cap["peak_vram_bytes"]
+    ):
+        raise ValueError("resource sampling compute cap is invalid")
+
+    metrics = _read_canonical_output_json(
+        run_dir / "outputs/metrics.json",
+        noun="metrics evidence",
+    )
+    _validate_exact_json(metrics)
+    if (
+        type(metrics) is not dict
+        or metrics.get("definition_version") != manifest["metric_version"]
+    ):
+        raise ValueError("metrics evidence version disagrees with the manifest")
+    reconstruction = load_reconstruction_v2(
+        run_dir / "outputs/reconstruction.npz"
+    )
+    method_info = load_method_info_v2(run_dir / "outputs/method-info.json")
+    method_info_contract = runner_config["method_info_contract"]
+    if type(method_info_contract) is not dict:
+        raise ValueError("identity-bound method info contract is invalid")
+    validate_method_info_contract_v1(method_info, method_info_contract)
+    auxiliary_contract = method_info_contract["auxiliary_arrays"]
+    assert type(auxiliary_contract) is dict
+    expected_dgi = auxiliary_contract["dgi"] == "required"
+    if (reconstruction.dgi is not None) is not expected_dgi:
+        raise ValueError(
+            "reconstruction auxiliary arrays disagree with identity contract"
+        )
+    if protocol["method"] == "dgi":
+        assert reconstruction.dgi is not None
+        if not np.array_equal(
+            reconstruction.dgi,
+            reconstruction.reconstruction[0],
+        ) or not np.all(
+            reconstruction.reconstruction
+            == reconstruction.reconstruction[0]
+        ):
+            raise ValueError("DGI reconstruction auxiliary evidence is invalid")
+    reconstruction_descriptor = next(
+        item for item in artifacts if item["role"] == "reconstruction"
+    )
+    if (
+        reconstruction.method_id != protocol["method"]
+        or reconstruction.dataset_identity_sha256
+        != inputs["dataset_identity_sha256"]
+        or method_info["method_id"] != protocol["method"]
+        or method_info["dataset_identity_sha256"]
+        != inputs["dataset_identity_sha256"]
+        or method_info["measurements_file_sha256"]
+        != inputs["measurements_file_sha256"]
+        or method_info["method_config_sha256"]
+        != config["method_config_sha256"]
+        or method_info["reconstruction"]["sha256"]
+        != reconstruction_descriptor["sha256"]
+        or method_info["reconstruction"]["array_descriptors"]
+        != reconstruction.array_descriptors
+    ):
+        raise ValueError("core method outputs disagree with run provenance")
+    checkpoint_records = method_info["checkpoints"]
+    checkpoint_mapping = {
+        item["logical_id"]: item["sha256"] for item in checkpoint_records
+    }
+    if checkpoint_mapping != inputs["checkpoints"]:
+        raise ValueError("method output checkpoints disagree with run inputs")
+    expected_seed = derive_algorithm_seed(
+        cell_seed=protocol["seed"],
+        dataset_identity_sha256=inputs["dataset_identity_sha256"],
+        method_id=protocol["method"],
+        method_config_sha256=config["method_config_sha256"],
+    )
+    expected_seed_record = {
+        "derivation_sha256": expected_seed.derivation_sha256,
+        "seed_u32": expected_seed.seed_u32,
+    }
+    info_seed = dict(method_info["algorithm_seed"])
+    info_seed.pop("domain", None)
+    expected_acquisition = logical["expected_acquisition_spec"]
+    _validate_blind_acquisition_spec(expected_acquisition)
+    dimensions = expected_acquisition["dimensions"]
+    acquisition = expected_acquisition["acquisition"]
+    if (
+        logical["methods_registry_protocol_sha256"]
+        != METHODS_REGISTRY_PROTOCOL_SHA256
+        or type(logical["semantic_sha256"]) is not str
+        or _SHA256.fullmatch(logical["semantic_sha256"]) is None
+        or type(logical["materialized_config_sha256"]) is not str
+        or _SHA256.fullmatch(logical["materialized_config_sha256"]) is None
+        or logical["method_config_id"] != method_info["method_config_id"]
+        or logical["execution_profile"] != method_info["execution_profile"]
+        or logical["algorithm_seed"] != expected_seed_record
+        or info_seed != expected_seed_record
+        or logical["checkpoint_sha256"] != inputs["checkpoints"]
+        or logical["entrypoint"] != logical["command_template"][1]
+        or dimensions["T"] != reconstruction.reconstruction.shape[0]
+        or dimensions["H"] != reconstruction.reconstruction.shape[1]
+        or dimensions["W"] != reconstruction.reconstruction.shape[2]
+        or dimensions["K"] != manifest["measurement"]["train_count"]
+        or dimensions["holdout_K"]
+        != manifest["measurement"]["holdout_count"]
+        or acquisition["pattern_family"]
+        != manifest["measurement"]["pattern_family"]
+        or acquisition["noise_sigma_absolute"]
+        != manifest["measurement"]["noise_sigma_absolute"]
+        or method_info["semantic_config"].get("compute_cap")
+        != runner_config["compute_cap"]
+    ):
+        raise ValueError("materialization identity disagrees with core evidence")
+    validate_metrics_v1_payload(metrics, reconstruction.reconstruction)
+    verified_dataset = _verify_complete_dataset_root(
+        artifact_root,
+        run_dir,
+        manifest,
+        runner_config=runner_config,
+    )
+    expected_metrics = evaluate_video_global_affine(
+        verified_dataset.truth.gt_frames,
+        reconstruction.reconstruction,
+    )
+    if canonical_json_bytes(metrics) != canonical_json_bytes(expected_metrics):
+        raise ValueError(
+            "metrics evidence disagrees with independent dataset-truth evaluation"
+        )
+
+
+def _verify_complete_dataset_root(
+    artifact_root: Path,
+    run_dir: Path,
+    manifest: Mapping[str, object],
+    *,
+    runner_config: Mapping[str, object],
+):
+    if not isinstance(artifact_root, Path):
+        raise TypeError("artifact_root must be a Path")
+    root = artifact_root.absolute()
+    identity = manifest["identity_sha256"]
+    if run_dir.absolute() != root / "runs" / identity:
+        raise ValueError("complete run is outside the explicit artifact root")
+    inputs = manifest["inputs"]
+    assert type(inputs) is dict
+    dataset_identity = inputs["dataset_identity_sha256"]
+    dataset_dir = root / "datasets" / dataset_identity
+    discovery = discover_dataset_directories(root)
+    if dataset_dir not in discovery.canonical_directories:
+        raise ValueError(
+            "complete run dataset is not a canonical artifact-root dataset"
+        )
+    verified = verify_dataset_directory(
+        dataset_dir,
+        expected_dataset_identity_sha256=dataset_identity,
+        expected_dataset_manifest_sha256=inputs["dataset_manifest_sha256"],
+    )
+    dataset_input_contract = runner_config["dataset_input_contract"]
+    expected_dataset_input_contract = build_dataset_input_contract(verified)
+    if (
+        type(dataset_input_contract) is not dict
+        or dataset_input_contract != expected_dataset_input_contract
+        or dataset_input_contract != {
+            "dataset_manifest_sha256": inputs[
+                "dataset_manifest_sha256"
+            ],
+            "measurements_file_sha256": inputs[
+                "measurements_file_sha256"
+            ],
+            "evaluation_truth_file_sha256": inputs[
+                "evaluation_truth_file_sha256"
+            ],
+            "measurement": manifest["measurement"],
+        }
+    ):
+        raise ValueError(
+            "identity-bound dataset input contract disagrees with dataset"
+        )
+    protocol = manifest["protocol"]
+    assert type(protocol) is dict
+    validate_dataset_protocol_binding(
+        verified.manifest,
+        scientific_contract_id=protocol["scientific_contract_id"],
+        scientific_contract_sha256=protocol[
+            "scientific_contract_sha256"
+        ],
+        target_id=protocol["target"],
+        motion_id=protocol["motion"],
+        seed=protocol["seed"],
+        assets_sha256=inputs["assets"],
+    )
+    if manifest["measurement"] != dataset_measurement_record(
+        verified.manifest
+    ):
+        raise ValueError(
+            "run measurement evidence disagrees with canonical dataset"
+        )
+    payload_evidence = verified.payload_evidence
+    if (
+        payload_evidence["measurements.npz"].sha256
+        != inputs["measurements_file_sha256"]
+        or payload_evidence["evaluation-truth.npz"].sha256
+        != inputs["evaluation_truth_file_sha256"]
+    ):
+        raise ValueError(
+            "complete run dataset payload hashes disagree with manifest inputs"
+        )
+    verify_canonical_dataset_directory_discovery(discovery)
+    return verified
+
+
+def _read_canonical_output_json(path: Path, *, noun: str) -> object:
+    raw = _read_regular_file(path, noun)
+    try:
+        value = json.loads(
+            raw.decode("utf-8", errors="strict"),
+            object_pairs_hook=_unique_object,
+            parse_constant=lambda token: (_ for _ in ()).throw(
+                ValueError(f"non-finite JSON constant: {token}")
+            ),
+        )
+    except (UnicodeError, ValueError) as error:
+        raise ValueError(f"{noun} is not canonical JSON") from error
+    if raw != canonical_json_bytes(value):
+        raise ValueError(f"{noun} is not canonical JSON")
+    return value
 
 
 def _validate_manifest_semantics(manifest: Mapping[str, object], *, identity: RunIdentity | None) -> None:
@@ -552,14 +1181,7 @@ def _validate_relative_path(value: object) -> None:
     if path.is_absolute() or any(part in ("", ".", "..") for part in raw_parts):
         raise ValueError("output path contains an unsafe component")
     for part in path.parts:
-        stem = part.split(".", 1)[0].rstrip(" ").casefold()
-        if (
-            ":" in part
-            or part.rstrip(". ") != part
-            or stem in _RESERVED_WINDOWS_NAMES
-            or any(ord(char) < 32 or char in '*?"<>|' for char in part)
-        ):
-            raise ValueError("output path contains a Windows-unsafe component")
+        windows_component_collision_key(part)
 
 
 def _load_unique_json(path: Path) -> tuple[_SafeRead, object]:
@@ -590,6 +1212,7 @@ def _snapshot(info: os.stat_result) -> _StatSnapshot:
         info.st_size,
         info.st_mtime_ns,
         info.st_ctime_ns,
+        info.st_nlink,
     )
 
 
@@ -608,6 +1231,8 @@ def _open_regular_file(
         if (
             not stat.S_ISREG(before_link.st_mode)
             or not stat.S_ISREG(before.st_mode)
+            or before_link.st_nlink != 1
+            or before.st_nlink != 1
         ):
             raise ValueError(f"{noun} is not a regular file: {path}")
         flags = (
@@ -628,6 +1253,7 @@ def _open_regular_file(
         # stronger writer-side isolation needed against hostile concurrent writes.
         if (
             not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
             or _snapshot(before_link)[:2] != _snapshot(opened)[:2]
             or _snapshot(before)[:2] != _snapshot(opened)[:2]
         ):
@@ -746,7 +1372,10 @@ def _directory_inventory(root: Path) -> frozenset[tuple[str, _StatSnapshot]]:
         for name in [*directories, *files]:
             path = current_path / name
             _reject_linked_path(path)
-            entries.add((path.relative_to(root).as_posix(), _snapshot(os.lstat(path))))
+            info = os.lstat(path)
+            if stat.S_ISREG(info.st_mode) and info.st_nlink != 1:
+                raise ValueError(f"output file has a hardlink alias: {path}")
+            entries.add((path.relative_to(root).as_posix(), _snapshot(info)))
     return frozenset(entries)
 
 

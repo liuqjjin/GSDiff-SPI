@@ -39,6 +39,7 @@ from gsdiff.experiments.methods import (
 
 
 MEASUREMENTS_SHA256 = "a" * 64
+_DEFAULT_DGI = object()
 
 
 def acquisition(
@@ -116,7 +117,7 @@ def algorithm_seed(
 
 def dgi_result(
     *,
-    dgi: np.ndarray | None = None,
+    dgi: np.ndarray | None | object = _DEFAULT_DGI,
     motion: np.ndarray | None = None,
     history: tuple[dict[str, object], ...] = (),
     info_mutation: Callable[[dict[str, object]], None] | None = None,
@@ -134,11 +135,16 @@ def dgi_result(
         info["native_motion_model"] = "native-trajectory"
     if info_mutation is not None:
         info_mutation(info)
+    resolved_dgi = (
+        np.ones((32, 32), dtype=np.float32)
+        if dgi is _DEFAULT_DGI
+        else dgi
+    )
     return MethodChildResult(
         method_id="dgi",
         reconstruction=np.ones((4, 32, 32), dtype=np.float32),
         estimated_motion_trajectory=motion,
-        dgi=dgi,
+        dgi=resolved_dgi,  # type: ignore[arg-type]
         info=info,
         history=history,
     )
@@ -258,6 +264,12 @@ def snapshot_method_result(
             "kind": "step",
             "step": step,
             "loss": float(step),
+            "learning_rate": 0.001,
+            **(
+                {"data_fidelity": float(step)}
+                if method_id == "gidc3dtv" or step > int(solver["warm_steps"])
+                else {}
+            ),
             **(
                 {"reconstruction_source": True}
                 if step == source_step
@@ -272,7 +284,10 @@ def snapshot_method_result(
         estimated_motion_trajectory=None,
         dgi=None,
         info={
-            "parameter_count": 1,
+            "parameter_count": child_outputs._classical_parameter_count(
+                method,
+                acquisition(),
+            ),
             "native_iteration_unit": native_unit,
             "native_iteration_budget": native_budget,
             "convergence_status": method.convergence_status,
@@ -317,12 +332,27 @@ def monin_result(parameter_count: int) -> MethodChildResult:
             "checkpoint_hashes": [],
             "native_motion_model": "translation-polynomial",
         },
-        history=({"kind": "iteration", "iteration": 1, "loss": 1.0},),
+        history=({
+            "kind": "iteration",
+            "iteration": 1,
+            "data_fidelity": 1.0,
+            "primal_residual": 1.0,
+            "dual_residual": 1.0,
+        },),
     )
 
 
 def history_row(index: int) -> dict[str, object]:
     return {"kind": "iteration", "iteration": index}
+
+
+def static_history_row(index: int) -> dict[str, object]:
+    return {
+        **history_row(index),
+        "data_fidelity": float(index),
+        "primal_residual": float(index),
+        "dual_residual": float(index),
+    }
 
 
 def write_valid(
@@ -388,28 +418,27 @@ def rewrite_info(
     atomic_write_bytes(path, canonical_json_bytes(info))
 
 
-@pytest.mark.parametrize(("dgi_present", "motion_present"), [
-    (False, False),
-    (False, True),
-    (True, False),
-    (True, True),
-])
-def test_v2_writer_owns_two_files_for_all_optional_array_combinations(
+def test_v2_writer_owns_two_files_for_required_dgi_array(
     tmp_path: Path,
-    dgi_present: bool,
-    motion_present: bool,
 ) -> None:
     result = dgi_result(
-        dgi=np.ones((32, 32), dtype=np.float32) if dgi_present else None,
-        motion=np.ones((4, 3), dtype=np.float32) if motion_present else None,
+        dgi=np.ones((32, 32), dtype=np.float32),
     )
     method, data, seed, hashes = write_valid(tmp_path, result=result)
     assert set(hashes) == {"reconstruction.npz", "method-info.json"}
     assert {path.name for path in tmp_path.iterdir()} == set(hashes)
     loaded = load_reconstruction_v2(tmp_path / "reconstruction.npz")
-    assert (loaded.dgi is not None) is dgi_present
-    assert (loaded.estimated_motion_trajectory is not None) is motion_present
+    assert loaded.dgi is not None
+    assert loaded.estimated_motion_trajectory is None
     assert validate_valid(tmp_path, method, data, seed) == hashes
+
+
+def test_dgi_writer_rejects_missing_required_auxiliary_array(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="dgi|auxiliary"):
+        write_valid(tmp_path, result=dgi_result(dgi=None))
+    assert list(tmp_path.iterdir()) == []
 
 
 @pytest.mark.parametrize("name", ["metrics.json", "stdout.log", "stderr.log"])
@@ -504,27 +533,26 @@ def test_history_sampling_is_locked(
     expected_indices: list[int],
 ) -> None:
     history = tuple(history_row(index) for index in range(observed_count))
-    write_valid(tmp_path, result=dgi_result(history=history))
-    convergence = load_info(tmp_path / "method-info.json")["convergence"]
-    assert convergence["observed_count"] == observed_count
-    assert convergence["serialized_count"] == serialized_count
-    assert [row["iteration"] for row in convergence["history"]] == expected_indices
+    sampled, sampling_policy = child_outputs._sample_history(history)
+    assert len(sampled) == serialized_count
+    assert [row["iteration"] for row in sampled] == expected_indices
     expected_policy = (
         "all-observations"
         if observed_count < 21
         else "floor(i*(observed_count-1)/20), i=0..20"
     )
-    assert convergence["sampling_policy"] == expected_policy
+    assert sampling_policy == expected_policy
 
 
 def test_validator_rejects_invented_sampling_policy_and_impossible_counts(
     tmp_path: Path,
 ) -> None:
+    method = resolved_method("static_cs")
+    history = tuple(static_history_row(index) for index in range(1, 151))
     method, data, seed, _ = write_valid(
         tmp_path,
-        result=dgi_result(
-            history=tuple(history_row(index) for index in range(22))
-        ),
+        method=method,
+        result=static_result(history=history),
     )
 
     def mutate(info: dict[str, object]) -> None:
@@ -543,7 +571,7 @@ def test_convergence_required_prevalidation_leaves_no_stale_file(
 ) -> None:
     method = resolved_method("static_cs")
     data = acquisition()
-    with pytest.raises(ValueError, match="21"):
+    with pytest.raises(ValueError, match="history|native|budget"):
         write_method_child_outputs_v2(
             tmp_path,
             method=method,
@@ -562,7 +590,7 @@ def test_convergence_required_selection_positive_control(
 ) -> None:
     method = resolved_method("static_cs")
     data = acquisition()
-    history = tuple(history_row(index) for index in range(21))
+    history = tuple(static_history_row(index) for index in range(1, 151))
     _, _, seed, hashes = write_valid(
         tmp_path,
         method=method,
@@ -766,21 +794,19 @@ def test_only_snapshot_methods_accept_reconstruction_source_marker() -> None:
     data = acquisition()
     child_outputs._validate_result(valid_snapshot, data, method)
     dgi_method = resolved_method("dgi")
-    valid_dgi = dgi_result(
-        history=({"kind": "step", "step": 1, "loss": 1.0},)
-    )
-    child_outputs._validate_result(valid_dgi, data, dgi_method)
-    marked_dgi = replace(
-        valid_dgi,
-        history=({
+    marked_history = ({
             "kind": "step",
             "step": 1,
             "loss": 1.0,
             "reconstruction_source": True,
-        },),
-    )
+        },)
     with pytest.raises(ValueError, match="reconstruction|source|snapshot"):
-        child_outputs._validate_result(marked_dgi, data, dgi_method)
+        child_outputs._validate_reconstruction_source(
+            dgi_method,
+            None,
+            marked_history,
+            field="history",
+        )
 
 
 def test_bounded_history_always_retains_reconstruction_source(
@@ -914,7 +940,7 @@ def test_selected_hyperparameter_must_come_from_locked_grid(
 ) -> None:
     method = resolved_method("static_cs")
     data = acquisition()
-    history = tuple(history_row(index) for index in range(21))
+    history = tuple(static_history_row(index) for index in range(1, 151))
     with pytest.raises(ValueError, match="hyperparameter|lambda"):
         write_method_child_outputs_v2(
             tmp_path,

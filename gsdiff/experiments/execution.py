@@ -366,53 +366,16 @@ def materialize_method_execution(
             {"path": relative.as_posix(), "sha256": digest}
         )
 
-    semantic = _method_semantic_document(method)
-    semantic_sha256 = hashlib.sha256(
-        canonical_json_bytes(semantic)
-    ).hexdigest()
-    runtime_checkpoints = {
-        requirement.logical_id: {
-            "path": checkpoint_destinations[
-                requirement.logical_id
-            ].relative_to(stage).as_posix(),
-            "sha256": requirement.sha256,
-        }
-        for requirement in method.checkpoint_requirements
-    }
-    config_document = {
-        "schema": "materialized-method-config-v1",
-        "methods_registry_protocol_sha256": (
-            METHODS_REGISTRY_PROTOCOL_SHA256
-        ),
-        "semantic": semantic,
-        "semantic_sha256": semantic_sha256,
-        "request": {
-            "method_id": method.method_id,
-            "method_config_id": method.method_config_id,
-            "execution_profile": method.execution_profile,
-            "method_config_sha256": method.method_config_sha256,
-            "methods_registry_protocol_sha256": (
-                METHODS_REGISTRY_PROTOCOL_SHA256
-            ),
-            "semantic_sha256": semantic_sha256,
-            "dataset_identity_sha256": dataset_hash,
-            "measurements_file_sha256": measurement_hash,
-            "expected_acquisition_spec": thaw_json(
-                frozen_acquisition_spec
-            ),
-            "algorithm_seed": {
-                "derivation_sha256": algorithm_seed.derivation_sha256,
-                "seed_u32": algorithm_seed.seed_u32,
-            },
-        },
-        "runtime": {
-            "measurements_path": "input/measurements.npz",
-            "child_output_dir": "child-output",
-            "checkpoints": runtime_checkpoints,
-            "requested_runtime_device": requested_device,
-            "child_runtime_device": child_device,
-        },
-    }
+    config_document, _predicted_logical = _materialization_identity_documents(
+        method=method,
+        dataset_identity_sha256=dataset_hash,
+        measurements_file_sha256=measurement_hash,
+        expected_acquisition_spec=frozen_acquisition_spec,
+        algorithm_seed=algorithm_seed,
+        source_inventory=source_inventory,
+        requested_runtime_device=requested_device,
+    )
+    semantic_sha256 = config_document["semantic_sha256"]
     config_bytes = canonical_json_bytes(config_document)
     config_sha256 = _exclusive_write_bytes(
         paths["method_config"],
@@ -605,40 +568,17 @@ def materialize_method_execution(
         expected_files=expected_stage_files,
     )
 
-    source_snapshot_sha256 = hashlib.sha256(
-        canonical_json_bytes(source_inventory)
-    ).hexdigest()
-    logical_record = {
-        "schema": "materialized-method-execution-v1",
-        "method_id": method.method_id,
-        "method_config_id": method.method_config_id,
-        "execution_profile": method.execution_profile,
-        "method_config_sha256": method.method_config_sha256,
-        "methods_registry_protocol_sha256": (
-            METHODS_REGISTRY_PROTOCOL_SHA256
-        ),
-        "semantic_sha256": semantic_sha256,
-        "materialized_config_sha256": config_sha256,
-        "dataset_identity_sha256": dataset_hash,
-        "measurements_file_sha256": measurement_hash,
-        "expected_acquisition_spec": thaw_json(
-            frozen_acquisition_spec
-        ),
-        "algorithm_seed": {
-            "derivation_sha256": algorithm_seed.derivation_sha256,
-            "seed_u32": algorithm_seed.seed_u32,
-        },
-        "checkpoint_sha256": {
-            requirement.logical_id: requirement.sha256
-            for requirement in method.checkpoint_requirements
-        },
-        "source_inventory": source_inventory,
-        "source_snapshot_sha256": source_snapshot_sha256,
-        "requested_runtime_device": requested_device,
-        "child_runtime_device": child_device,
-        "entrypoint": selected_entrypoint,
-        "command_template": list(method.command_template),
-    }
+    rebuilt_config, logical_record = _materialization_identity_documents(
+        method=method,
+        dataset_identity_sha256=dataset_hash,
+        measurements_file_sha256=measurement_hash,
+        expected_acquisition_spec=frozen_acquisition_spec,
+        algorithm_seed=algorithm_seed,
+        source_inventory=source_inventory,
+        requested_runtime_device=requested_device,
+    )
+    if canonical_json_bytes(rebuilt_config) != final_config_bytes:
+        raise ValueError("predicted materialized config changed")
     runtime_record = {
         "stage_root": str(stage),
         "cwd": str(paths["code"]),
@@ -1528,6 +1468,103 @@ def _method_semantic_document(
         "execution_profile": method.execution_profile,
         "profile_policy": payload["profile_policy"],
     }
+
+
+def _materialization_identity_documents(
+    *,
+    method: ResolvedMethod,
+    dataset_identity_sha256: str,
+    measurements_file_sha256: str,
+    expected_acquisition_spec: Mapping[str, object],
+    algorithm_seed: AlgorithmSeed,
+    source_inventory: list[dict[str, str]],
+    requested_runtime_device: str,
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Build the path-stable config and 19-field logical identity documents."""
+    requested_device, child_device, _physical_cuda = _runtime_device(
+        requested_runtime_device
+    )
+    entrypoint = _validate_command_template(method, Path("python"))
+    semantic = _method_semantic_document(method)
+    semantic_sha256 = hashlib.sha256(
+        canonical_json_bytes(semantic)
+    ).hexdigest()
+    checkpoint_sha256 = {
+        requirement.logical_id: requirement.sha256
+        for requirement in method.checkpoint_requirements
+    }
+    runtime_checkpoints = {
+        logical_id: {
+            "path": (
+                "checkpoints/"
+                + hashlib.sha256(
+                    logical_id.encode("utf-8", errors="strict")
+                ).hexdigest()
+                + ".checkpoint"
+            ),
+            "sha256": digest,
+        }
+        for logical_id, digest in checkpoint_sha256.items()
+    }
+    acquisition = thaw_json(expected_acquisition_spec)
+    seed = {
+        "derivation_sha256": algorithm_seed.derivation_sha256,
+        "seed_u32": algorithm_seed.seed_u32,
+    }
+    config_document = {
+        "schema": "materialized-method-config-v1",
+        "methods_registry_protocol_sha256": METHODS_REGISTRY_PROTOCOL_SHA256,
+        "semantic": semantic,
+        "semantic_sha256": semantic_sha256,
+        "request": {
+            "method_id": method.method_id,
+            "method_config_id": method.method_config_id,
+            "execution_profile": method.execution_profile,
+            "method_config_sha256": method.method_config_sha256,
+            "methods_registry_protocol_sha256": METHODS_REGISTRY_PROTOCOL_SHA256,
+            "semantic_sha256": semantic_sha256,
+            "dataset_identity_sha256": dataset_identity_sha256,
+            "measurements_file_sha256": measurements_file_sha256,
+            "expected_acquisition_spec": acquisition,
+            "algorithm_seed": seed,
+        },
+        "runtime": {
+            "measurements_path": "input/measurements.npz",
+            "child_output_dir": "child-output",
+            "checkpoints": runtime_checkpoints,
+            "requested_runtime_device": requested_device,
+            "child_runtime_device": child_device,
+        },
+    }
+    config_sha256 = hashlib.sha256(
+        canonical_json_bytes(config_document)
+    ).hexdigest()
+    inventory = [dict(item) for item in source_inventory]
+    source_snapshot_sha256 = hashlib.sha256(
+        canonical_json_bytes(inventory)
+    ).hexdigest()
+    logical_record = {
+        "schema": "materialized-method-execution-v1",
+        "method_id": method.method_id,
+        "method_config_id": method.method_config_id,
+        "execution_profile": method.execution_profile,
+        "method_config_sha256": method.method_config_sha256,
+        "methods_registry_protocol_sha256": METHODS_REGISTRY_PROTOCOL_SHA256,
+        "semantic_sha256": semantic_sha256,
+        "materialized_config_sha256": config_sha256,
+        "dataset_identity_sha256": dataset_identity_sha256,
+        "measurements_file_sha256": measurements_file_sha256,
+        "expected_acquisition_spec": acquisition,
+        "algorithm_seed": seed,
+        "checkpoint_sha256": checkpoint_sha256,
+        "source_inventory": inventory,
+        "source_snapshot_sha256": source_snapshot_sha256,
+        "requested_runtime_device": requested_device,
+        "child_runtime_device": child_device,
+        "entrypoint": entrypoint,
+        "command_template": list(method.command_template),
+    }
+    return config_document, logical_record
 
 
 def _is_link_or_reparse(info: os.stat_result) -> bool:
@@ -2634,8 +2671,9 @@ def _fresh_child_environment(
         "TORCH_HOME": str(work_directories["torch"]),
         "MPLCONFIGDIR": str(work_directories["matplotlib"]),
     }
-    if physical_cuda is not None:
-        environment["CUDA_VISIBLE_DEVICES"] = physical_cuda
+    environment["CUDA_VISIBLE_DEVICES"] = (
+        "-1" if physical_cuda is None else physical_cuda
+    )
     return MappingProxyType(environment)
 
 

@@ -37,6 +37,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 BUILD_DATASETS_SCRIPT = (
     REPO_ROOT / "scripts" / "experiments" / "build_datasets.py"
 )
+RUN_CAMPAIGN_SCRIPT = REPO_ROOT / "scripts" / "experiments" / "run_campaign.py"
 CONTROLLED_RUNTIME = {
     "dependencies_sha256": "1" * 64,
     "environment_lock_sha256": "2" * 64,
@@ -63,6 +64,591 @@ def _load_build_datasets_cli():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def _load_run_campaign_cli():
+    spec = importlib.util.spec_from_file_location(
+        "gsdiff_run_campaign_cli",
+        RUN_CAMPAIGN_SCRIPT,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_campaign_device_vocabulary_requires_indexed_cuda():
+    parser = _load_run_campaign_cli()._parser()
+
+    parsed = parser.parse_args(
+        [
+            "--protocol",
+            str(REPO_ROOT / "configs/protocols/pilot-v1.yaml"),
+            "--device",
+            "cuda:0",
+        ]
+    )
+    assert parsed.device == "cuda:0"
+    for alias in ("cuda", "cuda:00", "cuda:01"):
+        with pytest.raises(SystemExit):
+            parser.parse_args(
+                [
+                    "--protocol",
+                    str(REPO_ROOT / "configs/protocols/pilot-v1.yaml"),
+                    "--device",
+                    alias,
+                ]
+            )
+
+
+def test_campaign_runtime_metadata_uses_requested_cuda_index(monkeypatch):
+    import torch
+
+    cli = _load_run_campaign_cli()
+    observed = []
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_name",
+        lambda index: observed.append(index) or f"gpu-{index}",
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+    runtime = {
+        "python_version": "3.12",
+        "torch_version": "2.8",
+        "cuda_version": "12.8",
+        "gpu_name": "gpu-0",
+        "os": "Windows",
+    }
+
+    metadata = cli._runtime_manifest(runtime, "cuda:1")
+
+    assert metadata["gpu"] == "gpu-1"
+    assert observed == [1]
+
+
+def test_out_of_range_cuda_is_refused_before_artifacts_or_source_access(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    import torch
+
+    cli = _load_run_campaign_cli()
+    artifact_root = tmp_path / "must-not-be-created"
+    campaign = {
+        "document_kind": "campaign",
+        "execution_ready": True,
+        "method_budgets": {"dgi": 1},
+    }
+    monkeypatch.setattr(cli, "load_protocol", lambda path: campaign)
+    monkeypatch.setattr(
+        cli,
+        "_require_versioned_budget_contract",
+        lambda value: None,
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("invalid CUDA index reached source/artifact access")
+
+    monkeypatch.setattr(torch.cuda, "get_device_name", forbidden)
+    monkeypatch.setattr(cli, "git_state", forbidden)
+
+    return_code = cli.main(
+        [
+            "--protocol",
+            str(tmp_path / "ready.yaml"),
+            "--artifact-root",
+            str(artifact_root),
+            "--device",
+            "cuda:999999",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert return_code == 1
+    assert captured.out == ""
+    assert captured.err == "campaign execution refused: ValueError\n"
+    assert not artifact_root.exists()
+
+
+def test_campaign_preserves_authoritative_multi_asset_logical_mapping():
+    cli = _load_run_campaign_cli()
+    assets = {
+        "descriptor": "1" * 64,
+        "font": "1" * 64,
+        "renderer": "1" * 64,
+    }
+    target = {
+        "id": "digit5",
+        "descriptor": "char:5",
+        "assets_sha256": assets,
+    }
+
+    assert cli._identity_asset_mapping(target) == assets
+
+
+def test_campaign_projects_file_asset_path_to_target_identity_key():
+    cli = _load_run_campaign_cli()
+    digest = "2" * 64
+    target = {
+        "id": "tank",
+        "descriptor": "assets/tank.png",
+        "assets_sha256": {"assets/tank.png": digest},
+    }
+
+    assert cli._identity_asset_mapping(target) == {"tank": digest}
+
+
+def test_ready_campaign_planner_uses_authoritative_blind_acquisition_spec():
+    cli = _load_run_campaign_cli()
+
+    assert (
+        cli._run_ready_campaign.__globals__["blind_acquisition_spec"]
+        is blind_acquisition_spec
+    )
+
+
+def _write_hostile_pythonpath(attacker_root: Path, marker: Path) -> None:
+    attacker_root.mkdir()
+    payload = (
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text(__name__, encoding='utf-8')\n"
+    )
+    for name in ("numpy.py", "torch.py"):
+        (attacker_root / name).write_text(payload, encoding="utf-8")
+
+
+def test_campaign_script_refuses_nonisolated_python_before_dependency_import(
+    tmp_path: Path,
+):
+    marker = tmp_path / "dependency-imported"
+    attacker_root = tmp_path / "attacker"
+    _write_hostile_pythonpath(attacker_root, marker)
+    environment = {**os.environ, "PYTHONPATH": str(attacker_root)}
+
+    result = subprocess.run(
+        [sys.executable, str(RUN_CAMPAIGN_SCRIPT)],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert result.stderr == (
+        "campaign execution refused: isolated-python-required\n"
+    )
+    assert not marker.exists()
+
+
+def test_campaign_script_isolated_mode_ignores_pythonpath_and_sitecustomize(
+    tmp_path: Path,
+):
+    marker = tmp_path / "hostile-code-executed"
+    attacker_root = tmp_path / "attacker"
+    _write_hostile_pythonpath(attacker_root, marker)
+    (attacker_root / "sitecustomize.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('sitecustomize', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    environment = {**os.environ, "PYTHONPATH": str(attacker_root)}
+
+    result = subprocess.run(
+        [
+            str(Path(sys.executable).resolve()),
+            "-I",
+            "-B",
+            "-X",
+            "utf8",
+            str(RUN_CAMPAIGN_SCRIPT.resolve()),
+            "--protocol",
+            str(REPO_ROOT / "configs/protocols/pilot-v1.yaml"),
+            "--device",
+            "cpu",
+        ],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert result.stderr == "campaign execution refused: execution-not-ready\n"
+    assert not marker.exists()
+
+
+def test_real_corrected_glyph_dataset_preserves_all_catalog_asset_keys(
+    tmp_path: Path,
+):
+    from gsdiff.data.artifacts import (
+        publish_dataset,
+        resolve_target_snapshot,
+    )
+
+    build_cli = _load_build_datasets_cli()
+    run_cli = _load_run_campaign_cli()
+    plan = build_cli.plan_campaign_datasets(
+        repo_root=REPO_ROOT,
+        protocol_path=REPO_ROOT / "configs/protocols/pilot-v1.yaml",
+        runtime=CONTROLLED_RUNTIME,
+        generator_commit=CONTROLLED_COMMIT,
+    )
+    request = plan.requests[0]
+    arguments = request.generation_arguments()
+    arguments["target_snapshot"] = resolve_target_snapshot(
+        repo_root=REPO_ROOT,
+        target_id="digit5",
+        descriptor="char:5",
+        H=32,
+        W=32,
+    )
+    generated = build_cli.generate_corrected_dataset(**arguments)
+    publish_dataset(tmp_path, generated)
+    verified = next(iter(run_cli._dataset_catalog(tmp_path).values()))
+    dataset_assets = verified.manifest["resolved_generator_config"]["target"][
+        "assets_sha256"
+    ]
+
+    assert set(dataset_assets) == {"descriptor", "font", "renderer"}
+    target = verified.manifest["resolved_generator_config"]["target"]
+    assert run_cli._identity_asset_mapping(target) == dataset_assets
+
+
+def test_failure_campaign_plans_all_acquisition_cells_without_old_key_collisions():
+    build_cli = _load_build_datasets_cli()
+    run_cli = _load_run_campaign_cli()
+    protocol_path = REPO_ROOT / "configs/protocols/failure-v1.yaml"
+    campaign = run_cli.load_protocol(protocol_path)
+    plan = build_cli.plan_campaign_datasets(
+        repo_root=REPO_ROOT,
+        protocol_path=protocol_path,
+        runtime=CONTROLLED_RUNTIME,
+        generator_commit=CONTROLLED_COMMIT,
+    )
+    cells = run_cli.expand_cells(campaign)
+    old_keys = {
+        (
+            cell.scientific_contract_id,
+            cell.scientific_contract_sha256,
+            cell.target,
+            cell.motion,
+            cell.seed,
+        )
+        for cell in cells
+    }
+    selected_requests = {
+        run_cli._planned_dataset_request_for_cell(
+            cell,
+            campaign,
+            plan.requests,
+        ).request_sha256
+        for cell in cells
+    }
+
+    assert len(old_keys) == 6
+    assert len(plan.requests) == 36
+    assert len(selected_requests) == 36
+
+
+def test_runner_dataset_catalog_rejects_staging_directory(tmp_path: Path):
+    run_cli = _load_run_campaign_cli()
+    datasets = tmp_path / "datasets"
+    datasets.mkdir()
+    (datasets / f".{('a' * 64)}.staging-test").mkdir()
+
+    with pytest.raises(ValueError, match="staging|rejected"):
+        run_cli._dataset_catalog(tmp_path)
+
+
+def test_runner_dataset_catalog_selects_exact_frozen_plan_request(
+    tmp_path: Path,
+):
+    from gsdiff.data.artifacts import publish_dataset
+
+    build_cli = _load_build_datasets_cli()
+    run_cli = _load_run_campaign_cli()
+    plan = build_cli.plan_campaign_datasets(
+        repo_root=REPO_ROOT,
+        protocol_path=REPO_ROOT / "configs/protocols/pilot-v1.yaml",
+        runtime=CONTROLLED_RUNTIME,
+        generator_commit=CONTROLLED_COMMIT,
+    )
+    request = plan.requests[0]
+    generated = build_cli.generate_corrected_dataset(
+        **request.generation_arguments()
+    )
+    published = publish_dataset(tmp_path, generated)
+
+    selected = run_cli._dataset_catalog(
+        tmp_path,
+        expected_requests=(request,),
+    )
+
+    assert tuple(selected) == (request.request_sha256,)
+    assert (
+        selected[request.request_sha256].dataset_identity_sha256
+        == published.verified.dataset_identity_sha256
+    )
+
+
+def test_runner_dataset_catalog_rejects_staging_added_during_verification(
+    tmp_path: Path,
+    monkeypatch,
+):
+    from gsdiff.data.artifacts import publish_dataset
+
+    build_cli = _load_build_datasets_cli()
+    run_cli = _load_run_campaign_cli()
+    plan = build_cli.plan_campaign_datasets(
+        repo_root=REPO_ROOT,
+        protocol_path=REPO_ROOT / "configs/protocols/pilot-v1.yaml",
+        runtime=CONTROLLED_RUNTIME,
+        generator_commit=CONTROLLED_COMMIT,
+    )
+    request = plan.requests[0]
+    generated = build_cli.generate_corrected_dataset(
+        **request.generation_arguments()
+    )
+    publish_dataset(tmp_path, generated)
+    original_verify = run_cli.verify_dataset_directory
+    injected = False
+
+    def add_staging_then_verify(*args, **kwargs):
+        nonlocal injected
+        if not injected:
+            injected = True
+            staging = tmp_path / "datasets" / f".{('b' * 64)}.staging-race"
+            staging.mkdir()
+        return original_verify(*args, **kwargs)
+
+    monkeypatch.setattr(
+        run_cli,
+        "verify_dataset_directory",
+        add_staging_then_verify,
+    )
+
+    with pytest.raises(ValueError, match="staging|rejected"):
+        run_cli._dataset_catalog(
+            tmp_path,
+            expected_requests=(request,),
+        )
+
+
+def test_task5_campaign_rejects_nonready_protocol_before_artifacts_or_child(
+    tmp_path, capsys, monkeypatch
+):
+    cli = _load_run_campaign_cli()
+    artifact_root = tmp_path / "must-not-be-created"
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("nonready campaign reached a method child")
+
+    monkeypatch.setattr(cli, "run_request", forbidden)
+    return_code = cli.main(
+        [
+            "--protocol",
+            str(REPO_ROOT / "configs/protocols/pilot-v1.yaml"),
+            "--artifact-root",
+            str(artifact_root),
+            "--device",
+            "cpu",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert return_code == 1
+    assert captured.out == ""
+    assert captured.err == "campaign execution refused: execution-not-ready\n"
+    assert not artifact_root.exists()
+
+
+def test_ready_campaign_without_versioned_budget_contract_fails_before_artifacts(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    cli = _load_run_campaign_cli()
+    artifact_root = tmp_path / "must-not-be-created"
+    campaign = {
+        "document_kind": "campaign",
+        "execution_ready": True,
+        "method_budgets": {"dgi": 1},
+    }
+    monkeypatch.setattr(cli, "load_protocol", lambda path: campaign)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("unversioned budgets reached campaign execution")
+
+    monkeypatch.setattr(cli, "_run_ready_campaign", forbidden)
+
+    result = cli.main(
+        [
+            "--protocol",
+            str(tmp_path / "ready.yaml"),
+            "--artifact-root",
+            str(artifact_root),
+            "--device",
+            "cpu",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert captured.out == ""
+    assert captured.err == "campaign execution refused: ValueError\n"
+    assert not artifact_root.exists()
+
+
+@pytest.mark.parametrize(
+    ("script_name", "legacy_args"),
+    [
+        ("run_eval_matrix.py", ["--seed", "7"]),
+        ("run_multiseed.py", ["--config", "configs/default.yaml"]),
+        ("autoresearch.py", ["--base", "configs/default.yaml"]),
+    ],
+)
+def test_task5_legacy_entrypoints_reject_freeform_scientific_arguments(
+    script_name, legacy_args, capsys
+):
+    path = REPO_ROOT / "scripts" / script_name
+    spec = importlib.util.spec_from_file_location(
+        f"legacy_{path.stem}", path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    return_code = module.main(legacy_args)
+
+    captured = capsys.readouterr()
+    assert return_code == 2
+    assert "deprecated" in captured.err.lower()
+    assert "--protocol" in captured.err
+
+
+@pytest.mark.parametrize(
+    "script_name",
+    ["run_eval_matrix.py", "run_multiseed.py", "autoresearch.py"],
+)
+def test_legacy_script_entrypoints_refuse_nonisolated_python_before_imports(
+    tmp_path: Path,
+    script_name: str,
+):
+    marker = tmp_path / "dependency-imported"
+    attacker_root = tmp_path / "attacker"
+    _write_hostile_pythonpath(attacker_root, marker)
+
+    result = subprocess.run(
+        [sys.executable, str(REPO_ROOT / "scripts" / script_name)],
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": str(attacker_root)},
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert result.stderr == (
+        "campaign execution refused: isolated-python-required\n"
+    )
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    "script_name",
+    ["run_eval_matrix.py", "run_multiseed.py", "autoresearch.py"],
+)
+def test_legacy_wrappers_launch_canonical_isolated_campaign_command(
+    script_name: str,
+    monkeypatch,
+    capsys,
+):
+    path = REPO_ROOT / "scripts" / script_name
+    spec = importlib.util.spec_from_file_location(
+        f"canonical_wrapper_{path.stem}", path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    observed = {}
+
+    class Completed:
+        returncode = 1
+        stdout = ""
+        stderr = "campaign execution refused: execution-not-ready\n"
+
+    def capture(command, **kwargs):
+        observed["command"] = command
+        observed["kwargs"] = kwargs
+        return Completed()
+
+    monkeypatch.setattr(
+        module.main.__globals__["subprocess"],
+        "run",
+        capture,
+    )
+    arguments = [
+        "--protocol",
+        str(REPO_ROOT / "configs/protocols/pilot-v1.yaml"),
+        "--device",
+        "cpu",
+    ]
+
+    return_code = module.main(arguments)
+
+    assert return_code == 1
+    assert observed["command"] == [
+        str(Path(sys.executable).resolve()),
+        "-I",
+        "-B",
+        "-X",
+        "utf8",
+        str(RUN_CAMPAIGN_SCRIPT.resolve()),
+        *arguments,
+    ]
+    assert observed["kwargs"] == {
+        "cwd": REPO_ROOT,
+        "capture_output": True,
+        "text": True,
+        "encoding": "utf-8",
+        "check": False,
+    }
+    captured = capsys.readouterr()
+    assert "deprecated" in captured.err.lower()
+    assert "execution-not-ready" in captured.err
+
+
+def test_task5_legacy_entrypoint_translates_versioned_campaign_id(capsys):
+    path = REPO_ROOT / "scripts/run_eval_matrix.py"
+    spec = importlib.util.spec_from_file_location("legacy_campaign_id", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    return_code = module.main(
+        ["--campaign", "pilot-v1", "--device", "cpu"]
+    )
+
+    captured = capsys.readouterr()
+    assert return_code == 1
+    assert "deprecated" in captured.err.lower()
+    assert "execution-not-ready" in captured.err
 
 
 def _publish_controlled_pilot_dataset(

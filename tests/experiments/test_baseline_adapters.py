@@ -741,8 +741,33 @@ def test_monin_degree_two_count_is_four_motion_coefficients(
     )
 
 
+def _parameter_count_spec(acquisition: SPIAcquisitionData) -> dict[str, object]:
+    return {
+        "schema_version": "blind-acquisition-spec-v1",
+        "dimensions": {
+            "H": acquisition.H,
+            "W": acquisition.W,
+            "T": acquisition.T,
+            "K": acquisition.K,
+            "holdout_K": acquisition.holdout_K,
+        },
+        "acquisition": {
+            "pattern_family": "bernoulli",
+            "pattern_values": [0, 1],
+            "pattern_order": "sequential",
+            "time_assignment": "uniform",
+            "holdout_pattern_family": "uniform-random",
+            "noise_convention": "detector-absolute",
+            "noise_sigma_absolute": 0.0,
+        },
+    }
+
+
 def test_gidc_parameter_count_is_unique_optimizer_owned_count(blind_acquisition: SPIAcquisitionData) -> None:
     import gsdiff.baselines.gidc as gidc
+    from gsdiff.experiments.parameter_counts import (
+        expected_trainable_parameter_count,
+    )
     method = resolve_smoke("gidc3dtv", blind_acquisition)
     network = gidc.GIDCUNet2D(
         in_channels=2, channels=method.semantic_config["solver"]["unet_channels"]
@@ -756,6 +781,10 @@ def test_gidc_parameter_count_is_unique_optimizer_owned_count(blind_acquisition:
             if parameter.requires_grad
         }.values()
     )
+    assert expected_trainable_parameter_count(
+        method,
+        _parameter_count_spec(blind_acquisition),
+    ) == expected
     result = run_baseline_method(
         method, blind_acquisition,
         algorithm_seed=derive_for(method, blind_acquisition), device="cpu",
@@ -765,6 +794,9 @@ def test_gidc_parameter_count_is_unique_optimizer_owned_count(blind_acquisition:
 
 def test_recinr_parameter_count_is_unique_optimizer_owned_count(blind_acquisition: SPIAcquisitionData) -> None:
     import gsdiff.baselines.recinr as recinr
+    from gsdiff.experiments.parameter_counts import (
+        expected_trainable_parameter_count,
+    )
     method = resolve_smoke("recinr", blind_acquisition)
     representation = method.semantic_config["representation"]
     solver = method.semantic_config["solver"]
@@ -796,6 +828,10 @@ def test_recinr_parameter_count_is_unique_optimizer_owned_count(blind_acquisitio
         id(parameter): parameter for parameter in network.parameters()
         if parameter.requires_grad
     }.values())
+    assert expected_trainable_parameter_count(
+        method,
+        _parameter_count_spec(blind_acquisition),
+    ) == expected
     result = run_baseline_method(
         method, blind_acquisition,
         algorithm_seed=derive_for(method, blind_acquisition), device="cpu",

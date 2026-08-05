@@ -117,6 +117,60 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _authoritative_python_executable_evidence() -> tuple[Path, str, tuple[int, ...]]:
+    lexical = Path(sys.executable).absolute()
+    try:
+        observed = os.lstat(lexical)
+        resolved = lexical.resolve(strict=True)
+    except OSError as error:
+        raise ValueError("cannot resolve authoritative Python executable") from error
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    if (
+        stat.S_ISLNK(observed.st_mode)
+        or getattr(observed, "st_file_attributes", 0) & reparse
+        or not stat.S_ISREG(observed.st_mode)
+    ):
+        raise ValueError(
+            "authoritative Python executable must be an exact regular file"
+        )
+    digest = hashlib.sha256()
+    with resolved.open("rb") as stream:
+        opened = os.fstat(stream.fileno())
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+        after = os.fstat(stream.fileno())
+    current = os.lstat(resolved)
+    def path_signature(info):
+        return (
+            info.st_dev,
+            info.st_ino,
+            info.st_size,
+            info.st_mtime_ns,
+            info.st_ctime_ns,
+            info.st_nlink,
+        )
+
+    def cross_api_signature(info):
+        # Windows reports a different hardlink creation time through CRT
+        # fstat than through pathname lstat; every other identity field must
+        # still agree, while ctime is compared within each API.
+        return (
+            info.st_dev,
+            info.st_ino,
+            info.st_size,
+            info.st_mtime_ns,
+            info.st_nlink,
+        )
+
+    if (
+        path_signature(observed) != path_signature(current)
+        or path_signature(opened) != path_signature(after)
+        or cross_api_signature(observed) != cross_api_signature(opened)
+    ):
+        raise ValueError("authoritative Python executable changed while hashing")
+    return resolved, digest.hexdigest(), path_signature(observed)
+
+
 def requirements_dependencies_sha256(path: Path | str) -> str:
     """Hash canonical unique normalized name/version records in a lock file."""
     records = _requirements_records(Path(path))
@@ -524,6 +578,7 @@ def git_state(
         head,
         head_entries,
         index_entries,
+        index_payload,
         tracked_paths,
         scanned_files,
     ) = _collect_source_inputs(repo, source_roots)
@@ -531,7 +586,12 @@ def git_state(
         "ascii", errors="strict"
     )
     branch_result = subprocess.run(
-        ["git", "symbolic-ref", "--quiet", "--short", "HEAD"],
+        _git_command(
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "HEAD",
+        ),
         cwd=resolved_repo,
         check=False,
         capture_output=True,
@@ -545,7 +605,13 @@ def git_state(
         else None
     )
     status = subprocess.run(
-        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        _git_command(
+            "-c",
+            "core.fsmonitor=false",
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+        ),
         cwd=resolved_repo,
         check=True,
         capture_output=True,
@@ -569,6 +635,11 @@ def git_state(
         scanned_files,
         clean_head=True,
     )
+    _verify_git_provenance_anchor(
+        resolved_repo,
+        head,
+        index_payload,
+    )
     return {
         "commit": commit,
         "branch": branch,
@@ -578,14 +649,35 @@ def git_state(
 
 
 def _git_read_environment() -> dict[str, str]:
-    environment = dict(os.environ)
-    environment["GIT_OPTIONAL_LOCKS"] = "0"
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.upper().startswith("GIT_")
+    }
+    environment.update(
+        {
+            "GIT_ATTR_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_LITERAL_PATHSPECS": "1",
+            "GIT_NO_LAZY_FETCH": "1",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_PAGER": "cat",
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+    )
     return environment
+
+
+def _git_command(*args: str) -> list[str]:
+    return ["git", "--no-replace-objects", *args]
 
 
 def _git_bytes(repo: Path, *args: str) -> bytes:
     return subprocess.run(
-        ["git", *args],
+        _git_command(*args),
         cwd=repo,
         check=True,
         capture_output=True,
@@ -882,6 +974,7 @@ def _collect_source_inputs(
     bytes,
     dict[str, tuple[str, str]],
     dict[str, tuple[str, str]],
+    bytes,
     set[str],
     set[str],
 ]:
@@ -903,11 +996,10 @@ def _collect_source_inputs(
         raise ValueError("Git HEAD must be a full lowercase commit")
 
     head_entries = _parse_tree_records(
-        _git_bytes(resolved_repo, "ls-tree", "-r", "-z", "HEAD")
+        _git_bytes(resolved_repo, "ls-tree", "-r", "-z", head_text)
     )
-    index_entries = _parse_index_records(
-        _git_bytes(resolved_repo, "ls-files", "--stage", "-z")
-    )
+    index_payload = _git_bytes(resolved_repo, "ls-files", "--stage", "-z")
+    index_entries = _parse_index_records(index_payload)
     all_tracked_paths = head_entries.keys() | index_entries.keys()
     roots, root_relatives = _normalize_source_roots(
         resolved_repo, source_roots, set(all_tracked_paths)
@@ -942,11 +1034,16 @@ def _collect_source_inputs(
             scanned_files,
             set(),
         )
+    if _git_bytes(resolved_repo, "rev-parse", "HEAD").strip() != head:
+        raise ValueError("Git HEAD changed during provenance collection")
+    if _git_bytes(resolved_repo, "ls-files", "--stage", "-z") != index_payload:
+        raise ValueError("Git index changed during provenance collection")
     return (
         resolved_repo,
         head,
         head_entries,
         index_entries,
+        index_payload,
         tracked_paths,
         scanned_files,
     )
@@ -1070,10 +1167,11 @@ def source_tree_sha256(repo: Path, source_roots: Sequence[Path]) -> str:
         head,
         head_entries,
         index_entries,
+        index_payload,
         tracked_paths,
         scanned_files,
     ) = _collect_source_inputs(repo, source_roots)
-    return _source_snapshot_sha256(
+    digest = _source_snapshot_sha256(
         resolved_repo,
         head,
         head_entries,
@@ -1082,6 +1180,24 @@ def source_tree_sha256(repo: Path, source_roots: Sequence[Path]) -> str:
         scanned_files,
         clean_head=False,
     )
+    _verify_git_provenance_anchor(
+        resolved_repo,
+        head,
+        index_payload,
+    )
+    return digest
+
+
+def _verify_git_provenance_anchor(
+    repo: Path,
+    head: bytes,
+    index_payload: bytes,
+) -> None:
+    if _git_bytes(repo, "rev-parse", "HEAD").strip() != head:
+        raise ValueError("Git HEAD changed during provenance verification")
+    current_index = _git_bytes(repo, "ls-files", "--stage", "-z")
+    if current_index != index_payload:
+        raise ValueError("Git index changed during provenance verification")
 
 
 def collect_runtime_metadata() -> dict[str, object]:
@@ -1200,3 +1316,73 @@ def collect_environment_fingerprint() -> dict[str, object]:
         },
         "gpu": _gpu_fingerprint(),
     }
+
+
+def _authoritative_runtime_projection(
+    requirements_lock: Path | str,
+    environment_lock: Path | str,
+    requested_runtime_device: str,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Derive manifest runtime fields from one internally collected live lock."""
+    match = re.fullmatch(
+        r"(?:cpu|cuda:(?:0|[1-9][0-9]*))",
+        requested_runtime_device,
+        flags=re.ASCII,
+    )
+    if match is None:
+        raise ValueError("requested runtime device must be exact cpu or cuda:N")
+    live = collect_environment_fingerprint()
+    hashes = verify_environment_requirements(
+        requirements_lock,
+        environment_lock,
+        live_fingerprint=live,
+    )
+    python = live.get("python")
+    pytorch = live.get("pytorch")
+    platform_record = live.get("platform")
+    gpu_record = live.get("gpu")
+    if not all(
+        type(item) is dict
+        for item in (python, pytorch, platform_record, gpu_record)
+    ):
+        raise ValueError("live environment fingerprint runtime shape is invalid")
+    assert type(python) is dict
+    assert type(pytorch) is dict
+    assert type(platform_record) is dict
+    assert type(gpu_record) is dict
+    python_version = python.get("version")
+    pytorch_version = pytorch.get("version")
+    cuda_build = pytorch.get("cuda_build")
+    os_platform = platform_record.get("platform")
+    if (
+        type(python_version) is not str
+        or type(pytorch_version) is not str
+        or cuda_build is not None
+        and type(cuda_build) is not str
+        or type(os_platform) is not str
+    ):
+        raise ValueError("live environment fingerprint runtime values are invalid")
+    gpu_name = ""
+    if requested_runtime_device != "cpu":
+        index = int(requested_runtime_device.partition(":")[2])
+        devices = gpu_record.get("devices")
+        if gpu_record.get("available") is not True or type(devices) is not list:
+            raise ValueError("requested CUDA runtime is absent from live fingerprint")
+        matches = [
+            item
+            for item in devices
+            if type(item) is dict and item.get("index") == index
+        ]
+        if len(matches) != 1 or type(matches[0].get("name")) is not str:
+            raise ValueError("requested CUDA device index is absent from live fingerprint")
+        gpu_name = matches[0]["name"]
+    return (
+        {
+            "python": python_version,
+            "pytorch": pytorch_version,
+            "cuda": "" if cuda_build is None else cuda_build,
+            "gpu": gpu_name,
+            "os": os_platform,
+        },
+        hashes,
+    )
