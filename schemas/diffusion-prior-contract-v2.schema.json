@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Diffusion prior training contract v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "logical_id", "dataset", "rng", "motion", "model", "noise", "training", "resources", "artifact"],
+  "properties": {
+    "schema": {"const": "diffusion-prior-contract-v2"},
+    "logical_id": {"const": "gsdiff-diffusion-prior-v2"},
+    "dataset": {
+      "type": "object", "additionalProperties": false,
+      "required": ["num_videos", "shape", "device", "dtype", "sources", "source_counts"],
+      "properties": {
+        "num_videos": {"type": "integer", "const": 5000},
+        "shape": {"const": [5000, 20, 64, 64]},
+        "device": {"const": "cpu"}, "dtype": {"const": "float32"},
+        "sources": {"const": ["procedural:7", "procedural:L", "procedural:T", "procedural:circle"]},
+        "source_counts": {"const": {"procedural:7": 1250, "procedural:L": 1250, "procedural:T": 1250, "procedural:circle": 1250}}
+      }
+    },
+    "rng": {"const": {"bit_generator": "MT19937", "dataset_seed": 0, "draw_order": ["vy", "vx", "omega", "child_seed"], "training_seed": 42}},
+    "motion": {"const": {"fill_mode": "constant-zero", "interpolation_order": 1, "normalized_time": [0.0, 1.0], "omega_range": [-0.5, 0.5], "operation_order": ["rotation", "shift"], "output_clip": [0.0, 1.0], "vx_range": [-12.0, 12.0], "vy_range": [-12.0, 12.0]}},
+    "model": {"const": {"base_channels": 32, "channel_mults": [1, 2, 4], "emb_dim": 128, "in_channels": 1}},
+    "noise": {"const": {"objective": "epsilon-prediction-mse", "sigma_max": 0.5, "sigma_min": 0.002}},
+    "training": {
+      "type": "object", "additionalProperties": false,
+      "required": ["device", "batch_size", "shuffle", "dataloader_generator_seed", "drop_last", "workers", "epochs", "batches_per_epoch", "optimizer_steps", "gradient_clip_norm", "ema_decay", "ema_update_order", "optimizer", "checkpoint_selection", "resume", "amp"],
+      "properties": {
+        "device": {"const": "cuda:0"}, "batch_size": {"type": "integer", "const": 8},
+        "shuffle": {"const": true}, "dataloader_generator_seed": {"type": "integer", "const": 42},
+        "drop_last": {"const": true}, "workers": {"type": "integer", "const": 0},
+        "epochs": {"type": "integer", "const": 200}, "batches_per_epoch": {"type": "integer", "const": 625},
+        "optimizer_steps": {"type": "integer", "const": 125000}, "gradient_clip_norm": {"const": 1.0},
+        "ema_decay": {"const": 0.999}, "ema_update_order": {"const": "after-optimizer-step"},
+        "optimizer": {"const": {"amsgrad": false, "betas": [0.9, 0.999], "capturable": false, "differentiable": false, "eps": 1e-8, "foreach": false, "fused": false, "lr": 0.0001, "maximize": false, "name": "AdamW", "weight_decay": 0.00001}},
+        "checkpoint_selection": {"const": false}, "resume": {"const": false}, "amp": {"const": false}
+      }
+    },
+    "resources": {"const": {"minimum_cuda_memory_bytes": 12000000000, "minimum_free_disk_bytes": 6442450944}},
+    "artifact": {"const": {"promotable_checkpoint": "ema-final.pt", "root": "artifacts/diffusion-prior-v2/{contract_sha256}", "save_intermediate": false}}
+  }
+}

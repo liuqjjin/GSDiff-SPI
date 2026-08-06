@@ -55,7 +55,8 @@ out of scope until Task 3 is closed.
 - Diffusion prior v1 is not edited or relabelled. V2 is a new logical artifact.
 - V2 uses 5,000 videos of shape `20 x 64 x 64`, preserving the former training
   scale while removing target leakage. Its sources are the repository's four
-  procedural descriptors `char:7`, `char:L`, `char:T`, and `shape:circle`.
+  procedural descriptors `procedural:7`, `procedural:L`, `procedural:T`, and
+  `procedural:circle`.
   No external image asset is needed.
 - The v2 final checkpoint is the predeclared epoch-200 EMA state. Training-time
   model selection is forbidden.

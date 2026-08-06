@@ -2300,3 +2300,33 @@ post-reclosure completion gate is still pending and is not claimed here.
 - The pilot remains `execution_ready: false` with null budgets until a
   target-disjoint, independently verified diffusion-prior v2 exists. No
   experiment or training run was started in this package.
+
+## Diffusion-prior v2 control-code closure (2026-08-06)
+
+- Added the canonical `gsdiff-diffusion-prior-v2` contract, exactly two Draft
+  2020-12 schemas, one fail-closed control module, and three fixed-path CLIs.
+  The generation/training/verifier flow binds the target-disjoint procedural
+  sources, real scientific-contract registry, strict project environment,
+  clean historical Git control blobs, content-addressed artifact root, dataset
+  file/tensor hashes, final raw/EMA states, and compact tracked provenance.
+- No v1 source, environment lock, method registry, pilot readiness flag,
+  dataset, checkpoint, provenance, or 200-epoch training result was changed or
+  generated. The tracked plan source names were corrected from the stale
+  `char:*`/`shape:*` spellings to the approved `procedural:*` descriptors.
+- Initial RED was genuine: the two new test files failed collection with two
+  import errors because `gsdiff.prior.training_v2` did not exist. Later
+  fail-closed RED cycles observed `3 failed` for pre-publication rechecks and
+  C-versus-P history, then `2 failed` for reuse-audit and verification-source
+  cross-links. The completed focused CPU plus real-CUDA group is GREEN at
+  `24 passed in 19.36s`; the full prior area is GREEN at
+  `65 passed in 15.87s`.
+- The complete non-CUDA repository gate is GREEN at
+  `2877 passed, 22 skipped, 3 deselected in 4685.74s`; every skip is an
+  existing Windows symlink, FIFO, or POSIX audit-operation capability case.
+  The complete marked CUDA gate executed all three cases and is GREEN at
+  `3 passed, 2899 deselected in 13.33s`.
+- `compileall` completed silently, all 13 repository schemas passed Draft
+  2020-12 meta-validation, strict environment verification passed at
+  fingerprint
+  `4a51ef8440bf725b369a9ce40534a8d2a19d7a994b636c7aa2125e83bb92dc1f`,
+  and `pip check` reported `No broken requirements found.`

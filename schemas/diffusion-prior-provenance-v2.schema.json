@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Diffusion prior verified provenance v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "logical_id", "contract_sha256", "dataset_manifest_sha256", "training_candidate_sha256", "source_anchor", "environment", "checkpoints", "verification_commit"],
+  "properties": {
+    "schema": {"const": "diffusion-prior-provenance-v2"},
+    "logical_id": {"const": "gsdiff-diffusion-prior-v2"},
+    "contract_sha256": {"$ref": "#/$defs/sha256"},
+    "dataset_manifest_sha256": {"$ref": "#/$defs/sha256"},
+    "training_candidate_sha256": {"$ref": "#/$defs/sha256"},
+    "source_anchor": {"$ref": "#/$defs/sourceAnchor"},
+    "environment": {"$ref": "#/$defs/environment"},
+    "checkpoints": {
+      "type": "object", "additionalProperties": false,
+      "required": ["raw_file_sha256", "ema_file_sha256", "promotable"],
+      "properties": {
+        "raw_file_sha256": {"$ref": "#/$defs/sha256"},
+        "ema_file_sha256": {"$ref": "#/$defs/sha256"},
+        "promotable": {"const": "ema-final.pt"}
+      }
+    },
+    "verification_commit": {"$ref": "#/$defs/commit"}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "sourceAnchor": {
+      "type": "object", "additionalProperties": false,
+      "required": ["commit", "control_files"],
+      "properties": {
+        "commit": {"$ref": "#/$defs/commit"},
+        "control_files": {"type": "object", "minProperties": 1, "additionalProperties": {"$ref": "#/$defs/sha256"}}
+      }
+    },
+    "environment": {
+      "type": "object", "additionalProperties": false,
+      "required": ["dependencies_sha256", "fingerprint_sha256", "policy"],
+      "properties": {
+        "dependencies_sha256": {"$ref": "#/$defs/sha256"},
+        "fingerprint_sha256": {"$ref": "#/$defs/sha256"},
+        "policy": {"type": "object"}
+      }
+    }
+  }
+}
