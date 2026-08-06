@@ -14,7 +14,9 @@ import math
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
+import sys
 import tempfile
 from typing import Callable, Mapping, Sequence
 
@@ -27,6 +29,7 @@ import yaml
 
 from gsdiff.data.simulation import load_image, make_test_image
 from gsdiff.experiments.identity import (
+    _git_bytes,
     canonical_json_bytes as _compact_json_bytes,
     git_state,
     sha256_file,
@@ -223,10 +226,10 @@ def render_se2_video(
     vx: float,
     omega: float,
 ) -> np.ndarray:
-    canonical = np.asarray(image, dtype=np.float32)
+    canonical = np.asarray(image).astype(np.float64)
     if canonical.ndim != 2 or type(frames) is not int or frames < 1:
         raise ContractError("SE(2) input shape or frame count is invalid")
-    video = np.empty((frames, *canonical.shape), dtype=np.float32)
+    video = np.empty((frames, *canonical.shape), dtype=np.float64)
     for index, time_value in enumerate(np.linspace(0.0, 1.0, frames)):
         rotated = nd_rotate(
             canonical,
@@ -235,7 +238,6 @@ def render_se2_video(
             order=1,
             mode="constant",
             cval=0.0,
-            prefilter=False,
         )
         shifted = nd_shift(
             rotated,
@@ -243,10 +245,9 @@ def render_se2_video(
             order=1,
             mode="constant",
             cval=0.0,
-            prefilter=False,
         )
-        video[index] = np.clip(shifted, 0.0, 1.0).astype(np.float32, copy=False)
-    return video
+        video[index] = np.clip(shifted, 0.0, 1.0)
+    return video.astype(np.float32)
 
 
 def _canonical_image_hash(image: np.ndarray) -> str:
@@ -452,11 +453,60 @@ def _validate_environment_shape(environment: object) -> dict[str, object]:
     return environment
 
 
+def _validate_leakage_audit_shape(audit: object) -> dict[str, object]:
+    fields = {
+        "descriptor_intersection",
+        "canonical_image_sha256_intersection",
+        "evaluation_descriptor_count",
+        "training_descriptor_count",
+        "evaluation_canonical_image_sha256",
+        "training_canonical_image_sha256",
+        "protocol_sha256",
+        "registry_file_sha256",
+        "claim",
+    }
+    if type(audit) is not dict or set(audit) != fields:
+        raise ArtifactError("dataset leakage audit fields are invalid")
+    if (
+        audit["descriptor_intersection"] != []
+        or audit["canonical_image_sha256_intersection"] != []
+    ):
+        raise ArtifactError("dataset leakage audit intersections are nonempty")
+    evaluation_hashes = audit["evaluation_canonical_image_sha256"]
+    training_hashes = audit["training_canonical_image_sha256"]
+    evaluation_count = audit["evaluation_descriptor_count"]
+    training_count = audit["training_descriptor_count"]
+    if (
+        type(evaluation_count) is not int
+        or type(training_count) is not int
+        or type(evaluation_hashes) is not dict
+        or type(training_hashes) is not dict
+        or evaluation_count != len(evaluation_hashes)
+        or training_count != len(training_hashes)
+        or set(training_hashes) != set(SOURCES)
+    ):
+        raise ArtifactError("dataset leakage audit inventories are invalid")
+    for inventory in (evaluation_hashes, training_hashes):
+        for descriptor, digest in inventory.items():
+            if type(descriptor) is not str or not descriptor:
+                raise ArtifactError("dataset leakage audit descriptor is invalid")
+            _require_sha256(digest, noun="dataset leakage image hash")
+    _require_sha256(audit["protocol_sha256"], noun="dataset leakage protocol hash")
+    _require_sha256(audit["registry_file_sha256"], noun="dataset leakage registry hash")
+    if audit["claim"] != (
+        "exact descriptor/pixel disjointness only; not semantic or "
+        "distributional independence"
+    ):
+        raise ArtifactError("dataset leakage audit claim is invalid")
+    return audit
+
+
 def validate_dataset_pair(
     dataset_path: Path,
     manifest_path: Path,
     *,
     contract: Mapping[str, object],
+    leakage_audit: Mapping[str, object],
     source_anchor: Mapping[str, object] | None = None,
     environment: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
@@ -478,9 +528,10 @@ def validate_dataset_pair(
         require_matching_anchor(recorded_anchor, source_anchor, require_same_commit=True)
     if environment is not None:
         require_matching_environment(recorded_environment, environment)
-    leakage = manifest["leakage_audit"]
-    if type(leakage) is not dict or leakage.get("descriptor_intersection") != [] or leakage.get("canonical_image_sha256_intersection") != []:
-        raise ArtifactError("dataset leakage audit is absent or nonempty")
+    leakage = _validate_leakage_audit_shape(manifest["leakage_audit"])
+    expected_leakage = _validate_leakage_audit_shape(dict(leakage_audit))
+    if leakage != expected_leakage:
+        raise ArtifactError("dataset leakage audit disagrees with fresh evidence")
     try:
         payload = torch.load(dataset_path, map_location="cpu", weights_only=True)
     except Exception as exc:
@@ -505,6 +556,15 @@ def validate_dataset_pair(
     return manifest
 
 
+def _promote_no_clobber(temporary: Path, destination: Path) -> None:
+    from gsdiff.experiments.runner import _rename_no_clobber
+
+    try:
+        _rename_no_clobber(temporary, destination)
+    except FileExistsError as exc:
+        raise ArtifactError(f"destination already exists: {destination}") from exc
+
+
 def _atomic_torch_save(
     value: object,
     destination: Path,
@@ -512,6 +572,8 @@ def _atomic_torch_save(
     pre_promote_check: Callable[[Path], None] | None = None,
 ) -> None:
     temporary = destination.with_name(destination.name + ".tmp")
+    if os.path.lexists(destination):
+        raise ArtifactError(f"destination already exists: {destination}")
     if os.path.lexists(temporary):
         raise ArtifactError(f"stale exact sibling temporary file exists: {temporary.name}")
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -522,15 +584,17 @@ def _atomic_torch_save(
             os.fsync(stream.fileno())
         if pre_promote_check is not None:
             pre_promote_check(temporary)
-        os.replace(temporary, destination)
+        _promote_no_clobber(temporary, destination)
     except BaseException:
-        if temporary.exists():
+        if os.path.lexists(temporary):
             temporary.unlink()
         raise
 
 
 def _atomic_json_write(value: Mapping[str, object], destination: Path) -> None:
     temporary = destination.with_name(destination.name + ".tmp")
+    if os.path.lexists(destination):
+        raise ArtifactError(f"destination already exists: {destination}")
     if os.path.lexists(temporary):
         raise ArtifactError(f"stale exact sibling temporary file exists: {temporary.name}")
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -539,9 +603,9 @@ def _atomic_json_write(value: Mapping[str, object], destination: Path) -> None:
             stream.write(canonical_json_bytes(dict(value)))
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, destination)
+        _promote_no_clobber(temporary, destination)
     except BaseException:
-        if temporary.exists():
+        if os.path.lexists(temporary):
             temporary.unlink()
         raise
 
@@ -556,10 +620,11 @@ def generate_dataset_artifact(
     video_factory: Callable[[str, int, np.random.RandomState], torch.Tensor] | None = None,
     pre_promote_check: Callable[[], None] | None = None,
 ) -> dict[str, object]:
+    require_authoritative_python()
     dataset_path = artifact_root / "dataset.pt"
     manifest_path = artifact_root / "dataset-manifest.json"
-    dataset_exists = dataset_path.exists()
-    manifest_exists = manifest_path.exists()
+    dataset_exists = os.path.lexists(dataset_path)
+    manifest_exists = os.path.lexists(manifest_path)
     if dataset_exists != manifest_exists:
         raise ArtifactError("one-sided dataset output refuses reuse")
     if dataset_exists:
@@ -567,11 +632,10 @@ def generate_dataset_artifact(
             dataset_path,
             manifest_path,
             contract=contract,
+            leakage_audit=leakage_audit,
             source_anchor=source_anchor,
             environment=environment,
         )
-        if manifest["leakage_audit"] != dict(leakage_audit):
-            raise ArtifactError("existing dataset leakage audit mismatch")
         return manifest
 
     shape = _dataset_expectations(contract)
@@ -629,6 +693,7 @@ def generate_dataset_artifact(
         dataset_path,
         manifest_path,
         contract=contract,
+        leakage_audit=leakage_audit,
         source_anchor=source_anchor,
         environment=environment,
     )
@@ -670,15 +735,10 @@ def require_matching_environment(
 
 
 def _git_output(*args: str) -> bytes:
-    completed = subprocess.run(
-        ["git", *args],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        check=False,
-    )
-    if completed.returncode != 0:
-        raise AnchorError(f"Git command failed: git {' '.join(args)}")
-    return completed.stdout
+    try:
+        return _git_bytes(REPO_ROOT, *args)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise AnchorError(f"Git command failed: git {' '.join(args)}") from exc
 
 
 def _control_hashes_at_commit(commit: str) -> dict[str, str]:
@@ -714,7 +774,23 @@ def verify_historical_source_anchor(anchor: Mapping[str, object]) -> None:
         raise AnchorError("recorded control-file hashes disagree with historical Git blobs")
 
 
+def require_authoritative_python(executable: str | os.PathLike[str] | None = None) -> Path:
+    raw = sys.executable if executable is None else executable
+    try:
+        resolved = Path(raw).resolve(strict=True)
+        expected = AUTHORITATIVE_PYTHON.resolve(strict=True)
+        regular = stat.S_ISREG(resolved.stat().st_mode)
+    except (OSError, TypeError) as exc:
+        raise EnvironmentError("authoritative Python executable cannot be resolved") from exc
+    if not regular or os.path.normcase(str(resolved)) != os.path.normcase(str(expected)):
+        raise EnvironmentError(
+            f"authoritative Python must resolve exactly to {AUTHORITATIVE_PYTHON}"
+        )
+    return resolved
+
+
 def collect_environment_evidence() -> dict[str, object]:
+    require_authoritative_python()
     if Path(torch.__file__).resolve().is_relative_to(Path(r"D:\conda\envs\spi")):
         raise EnvironmentError("legacy environment is forbidden")
     try:
@@ -959,18 +1035,21 @@ def run_training(
     ema_path: Path,
     source_anchor: Mapping[str, object],
     environment: Mapping[str, object],
+    leakage_audit: Mapping[str, object],
     device: torch.device,
     model_factory: Callable[[], torch.nn.Module] = _make_model,
     loss_hook: Callable[[torch.Tensor, int], torch.Tensor] | None = None,
     gradient_hook: Callable[[torch.nn.Parameter, int], None] | None = None,
     pre_candidate_check: Callable[[], None] | None = None,
 ) -> dict[str, object]:
-    if candidate_path.exists() or raw_path.exists() or ema_path.exists():
+    require_authoritative_python()
+    if any(os.path.lexists(path) for path in (candidate_path, raw_path, ema_path)):
         raise TrainingError("training output already exists; resume and selection are forbidden")
     validate_dataset_pair(
         dataset_path,
         manifest_path,
         contract=contract,
+        leakage_audit=leakage_audit,
         source_anchor=source_anchor,
         environment=environment,
     )
@@ -1072,14 +1151,13 @@ def run_training(
             model_factory=model_factory,
         )
     except BaseException:
-        if candidate_path.exists():
-            candidate_path.unlink()
         raise
 
 
 def run_preflight(
     *, save_directory: Path, device: torch.device
 ) -> dict[str, object]:
+    require_authoritative_python()
     if str(device) != "cuda:0" or not torch.cuda.is_available():
         raise TrainingError("preflight requires real cuda:0 without fallback")
     _configure_seeded_best_effort(42)
@@ -1153,15 +1231,15 @@ def make_provenance(
     }
 
 
-def validate_provenance(
-    path: Path,
+def validate_provenance_value(
+    value: Mapping[str, object],
     *,
     current_commit: str | None = None,
 ) -> dict[str, object]:
-    value = _load_canonical_json(path, noun="diffusion prior provenance")
+    checked = deepcopy(dict(value))
     schema = _load_schema(PROVENANCE_SCHEMA_PATH)
     errors = sorted(
-        Draft202012Validator(schema).iter_errors(value),
+        Draft202012Validator(schema).iter_errors(checked),
         key=lambda error: list(error.absolute_path),
     )
     if errors:
@@ -1169,9 +1247,9 @@ def validate_provenance(
             "invalid diffusion prior provenance: "
             + "; ".join(error.message for error in errors)
         )
-    _validate_source_anchor_shape(value["source_anchor"])
-    _validate_environment_shape(value["environment"])
-    if value["verification_commit"] != value["source_anchor"]["commit"]:
+    _validate_source_anchor_shape(checked["source_anchor"])
+    _validate_environment_shape(checked["environment"])
+    if checked["verification_commit"] != checked["source_anchor"]["commit"]:
         raise ArtifactError("provenance verification source commit mismatch")
     if current_commit is not None and (
         type(current_commit) is not str
@@ -1179,9 +1257,18 @@ def validate_provenance(
         or any(ch not in "0123456789abcdef" for ch in current_commit)
     ):
         raise ArtifactError("current commit is invalid")
-    if value["checkpoints"]["raw_file_sha256"] == value["checkpoints"]["ema_file_sha256"]:
+    if checked["checkpoints"]["raw_file_sha256"] == checked["checkpoints"]["ema_file_sha256"]:
         raise ArtifactError("provenance raw and EMA hashes must differ")
-    return value
+    return checked
+
+
+def validate_provenance(
+    path: Path,
+    *,
+    current_commit: str | None = None,
+) -> dict[str, object]:
+    value = _load_canonical_json(path, noun="diffusion prior provenance")
+    return validate_provenance_value(value, current_commit=current_commit)
 
 
 def _verify_ema_inference(ema_path: Path) -> None:
@@ -1205,7 +1292,9 @@ def verify_and_publish(
     contract: Mapping[str, object],
     root: Path,
     provenance_path: Path = PROVENANCE_PATH,
+    model_factory: Callable[[], torch.nn.Module] = _make_model,
 ) -> dict[str, object]:
+    require_authoritative_python()
     dataset_path = root / "dataset.pt"
     manifest_path = root / "dataset-manifest.json"
     raw_path = root / "raw-final.pt"
@@ -1217,31 +1306,29 @@ def verify_and_publish(
         dataset_manifest_path=manifest_path,
         raw_path=raw_path,
         ema_path=ema_path,
+        model_factory=model_factory,
     )
     source_anchor = candidate["source_anchor"]
     environment = candidate["environment"]
     assert type(source_anchor) is dict and type(environment) is dict
     verify_historical_source_anchor(source_anchor)
-    manifest = validate_dataset_pair(
+    current_leakage = audit_target_disjointness(SCIENTIFIC_CONTRACTS_PATH)
+    validate_dataset_pair(
         dataset_path,
         manifest_path,
         contract=contract,
+        leakage_audit=current_leakage,
         source_anchor=source_anchor,
         environment=environment,
     )
-    current_leakage = audit_target_disjointness(SCIENTIFIC_CONTRACTS_PATH)
-    if manifest["leakage_audit"] != current_leakage:
-        raise LeakageError("recorded leakage audit disagrees with the real registry")
     current_environment = collect_environment_evidence()
     require_matching_environment(environment, current_environment)
-    checkpoints = verify_checkpoint_pair(raw_path, ema_path)
+    checkpoints = verify_checkpoint_pair(raw_path, ema_path, model_factory=model_factory)
     _verify_ema_inference(ema_path)
     current_commit = _git_output("rev-parse", "HEAD").decode("ascii").strip()
-    if provenance_path.exists():
+    if os.path.lexists(provenance_path):
         existing = validate_provenance(provenance_path, current_commit=current_commit)
         verification_commit = str(existing["verification_commit"])
-        if _git_output("cat-file", "-t", verification_commit).strip() != b"commit":
-            raise ArtifactError("recorded verification source is not a Git commit")
         recomputed = make_provenance(
             contract_sha256=contract_sha256(contract),
             dataset_manifest_sha256=sha256_file(manifest_path),
@@ -1261,13 +1348,18 @@ def verify_and_publish(
         source_anchor=source_anchor,
         environment=environment,
         checkpoints=checkpoints,
-        verification_commit=current_commit,
+        verification_commit=str(source_anchor["commit"]),
     )
-    _atomic_json_write(provenance, provenance_path)
-    return validate_provenance(provenance_path, current_commit=current_commit)
+    checked = validate_provenance_value(provenance, current_commit=current_commit)
+    _atomic_json_write(checked, provenance_path)
+    published = validate_provenance(provenance_path, current_commit=current_commit)
+    if published != checked:
+        raise ArtifactError("published provenance differs from validated construction")
+    return published
 
 
 def dataset_cli() -> int:
+    require_authoritative_python()
     contract = load_contract()
     root = artifact_root(contract)
     require_resources(contract, root)
@@ -1302,15 +1394,18 @@ def dataset_cli() -> int:
 
 
 def training_cli(*, preflight_only: bool) -> int:
+    require_authoritative_python()
     contract = load_contract()
     root = artifact_root(contract)
     require_resources(contract, root)
     anchor_before = current_source_anchor(require_clean=True)
     environment_before = collect_environment_evidence()
+    leakage = audit_target_disjointness(SCIENTIFIC_CONTRACTS_PATH)
     validate_dataset_pair(
         root / "dataset.pt",
         root / "dataset-manifest.json",
         contract=contract,
+        leakage_audit=leakage,
         source_anchor=anchor_before,
         environment=environment_before,
     )
@@ -1340,6 +1435,7 @@ def training_cli(*, preflight_only: bool) -> int:
             ema_path=root / "ema-final.pt",
             source_anchor=anchor_before,
             environment=environment_before,
+            leakage_audit=leakage,
             device=torch.device("cuda:0"),
             pre_candidate_check=recheck_before_candidate,
         )
@@ -1355,6 +1451,7 @@ def training_cli(*, preflight_only: bool) -> int:
 
 
 def verification_cli() -> int:
+    require_authoritative_python()
     contract = load_contract()
     provenance = verify_and_publish(contract=contract, root=artifact_root(contract))
     print(
